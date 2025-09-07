@@ -1,16 +1,18 @@
 // server.js — Twilio Connect/Stream + Deepgram ASR + OpenAI brain + ElevenLabs TTS
+// with EXTRA LOGS to pinpoint issues end-to-end.
+
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-// ====== config ======
 const PORT = process.env.PORT || 10000;
 
-// ====== audio helpers (μ-law @ 8kHz, 20ms frames) ======
+// ====================== Audio helpers (μ-law @ 8kHz) ======================
 const SAMPLE_RATE = 8000;
-const FRAME_SAMPLES = 160;
+const FRAME_SAMPLES = 160; // 20ms * 8000
 
+// μ-law -> PCM16 (to feed ASR). Includes logs if the buffer looks wrong.
 function muLawToPCM16(mu) {
   const out = new Int16Array(mu.length);
   for (let i = 0; i < mu.length; i++) {
@@ -22,17 +24,27 @@ function muLawToPCM16(mu) {
   return out;
 }
 
-// ====== Deepgram realtime (inline) ======
-function startDeepgram({ onPartial, onFinal }) {
+// ====================== Deepgram realtime (inline) ======================
+function startDeepgram({ onOpen, onPartial, onFinal, onError }) {
   const WebSocket = require("ws");
+  const key = process.env.DEEPGRAM_API_KEY || "";
   const url = "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_turnoff=500";
+
   const dg = new WebSocket(url, {
-    headers: { Authorization: `Token ${process.env.DEEPGRAM_API_KEY || ""}` },
+    headers: { Authorization: `Token ${key}` },
     perMessageDeflate: false,
   });
+
   let open = false;
   const q = [];
-  dg.on("open", () => { open = true; while (q.length) dg.send(q.shift()); });
+
+  dg.on("open", () => {
+    open = true;
+    console.log("[Deepgram] ws open");
+    onOpen?.();
+    while (q.length) dg.send(q.shift());
+  });
+
   dg.on("message", (data) => {
     try {
       const ev = JSON.parse(data.toString());
@@ -41,27 +53,43 @@ function startDeepgram({ onPartial, onFinal }) {
       if (!alt) return;
       const text = (alt.transcript || "").trim();
       if (!text) return;
-      const isFinal = ev.is_final || alt.words?.some(w => w?.is_final);
-      if (isFinal) onFinal?.(text); else onPartial?.(text);
-    } catch {}
+      const isFinal = ev.is_final || alt.words?.some((w) => w?.is_final);
+      if (isFinal) onFinal?.(text);
+      else onPartial?.(text);
+    } catch (e) {
+      // ignore parse errors
+    }
   });
-  dg.on("error", (e) => console.error("[Deepgram] ws error:", e.message || e));
-  dg.on("close", () => console.log("[Deepgram] ws closed"));
+
+  dg.on("error", (e) => {
+    console.error("[Deepgram] ws error:", e?.message || e);
+    onError?.(e);
+  });
+
+  dg.on("close", (c, r) => {
+    console.log("[Deepgram] ws closed", c, r?.toString?.() || "");
+  });
+
   return {
     sendPCM16(int16) {
       const buf = Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength);
-      if (open) dg.send(buf); else q.push(buf);
+      if (open) dg.send(buf);
+      else q.push(buf);
     },
-    close() { try { dg.close(); } catch {} }
+    close() {
+      try { dg.close(); } catch {}
+    },
   };
 }
 
-// ====== OpenAI brain (tiny, fast) ======
+// ====================== OpenAI brain (tiny) ======================
 async function brainReply({ systemPrompt, history, userText }) {
-  if (!process.env.OPENAI_API_KEY) {
-    // Safe fallback if no key yet
-    return `You said: "${userText}". How can I help further?`;
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    console.log("(!) OPENAI_API_KEY missing — using echo fallback.");
+    return `You said: "${userText}".`;
   }
+
   const body = {
     model: "gpt-4o-mini",
     messages: [
@@ -72,23 +100,34 @@ async function brainReply({ systemPrompt, history, userText }) {
     temperature: 0.5,
     max_tokens: 120
   };
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) {
-    console.error("[OpenAI] HTTP", res.status);
+
+  let res;
+  try {
+    res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (e) {
+    console.error("[OpenAI] network error:", e?.message || e);
     return `You said: "${userText}".`;
   }
+
+  if (!res.ok) {
+    console.error("[OpenAI] HTTP", res.status, await safeRead(res));
+    return `You said: "${userText}".`;
+  }
+
   const json = await res.json();
-  return json.choices?.[0]?.message?.content?.trim() || `You said: "${userText}".`;
+  const txt = json.choices?.[0]?.message?.content?.trim();
+  return txt || `You said: "${userText}".`;
 }
 
-// ====== ElevenLabs TTS (μ-law 8k streaming) ======
+async function safeRead(res) {
+  try { return await res.text(); } catch { return "(no body)"; }
+}
+
+// ====================== ElevenLabs TTS (μ-law 8k streaming) ======================
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid) return;
   const key = process.env.ELEVEN_API_KEY;
@@ -97,90 +136,131 @@ async function speakEleven(ws, streamSid, text) {
     console.log("(!) ELEVEN vars missing — skipping TTS");
     return;
   }
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "xi-api-key": key, "Content-Type": "application/json" },
-    body: JSON.stringify({ text, voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
-  });
-  if (!res.ok || !res.body) { console.error("[TTS] HTTP", res.status); return; }
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "xi-api-key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+    });
+  } catch (e) {
+    console.error("[TTS] network error:", e?.message || e);
+    return;
+  }
+
+  if (!res.ok || !res.body) {
+    console.error("[TTS] HTTP", res.status, await safeRead(res));
+    return;
+  }
+
+  console.log("[TTS] streaming reply bytes…");
   return new Promise((resolve, reject) => {
     res.body.on("data", (chunk) => {
       const base64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
     });
-    res.body.on("end", resolve);
-    res.body.on("error", reject);
+    res.body.on("end", () => { console.log("[TTS] stream end"); resolve(); });
+    res.body.on("error", (e) => { console.error("[TTS] stream error:", e?.message || e); reject(e); });
   });
 }
 
-// ====== HTTP app ======
+// ====================== HTTP app (health + browser check) ======================
 const app = express();
-app.get("/", (_, res) => res.type("text/plain").send("OK"));
+app.get("/",  (_, res) => res.type("text/plain").send("OK"));
 app.get("/twilio",  (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio"));
 app.get("/twilio/", (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio/"));
 const server = http.createServer(app);
 
-// ====== WebSocket (manual upgrade) ======
+// ====================== WebSocket (manual upgrade) ======================
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
 server.on("upgrade", (req, socket, head) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host}`);
+    console.log("[UPGRADE] path:", u.pathname, "search:", u.search);
     if (u.pathname !== "/twilio" && u.pathname !== "/twilio/") {
-      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"); socket.destroy(); return;
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } catch { try { socket.destroy(); } catch {} }
+  } catch (e) {
+    console.error("[UPGRADE] exception:", e?.message || e);
+    try { socket.destroy(); } catch {}
+  }
 });
 
-// ====== WS logic: ASR in → LLM → TTS out ======
+// ====================== WS logic: Twilio media → Deepgram → OpenAI → ElevenLabs ======================
 wss.on("connection", (ws) => {
   let streamSid = null;
-  let dg = null;                 // Deepgram session
-  const history = [];            // short chat history
+  let dg = null;
+  let dgOpened = false;
+  let frameCount = 0;
+  const history = [];
 
-  // simple system prompt (swap in your big Make prompt later)
   const systemPrompt =
     "You are a premium phone assistant. Be concise, friendly, and proactive. " +
-    "Ask clarifying questions before acting. If the caller mentions booking, gather date/time/name and confirm next steps plainly.";
+    "Ask clarifying questions before acting. If booking is mentioned, gather date/time/name and confirm next steps plainly.";
 
+  // Handle a final transcript: create reply via LLM (or echo) then speak it
   async function handleUserText(text) {
-    // get model reply
+    console.log("[final ]", text);
     const reply = await brainReply({ systemPrompt, history, userText: text });
     history.push({ role: "user", content: text }, { role: "assistant", content: reply });
-    // speak it
     await speakEleven(ws, streamSid, reply);
   }
 
   ws.on("message", async (buf) => {
-    let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
+    let evt;
+    try { evt = JSON.parse(buf.toString()); } catch { return; }
 
     if (evt.event === "start") {
       streamSid = evt.start?.streamSid || null;
       const biz = evt.start?.customParameters?.biz || "default";
       console.log("WS CONNECTED | streamSid:", streamSid, "| biz:", biz);
 
-      // spin up Deepgram if key present
+      // Start Deepgram if key exists
       if (process.env.DEEPGRAM_API_KEY) {
         dg = startDeepgram({
-          onPartial: (t) => console.log("[partial]", t),
-          onFinal:   (t) => { console.log("[final ]", t); handleUserText(t); }
+          onOpen: () => { console.log("[Deepgram] opened (ready for audio)"); },
+          onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
+          onFinal: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
+          onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); }
         });
+
+        // If no transcripts after 3s, log a warning
+        setTimeout(() => {
+          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check audio forwarding / format)");
+        }, 3000);
       } else {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled (it won't hear you).");
       }
 
-      // opening line (so it feels alive immediately)
+      // Opening line
       await speakEleven(ws, streamSid, "Hi there. How can I help you?");
     }
+
     else if (evt.event === "media") {
-      // caller audio (20ms μ-law base64) → feed to Deepgram
+      // Called every 20ms with caller audio (base64 μ-law 8k)
+      frameCount++;
+      if (frameCount % 50 === 1) console.log("[media] frames so far:", frameCount); // ~1s cadence
       if (dg) {
-        const ulaw = Buffer.from(evt.media?.payload || "", "base64");
-        const pcm16 = muLawToPCM16(ulaw);
-        dg.sendPCM16(pcm16);
+        try {
+          const ulaw = Buffer.from(evt.media?.payload || "", "base64");
+          if (!ulaw.length) {
+            if (frameCount % 50 === 1) console.log("[media] empty frame payload");
+          } else {
+            const pcm16 = muLawToPCM16(ulaw);
+            dg.sendPCM16(pcm16);
+          }
+        } catch (e) {
+          console.error("[media] frame decode/send error:", e?.message || e);
+        }
       }
     }
+
     else if (evt.event === "stop") {
       console.log("Twilio stream STOP");
       if (dg) dg.close();
@@ -188,7 +268,7 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => { if (dg) dg.close(); console.log("WS closed"); });
-  ws.on("error", (e) => console.error("WS error", e));
+  ws.on("error", (e) => console.error("WS error", e?.message || e));
 });
 
 server.listen(PORT, () => console.log(`Server running on 0.0.0.0:${PORT}`));
