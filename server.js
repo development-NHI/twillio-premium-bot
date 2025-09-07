@@ -1,7 +1,6 @@
-// server.js — Twilio Connect/Stream + Deepgram ASR (URL-config, linear16) + OpenAI brain + ElevenLabs TTS
-// - Deepgram configured via URL params (no control messages).
-// - μ-law (Twilio) -> PCM16LE (Deepgram) with 100ms batching.
-// - Extra logs to diagnose end-to-end.
+// server.js — Twilio Connect/Stream + Deepgram (URL-config) + OpenAI brain + ElevenLabs TTS + Make webhook
+// - Uses AGENT_PROMPT env if provided.
+// - Simple "book" intent: posts to MAKE_WEBHOOK fire-and-forget.
 
 const express = require("express");
 const http = require("http");
@@ -9,6 +8,7 @@ const { WebSocketServer } = require("ws");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const PORT = process.env.PORT || 10000;
+const MAKE_WEBHOOK = process.env.MAKE_WEBHOOK || "";
 
 /* ===================== μ-law -> PCM16LE (correct) ===================== */
 function ulawByteToPcm16(u) {
@@ -36,7 +36,6 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
 
-  // All configuration via querystring. We send only binary audio frames.
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=linear16"
@@ -49,7 +48,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
     + "&endpointing=250";
 
   const dg = new WebSocket(url, {
-    headers: { Authorization: `token ${key}` }, // "token <key>" per Deepgram docs
+    headers: { Authorization: `token ${key}` }, // Deepgram accepts "token <key>"
     perMessageDeflate: false,
   });
 
@@ -68,7 +67,6 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
     try { ev = JSON.parse(data.toString()); } catch { return; }
     onAnyMessage?.(ev);
 
-    // Expect "Results" for transcripts
     if (ev.type !== "Results") return;
     const alt = ev.channel?.alternatives?.[0];
     if (!alt) return;
@@ -94,7 +92,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   };
 }
 
-/* ===================== OpenAI brain (tiny) ===================== */
+/* ===================== OpenAI brain ===================== */
 async function brainReply({ systemPrompt, history, userText }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -136,7 +134,7 @@ async function brainReply({ systemPrompt, history, userText }) {
 }
 async function safeRead(res) { try { return await res.text(); } catch { return "(no body)"; } }
 
-/* ===================== ElevenLabs TTS (μ-law 8k) ===================== */
+/* ===================== ElevenLabs TTS (μ-law 8k streaming) ===================== */
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid) return;
   const key = process.env.ELEVEN_API_KEY;
@@ -211,12 +209,33 @@ wss.on("connection", (ws) => {
   const BATCH_FRAMES = 5;
   let pendingULaw = [];
 
+  // Use your business prompt if provided
   const systemPrompt =
+    process.env.AGENT_PROMPT ||
     "You are a premium phone assistant. Be concise, friendly, and proactive. " +
     "Ask clarifying questions before acting. If booking is mentioned, gather date/time/name and confirm next steps plainly.";
 
-  async function handleUserText(text) {
+  // Simple intent hook for background Make jobs (doesn't block the call)
+  async function maybeFireMake(words, callSid) {
+    if (!MAKE_WEBHOOK) return;
+    const needsBooking = /book|appointment|schedule|reserve/i.test(words || "");
+    if (!needsBooking) return;
+    try {
+      await fetch(MAKE_WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "BOOK", callSid, words })
+      });
+      console.log("[Make] BOOK fired");
+    } catch (e) {
+      console.error("[Make] webhook failed:", e?.message || e);
+    }
+  }
+
+  async function handleUserText(text, callSid) {
     console.log("[final ]", text);
+    // fire-and-forget Make if intent matches
+    maybeFireMake(text, callSid).catch(() => {});
     const reply = await brainReply({ systemPrompt, history, userText: text });
     history.push({ role: "user", content: text }, { role: "assistant", content: reply });
     await speakEleven(ws, streamSid, reply);
@@ -227,6 +246,7 @@ wss.on("connection", (ws) => {
 
     if (evt.event === "start") {
       streamSid = evt.start?.streamSid || null;
+      const callSid = evt.start?.callSid || null;
       const biz = evt.start?.customParameters?.biz || "default";
       console.log("WS CONNECTED | streamSid:", streamSid, "| biz:", biz);
 
@@ -234,13 +254,9 @@ wss.on("connection", (ws) => {
         dg = startDeepgramLinear16({
           onOpen: () => { console.log("[Deepgram] opened (ready for audio)"); },
           onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
-          onFinal:   (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
+          onFinal:   (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t, callSid); },
           onError:   (e) => { console.error("[Deepgram] error cb:", e?.message || e); },
-          onAnyMessage: (ev) => {
-            if (ev.type && ev.type !== "Results") {
-              console.log("[Deepgram] msg:", JSON.stringify(ev));
-            }
-          }
+          onAnyMessage: (ev) => { if (ev.type && ev.type !== "Results") console.log("[Deepgram] msg:", JSON.stringify(ev)); }
         });
         setTimeout(() => {
           if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (URL-config)");
