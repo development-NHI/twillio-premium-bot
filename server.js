@@ -1,13 +1,15 @@
-// server.js — Twilio Connect/Stream beep proof
+// server.js — Twilio Connect/Stream + ElevenLabs TTS (with beep fallback)
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
+// ====== config ======
 const PORT = process.env.PORT || 10000;
 
-// ---------- audio helpers ----------
+// ====== audio helpers (μ-law @ 8kHz, 20ms frames) ======
 const SAMPLE_RATE = 8000;
-const FRAME_SAMPLES = 160; // 20ms @ 8kHz
+const FRAME_SAMPLES = 160; // 20ms * 8000
 
 function pcm16ToMuLaw(int16) {
   const out = Buffer.alloc(int16.length);
@@ -41,11 +43,26 @@ function chunkPCM16To20ms(pcm) {
   }
   return frames;
 }
+async function playBeep(ws, streamSid, freq = 440, ms = 400) {
+  if (!streamSid) return;
+  const pcm = makeSinePCM16(freq, ms, 0.25);
+  const frames = chunkPCM16To20ms(pcm);
+  for (const f of frames) {
+    const ulaw = pcm16ToMuLaw(f);
+    const base64 = Buffer.from(ulaw).toString("base64");
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: base64 }
+    }));
+    await new Promise(r => setTimeout(r, 20));
+  }
+}
 
-// ---------- HTTP app ----------
+// ====== HTTP app ======
 const app = express();
 app.get("/", (_, res) => res.type("text/plain").send("OK"));
-// helps verify routing in a browser
+// Helpful browser check for routing:
 app.get("/twilio", (_, res) =>
   res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio")
 );
@@ -55,7 +72,7 @@ app.get("/twilio/", (_, res) =>
 
 const server = http.createServer(app);
 
-// ---------- WebSocket (manual upgrade) ----------
+// ====== WebSocket (manual upgrade) ======
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 server.on("upgrade", (req, socket, head) => {
@@ -72,25 +89,55 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-wss.on("connection", (ws) => {
-  let streamSid = null;
+// ====== ElevenLabs TTS (μ-law 8k streaming) ======
+async function speakEleven(ws, streamSid, text) {
+  if (!streamSid) return;
+  const key = process.env.ELEVEN_API_KEY;
+  const voiceId = process.env.ELEVEN_VOICE_ID;
+  if (!key || !voiceId) {
+    console.log("(!) ELEVEN_API_KEY or ELEVEN_VOICE_ID missing — using beep fallback.");
+    await playBeep(ws, streamSid, 660, 250);
+    return;
+  }
 
-  // send one 500ms beep to the caller
-  async function beep() {
-    if (!streamSid) return;
-    const pcm = makeSinePCM16(440, 500, 0.25);
-    const frames = chunkPCM16To20ms(pcm);
-    for (const f of frames) {
-      const ulaw = pcm16ToMuLaw(f);
-      const base64 = Buffer.from(ulaw).toString("base64");
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": key,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      text,
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+    })
+  });
+
+  if (!res.ok || !res.body) {
+    console.error("[TTS] ElevenLabs HTTP", res.status);
+    await playBeep(ws, streamSid, 440, 250);
+    return;
+  }
+
+  return new Promise((resolve, reject) => {
+    res.body.on("data", (chunk) => {
+      // Already μ-law 8k; just base64 + send
+      const base64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({
         event: "media",
-        streamSid,               // REQUIRED for Twilio to play it
+        streamSid,
         media: { payload: base64 }
       }));
-      await new Promise(r => setTimeout(r, 20));
-    }
-  }
+    });
+    res.body.on("end", resolve);
+    res.body.on("error", reject);
+  });
+}
+
+// ====== WS handler ======
+wss.on("connection", (ws) => {
+  let streamSid = null;
 
   ws.on("message", async (buf) => {
     let evt;
@@ -101,13 +148,12 @@ wss.on("connection", (ws) => {
       const biz = evt.start?.customParameters?.biz || "default";
       console.log("WS CONNECTED | streamSid:", streamSid, "| biz:", biz);
 
-      // play the proof-of-life beep
-      await beep();
-      // optional: mark
-      ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "beep-done" } }));
+      // Speak a simple greeting (replace text later with LLM-driven content)
+      await speakEleven(ws, streamSid, "Hello! Thanks for calling. How can I help you today?");
+      ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "greeting-done" } }));
     }
     else if (evt.event === "media") {
-      // incoming audio frames from caller (unused for beep test)
+      // Incoming caller audio (20ms μ-law base64). Not used yet.
     }
     else if (evt.event === "stop") {
       console.log("Twilio stream STOP");
