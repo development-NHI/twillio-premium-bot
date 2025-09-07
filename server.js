@@ -1,17 +1,14 @@
-// server.js
+// server.js (diagnostic + fix)
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const url = require("url");
 
 const PORT = process.env.PORT || 10000;
-const STREAM_TOKEN = process.env.STREAM_TOKEN || "";
-const MAKE_WEBHOOK = process.env.MAKE_WEBHOOK || "";
 
-// --- μ-law + audio helpers ---
+// ---- μ-law + audio helpers (unchanged) ----
 const SAMPLE_RATE = 8000;
-const FRAME_SAMPLES = 160; // 20ms @ 8kHz
-
+const FRAME_SAMPLES = 160;
 function pcm16ToMuLaw(int16) {
   const out = Buffer.alloc(int16.length);
   for (let i = 0; i < int16.length; i++) {
@@ -27,7 +24,6 @@ function pcm16ToMuLaw(int16) {
   }
   return out;
 }
-
 function makeSinePCM16(freqHz, ms, amplitude = 0.2) {
   const total = Math.floor(SAMPLE_RATE * (ms / 1000));
   const data = new Int16Array(total);
@@ -38,7 +34,6 @@ function makeSinePCM16(freqHz, ms, amplitude = 0.2) {
   }
   return data;
 }
-
 function chunkPCM16To20ms(pcm) {
   const frames = [];
   for (let i = 0; i + FRAME_SAMPLES <= pcm.length; i += FRAME_SAMPLES) {
@@ -47,37 +42,37 @@ function chunkPCM16To20ms(pcm) {
   return frames;
 }
 
-// ---- HTTP app + server
+// ---- HTTP app + server ----
 const app = express();
 app.get("/", (_, res) => res.type("text/plain").send("OK"));
+// If you browse to /twilio over HTTP, return 426 so we know routing hits this app.
+app.get("/twilio", (_, res) => {
+  res.status(426).type("text/plain").send("Upgrade Required: connect via WebSocket (wss) to /twilio");
+});
+app.get("/twilio/", (_, res) => {
+  res.status(426).type("text/plain").send("Upgrade Required: connect via WebSocket (wss) to /twilio/");
+});
 
 const server = http.createServer(app);
 
-// ---- WebSocket server (noServer mode) + manual upgrade
-const wss = new WebSocketServer({
-  noServer: true,
-  // Twilio doesn’t need compression; some proxies misbehave with it
-  perMessageDeflate: false
-});
+// ---- WebSocket server (manual upgrade) ----
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 
 server.on("upgrade", (req, socket, head) => {
+  // Loud diagnostics so we see exactly what Twilio sent
   try {
-    const { pathname, search } = new URL(req.url, `http://${req.headers.host}`);
-    if (pathname !== "/twilio") {
-      // Not our WS endpoint
-      socket.destroy();
-      return;
-    }
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    console.log("[UPGRADE] path:", u.pathname, "search:", u.search);
+    console.log("[UPGRADE] headers:",
+      "Host:", req.headers.host,
+      "| Sec-WebSocket-Version:", req.headers["sec-websocket-version"],
+      "| Sec-WebSocket-Key:", req.headers["sec-websocket-key"] ? "(present)" : "(missing)"
+    );
 
-    // Validate token before upgrading (reject with 401)
-    const q = url.parse(pathname + search, true).query;
-    const tokenValid = !STREAM_TOKEN || q.token === STREAM_TOKEN;
-    if (!tokenValid) {
-      socket.write(
-        "HTTP/1.1 401 Unauthorized\r\n" +
-        "Connection: close\r\n" +
-        "\r\n"
-      );
+    // Accept both /twilio and /twilio/ (some proxies add trailing slash)
+    if (u.pathname !== "/twilio" && u.pathname !== "/twilio/") {
+      console.log("[UPGRADE] rejecting: wrong path");
+      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
@@ -87,16 +82,15 @@ server.on("upgrade", (req, socket, head) => {
       wss.emit("connection", ws, req);
     });
   } catch (e) {
-    // If anything goes wrong, close cleanly so Twilio gets a non-101
+    console.error("[UPGRADE] exception:", e);
     try { socket.destroy(); } catch {}
   }
 });
 
-// ---- WS connection handler
 wss.on("connection", (ws, req) => {
   const q = url.parse(req.url, true).query;
   const bizId = q.biz || "default";
-  console.log("Twilio WS CONNECTED. biz:", bizId);
+  console.log("✔ Twilio WS CONNECTED | biz:", bizId);
 
   const call = makeCallState(ws);
 
@@ -111,16 +105,13 @@ wss.on("connection", (ws, req) => {
       case "start":
         call.id = evt.start?.callSid || null;
         console.log("CallSid:", call.id);
-        // Prove outbound audio path: quick beep
-        call.speak("beep");
+        // Prove outbound audio path: beep
+        call.speak();
         break;
 
-      case "media": {
-        // Caller audio (20ms μ-law 8kHz base64)
-        // We’re not transcribing yet—just acknowledge.
-        // const frame = evt.media?.payload;
+      case "media":
+        // const frame = evt.media?.payload; // 20ms μ-law base64
         break;
-      }
 
       case "stop":
         console.log("Twilio stream STOP");
@@ -136,7 +127,7 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (e) => console.error("WS error", e));
 });
 
-// ---- Per-call state
+// ---- Per-call state ----
 function makeCallState(ws) {
   let callId = null;
   let mode = "listening";
@@ -145,11 +136,10 @@ function makeCallState(ws) {
     ws.send(JSON.stringify({ event: "media", media: { payload: base64Ulaw } }));
   }
 
-  async function speak(_replyText) {
+  async function speak() {
     mode = "responding";
     const pcm = makeSinePCM16(440, 500, 0.2);
     const frames = chunkPCM16To20ms(pcm);
-
     for (const frame of frames) {
       const ulaw = pcm16ToMuLaw(frame);
       const base64 = Buffer.from(ulaw).toString("base64");
@@ -159,15 +149,9 @@ function makeCallState(ws) {
     mode = "listening";
   }
 
-  async function onIncomingAudio(_base64Ulaw) {
-    if (mode === "responding") mode = "listening";
-    // (ASR will go here later)
-  }
-
   return {
     get id() { return callId; },
     set id(v) { callId = v; },
-    onIncomingAudio,
     speak
   };
 }
