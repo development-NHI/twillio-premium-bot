@@ -1,4 +1,4 @@
-// server.js — Twilio Connect/Stream + Deepgram ASR (mulaw, 200ms batching) + OpenAI brain + ElevenLabs TTS
+// server.js — Twilio Connect/Stream + Deepgram ASR (linear16 via correct μ-law decode) + OpenAI brain + ElevenLabs TTS
 // with DIAGNOSTIC LOGS
 
 const express = require("express");
@@ -8,14 +8,38 @@ const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...ar
 
 const PORT = process.env.PORT || 10000;
 
-// ====================== Deepgram realtime (mulaw) ======================
-function startDeepgramMulaw({ onOpen, onPartial, onFinal, onError }) {
+// ====================== G.711 μ-law -> PCM16 (correct decode) ======================
+function ulawByteToPcm16(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80;
+  let exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
+  if (sign) sample = -sample;
+  // clamp to 16-bit
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+  return sample;
+}
+
+function ulawBufferToPCM16LEBuffer(ulawBuf) {
+  const out = Buffer.alloc(ulawBuf.length * 2); // 16-bit little-endian
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const s = ulawByteToPcm16(ulawBuf[i]);
+    out.writeInt16LE(s, i * 2);
+  }
+  return out;
+}
+
+// ====================== Deepgram realtime (linear16) ======================
+function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
 
+  // Tell Deepgram we are sending linear16 PCM at 8kHz mono
   const url =
     "wss://api.deepgram.com/v1/listen" +
-    "?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&vad_turnoff=500";
+    "?encoding=linear16&sample_rate=8000&channels=1&punctuate=true&vad_turnoff=500";
 
   const dg = new WebSocket(url, {
     headers: { Authorization: `Token ${key}` },
@@ -27,7 +51,7 @@ function startDeepgramMulaw({ onOpen, onPartial, onFinal, onError }) {
 
   dg.on("open", () => {
     open = true;
-    console.log("[Deepgram] ws open (mulaw)");
+    console.log("[Deepgram] ws open (linear16)");
     onOpen?.();
     while (q.length) dg.send(q.shift());
   });
@@ -56,10 +80,9 @@ function startDeepgramMulaw({ onOpen, onPartial, onFinal, onError }) {
   });
 
   return {
-    // For mulaw: send the raw μ-law bytes directly
-    sendULaw(ulawBuffer) {
-      if (open) dg.send(ulawBuffer);
-      else q.push(ulawBuffer);
+    sendPCM16LE(buf) {
+      if (open) dg.send(buf);
+      else q.push(buf);
     },
     close() {
       try { dg.close(); } catch {}
@@ -169,7 +192,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ====================== WS logic: Twilio media (mulaw) → batch → Deepgram → OpenAI → ElevenLabs ======================
+// ====================== WS logic: Twilio media (μ-law) → batch → decode → Deepgram (linear16) → OpenAI → ElevenLabs ======================
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
@@ -180,11 +203,13 @@ wss.on("connection", (ws) => {
   // batch 10 frames (≈200ms) before sending to Deepgram
   const BATCH_FRAMES = 10;
   let pendingFrames = [];
+
   function flushBatch(reason) {
     if (!pendingFrames.length || !dg) return;
-    const chunk = Buffer.concat(pendingFrames);
-    console.log(`[media→DG] sending batched ulaw chunk (${chunk.length} bytes) ${reason ? "| " + reason : ""}`);
-    try { dg.sendULaw(chunk); } catch (e) { console.error("[media] sendULaw error:", e?.message || e); }
+    const ulawChunk = Buffer.concat(pendingFrames);
+    const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+    console.log(`[media→DG] sending PCM16 chunk (${pcm16le.length} bytes from ${ulawChunk.length} ulaw) ${reason ? "| " + reason : ""}`);
+    try { dg.sendPCM16LE(pcm16le); } catch (e) { console.error("[media] sendPCM16 error:", e?.message || e); }
     pendingFrames = [];
   }
 
@@ -208,14 +233,14 @@ wss.on("connection", (ws) => {
       console.log("WS CONNECTED | streamSid:", streamSid, "| biz:", biz);
 
       if (process.env.DEEPGRAM_API_KEY) {
-        dg = startDeepgramMulaw({
-          onOpen: () => { console.log("[Deepgram] opened (mulaw, ready for audio)"); },
+        dg = startDeepgramLinear16({
+          onOpen: () => { console.log("[Deepgram] opened (linear16, ready for audio)"); },
           onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
           onFinal: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
           onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); }
         });
         setTimeout(() => {
-          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check mulaw batching)");
+          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check linear16 stream)");
         }, 4000);
       } else {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled (it won't hear you).");
@@ -225,6 +250,7 @@ wss.on("connection", (ws) => {
     }
 
     else if (evt.event === "media") {
+      // 20ms μ-law 8k frame (base64)
       frameCount++;
       if (frameCount % 50 === 1) console.log("[media] frames so far:", frameCount);
       const b64 = evt.media?.payload || "";
@@ -245,7 +271,7 @@ wss.on("connection", (ws) => {
 
     else if (evt.event === "stop") {
       console.log("Twilio stream STOP");
-      flushBatch("on stop"); // push any remainder
+      flushBatch("on stop"); // push remainder
       if (dg) dg.close();
     }
   });
