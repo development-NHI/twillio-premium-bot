@@ -1,5 +1,7 @@
-// server.js — Twilio Connect/Stream + Deepgram ASR (linear16 with explicit "start" config) + OpenAI + ElevenLabs
-// Changes: Deepgram "start" message, model=nova-2-phonecall, always send audio (no VAD filter), 100ms batching, extra DG logs.
+// server.js — Twilio Connect/Stream + Deepgram ASR (URL-config, linear16) + OpenAI brain + ElevenLabs TTS
+// - Deepgram configured via URL params (no control messages).
+// - μ-law (Twilio) -> PCM16LE (Deepgram) with 100ms batching.
+// - Extra logs to diagnose end-to-end.
 
 const express = require("express");
 const http = require("http");
@@ -8,7 +10,7 @@ const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...ar
 
 const PORT = process.env.PORT || 10000;
 
-// =============== μ-law -> PCM16 (correct) ===============
+/* ===================== μ-law -> PCM16LE (correct) ===================== */
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -29,14 +31,25 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// =============== Deepgram realtime (explicit "start" config) ===============
+/* ===================== Deepgram realtime (URL-config) ===================== */
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
 
-  const url = "wss://api.deepgram.com/v1/listen"; // config via "start" message
+  // All configuration via querystring. We send only binary audio frames.
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=linear16"
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&language=en-US"
+    + "&endpointing=250";
+
   const dg = new WebSocket(url, {
-    headers: { Authorization: `Token ${key}` },
+    headers: { Authorization: `token ${key}` }, // "token <key>" per Deepgram docs
     perMessageDeflate: false,
   });
 
@@ -45,39 +58,23 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
 
   dg.on("open", () => {
     open = true;
-    console.log("[Deepgram] ws open");
-    // Send explicit start/config message
-    const startMsg = {
-      type: "start",
-      encoding: "linear16",
-      sample_rate: 8000,
-      channels: 1,
-      model: "nova-2-phonecall",
-      interim_results: true,
-      smart_format: true,
-      language: "en-US",
-      endpointing: 250,       // try quicker end-of-utterance
-      diarize: false
-    };
-    dg.send(JSON.stringify(startMsg));
+    console.log("[Deepgram] ws open (URL-config)");
     onOpen?.();
     while (q.length) dg.send(q.shift());
   });
 
   dg.on("message", (data) => {
     let ev;
-    try { ev = JSON.parse(data.toString()); } catch {
-      // not JSON (rare) — ignore
-      return;
-    }
+    try { ev = JSON.parse(data.toString()); } catch { return; }
     onAnyMessage?.(ev);
 
-    if (ev.type !== "transcript") return;
+    // Expect "Results" for transcripts
+    if (ev.type !== "Results") return;
     const alt = ev.channel?.alternatives?.[0];
     if (!alt) return;
     const text = (alt.transcript || "").trim();
     if (!text) return;
-    const isFinal = ev.is_final || alt?.words?.some(w => w?.is_final);
+    const isFinal = ev.is_final === true || ev.speech_final === true;
     if (isFinal) onFinal?.(text);
     else onPartial?.(text);
   });
@@ -92,15 +89,12 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   });
 
   return {
-    sendPCM16LE(buf) {
-      if (open) dg.send(buf);
-      else q.push(buf);
-    },
+    sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
     close() { try { dg.close(); } catch {} },
   };
 }
 
-// =============== OpenAI brain (tiny) ===============
+/* ===================== OpenAI brain (tiny) ===================== */
 async function brainReply({ systemPrompt, history, userText }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -142,7 +136,7 @@ async function brainReply({ systemPrompt, history, userText }) {
 }
 async function safeRead(res) { try { return await res.text(); } catch { return "(no body)"; } }
 
-// =============== ElevenLabs TTS (μ-law 8k streaming) ===============
+/* ===================== ElevenLabs TTS (μ-law 8k) ===================== */
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid) return;
   const key = process.env.ELEVEN_API_KEY;
@@ -152,6 +146,7 @@ async function speakEleven(ws, streamSid, text) {
     return;
   }
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+
   let res;
   try {
     res = await fetch(url, {
@@ -163,10 +158,12 @@ async function speakEleven(ws, streamSid, text) {
     console.error("[TTS] network error:", e?.message || e);
     return;
   }
+
   if (!res.ok || !res.body) {
     console.error("[TTS] HTTP", res.status, await safeRead(res));
     return;
   }
+
   console.log("[TTS] streaming reply bytes…");
   return new Promise((resolve, reject) => {
     res.body.on("data", (chunk) => {
@@ -178,14 +175,14 @@ async function speakEleven(ws, streamSid, text) {
   });
 }
 
-// =============== HTTP app (health + browser check) ===============
+/* ===================== HTTP app (health + browser check) ===================== */
 const app = express();
 app.get("/",  (_, res) => res.type("text/plain").send("OK"));
 app.get("/twilio",  (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio"));
 app.get("/twilio/", (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio/"));
 const server = http.createServer(app);
 
-// =============== WebSocket (manual upgrade) ===============
+/* ===================== WebSocket (manual upgrade) ===================== */
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
 server.on("upgrade", (req, socket, head) => {
   try {
@@ -202,7 +199,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// =============== WS logic: Twilio μ-law → 100ms batch → decode → Deepgram → OpenAI → ElevenLabs ===============
+/* ===================== Twilio μ-law → batch → decode → Deepgram → OpenAI → ElevenLabs ===================== */
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
@@ -210,7 +207,7 @@ wss.on("connection", (ws) => {
   let frameCount = 0;
   const history = [];
 
-  // batch 5 frames (≈100ms) for lower latency
+  // 5 frames * 20ms = 100ms per batch (low latency)
   const BATCH_FRAMES = 5;
   let pendingULaw = [];
 
@@ -237,17 +234,16 @@ wss.on("connection", (ws) => {
         dg = startDeepgramLinear16({
           onOpen: () => { console.log("[Deepgram] opened (ready for audio)"); },
           onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
-          onFinal: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
-          onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); },
+          onFinal:   (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
+          onError:   (e) => { console.error("[Deepgram] error cb:", e?.message || e); },
           onAnyMessage: (ev) => {
-            // Log non-transcript messages to see warnings/errors/config acks
-            if (ev.type && ev.type !== "transcript") {
+            if (ev.type && ev.type !== "Results") {
               console.log("[Deepgram] msg:", JSON.stringify(ev));
             }
           }
         });
         setTimeout(() => {
-          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (explicit start sent)");
+          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (URL-config)");
         }, 5000);
       } else {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled (it won't hear you).");
@@ -264,6 +260,7 @@ wss.on("connection", (ws) => {
         if (frameCount % 50 === 1) console.log("[media] empty frame payload");
         return;
       }
+
       const ulaw = Buffer.from(b64, "base64");
       if (frameCount % 100 === 1) {
         const sample = ulaw.subarray(0, Math.min(8, ulaw.length));
