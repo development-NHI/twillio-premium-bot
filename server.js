@@ -112,17 +112,19 @@ function makeCallState(ws) {
   let callId = null;
   let streamSid = null;
 
-  function sendAudioFrame(base64Ulaw) {
-    if (!streamSid) {
-      console.warn("(!) Tried to send audio without streamSid yet");
-      return;
-    }
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,                 // <-- REQUIRED for Twilio to accept audio
-      media: { payload: base64Ulaw }
-    }));
+function sendAudioFrame(base64Ulaw) {
+  if (!streamSid) {
+    console.warn("(!) Tried to send audio without streamSid yet");
+    return;
   }
+  ws.send(JSON.stringify({
+    event: "media",
+    streamSid,                 // required
+    track: "outbound",         // <-- tell Twilio this is audio going back to the caller
+    media: { payload: base64Ulaw }
+  }));
+}
+
 
   function mark(name) {
     if (!streamSid) return;
@@ -151,3 +153,4 @@ function makeCallState(ws) {
 }
 
 server.listen(PORT, () => console.log(`Server running on 0.0.0.0:${PORT}`));
+
