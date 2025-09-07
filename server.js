@@ -1,4 +1,4 @@
-// server.js — Twilio Connect/Stream + Deepgram ASR (mulaw) + OpenAI brain + ElevenLabs TTS
+// server.js — Twilio Connect/Stream + Deepgram ASR (mulaw, 200ms batching) + OpenAI brain + ElevenLabs TTS
 // with DIAGNOSTIC LOGS
 
 const express = require("express");
@@ -13,7 +13,6 @@ function startDeepgramMulaw({ onOpen, onPartial, onFinal, onError }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
 
-  // Tell Deepgram we are sending μ-law bytes at 8kHz
   const url =
     "wss://api.deepgram.com/v1/listen" +
     "?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true&vad_turnoff=500";
@@ -170,13 +169,24 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ====================== WS logic: Twilio media (mulaw) → Deepgram → OpenAI → ElevenLabs ======================
+// ====================== WS logic: Twilio media (mulaw) → batch → Deepgram → OpenAI → ElevenLabs ======================
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
   let dgOpened = false;
   let frameCount = 0;
   const history = [];
+
+  // batch 10 frames (≈200ms) before sending to Deepgram
+  const BATCH_FRAMES = 10;
+  let pendingFrames = [];
+  function flushBatch(reason) {
+    if (!pendingFrames.length || !dg) return;
+    const chunk = Buffer.concat(pendingFrames);
+    console.log(`[media→DG] sending batched ulaw chunk (${chunk.length} bytes) ${reason ? "| " + reason : ""}`);
+    try { dg.sendULaw(chunk); } catch (e) { console.error("[media] sendULaw error:", e?.message || e); }
+    pendingFrames = [];
+  }
 
   const systemPrompt =
     "You are a premium phone assistant. Be concise, friendly, and proactive. " +
@@ -205,18 +215,16 @@ wss.on("connection", (ws) => {
           onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); }
         });
         setTimeout(() => {
-          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check that raw mulaw frames are being sent)");
-        }, 3000);
+          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check mulaw batching)");
+        }, 4000);
       } else {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled (it won't hear you).");
       }
 
-      // Opening line
       await speakEleven(ws, streamSid, "Hi there. How can I help you?");
     }
 
     else if (evt.event === "media") {
-      // 20ms μ-law 8kHz frame (base64)
       frameCount++;
       if (frameCount % 50 === 1) console.log("[media] frames so far:", frameCount);
       const b64 = evt.media?.payload || "";
@@ -225,24 +233,24 @@ wss.on("connection", (ws) => {
         return;
       }
       const ulaw = Buffer.from(b64, "base64");
-      // quick entropy-ish check to ensure it’s not all one byte
       if (frameCount % 100 === 1) {
         const sample = ulaw.subarray(0, Math.min(8, ulaw.length));
         console.log("[media] first bytes:", [...sample].map(x => x.toString(16).padStart(2,"0")).join(" "));
       }
       if (dg) {
-        try { dg.sendULaw(ulaw); }
-        catch (e) { console.error("[media] sendULaw error:", e?.message || e); }
+        pendingFrames.push(ulaw);
+        if (pendingFrames.length >= BATCH_FRAMES) flushBatch();
       }
     }
 
     else if (evt.event === "stop") {
       console.log("Twilio stream STOP");
+      flushBatch("on stop"); // push any remainder
       if (dg) dg.close();
     }
   });
 
-  ws.on("close", () => { if (dg) dg.close(); console.log("WS closed"); });
+  ws.on("close", () => { flushBatch("on close"); if (dg) dg.close(); console.log("WS closed"); });
   ws.on("error", (e) => console.error("WS error", e?.message || e));
 });
 
