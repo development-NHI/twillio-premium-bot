@@ -1,5 +1,5 @@
-// server.js — Twilio Connect/Stream + Deepgram ASR (linear16 w/ VAD) + OpenAI brain + ElevenLabs TTS
-// Adds: phonecall model, interim results, RMS logs, only sends voiced batches.
+// server.js — Twilio Connect/Stream + Deepgram ASR (linear16 with explicit "start" config) + OpenAI + ElevenLabs
+// Changes: Deepgram "start" message, model=nova-2-phonecall, always send audio (no VAD filter), 100ms batching, extra DG logs.
 
 const express = require("express");
 const http = require("http");
@@ -29,29 +29,12 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// Simple RMS calculator for a PCM16LE buffer
-function rmsPcm16LE(buf) {
-  let sumSq = 0;
-  const n = buf.length / 2;
-  if (n === 0) return 0;
-  for (let i = 0; i < buf.length; i += 2) {
-    const v = buf.readInt16LE(i);
-    sumSq += v * v;
-  }
-  return Math.sqrt(sumSq / n) / 32768; // 0..1
-}
-
-// =============== Deepgram realtime (linear16) ===============
-function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError }) {
+// =============== Deepgram realtime (explicit "start" config) ===============
+function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
 
-  // Use phonecall model, interim results, smart formatting.
-  const url =
-    "wss://api.deepgram.com/v1/listen" +
-    "?encoding=linear16&sample_rate=8000&channels=1" +
-    "&model=phonecall&interim_results=true&smart_format=true&vad_turnoff=500";
-
+  const url = "wss://api.deepgram.com/v1/listen"; // config via "start" message
   const dg = new WebSocket(url, {
     headers: { Authorization: `Token ${key}` },
     perMessageDeflate: false,
@@ -62,23 +45,41 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError }) {
 
   dg.on("open", () => {
     open = true;
-    console.log("[Deepgram] ws open (linear16, phonecall)");
+    console.log("[Deepgram] ws open");
+    // Send explicit start/config message
+    const startMsg = {
+      type: "start",
+      encoding: "linear16",
+      sample_rate: 8000,
+      channels: 1,
+      model: "nova-2-phonecall",
+      interim_results: true,
+      smart_format: true,
+      language: "en-US",
+      endpointing: 250,       // try quicker end-of-utterance
+      diarize: false
+    };
+    dg.send(JSON.stringify(startMsg));
     onOpen?.();
     while (q.length) dg.send(q.shift());
   });
 
   dg.on("message", (data) => {
-    try {
-      const ev = JSON.parse(data.toString());
-      if (ev.type !== "transcript") return;
-      const alt = ev.channel?.alternatives?.[0];
-      if (!alt) return;
-      const text = (alt.transcript || "").trim();
-      if (!text) return;
-      const isFinal = ev.is_final || alt.words?.some((w) => w?.is_final);
-      if (isFinal) onFinal?.(text);
-      else onPartial?.(text);
-    } catch {}
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch {
+      // not JSON (rare) — ignore
+      return;
+    }
+    onAnyMessage?.(ev);
+
+    if (ev.type !== "transcript") return;
+    const alt = ev.channel?.alternatives?.[0];
+    if (!alt) return;
+    const text = (alt.transcript || "").trim();
+    if (!text) return;
+    const isFinal = ev.is_final || alt?.words?.some(w => w?.is_final);
+    if (isFinal) onFinal?.(text);
+    else onPartial?.(text);
   });
 
   dg.on("error", (e) => {
@@ -201,7 +202,7 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// =============== WS logic: Twilio media (μ-law) → batch → decode → VAD → Deepgram → OpenAI → ElevenLabs ===============
+// =============== WS logic: Twilio μ-law → 100ms batch → decode → Deepgram → OpenAI → ElevenLabs ===============
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
@@ -209,29 +210,9 @@ wss.on("connection", (ws) => {
   let frameCount = 0;
   const history = [];
 
-  // batching
-  const BATCH_FRAMES = 10; // 10 * 20ms = 200ms
+  // batch 5 frames (≈100ms) for lower latency
+  const BATCH_FRAMES = 5;
   let pendingULaw = [];
-
-  // VAD thresholds (tune if needed)
-  const RMS_TALKING = 0.02;   // ~2% of full scale = likely speech
-  const RMS_SILENCE = 0.005;  // below this, consider silence
-
-  function flushBatch(reason) {
-    if (!pendingULaw.length || !dg) return;
-    const ulawChunk = Buffer.concat(pendingULaw);
-    const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-    const rms = rmsPcm16LE(pcm16le);
-    const tag = rms >= RMS_TALKING ? "voice" : (rms <= RMS_SILENCE ? "silence" : "maybe");
-    console.log(`[media→DG] chunk ${pcm16le.length}B (from ${ulawChunk.length}B μ-law) | [vad] rms=${rms.toFixed(4)} (${tag}) ${reason? "| "+reason:""}`);
-
-    // Only send voiced or maybe-voiced chunks to ASR to avoid wasting buffer
-    if (rms >= RMS_SILENCE) {
-      try { dg.sendPCM16LE(pcm16le); }
-      catch (e) { console.error("[media] sendPCM16 error:", e?.message || e); }
-    }
-    pendingULaw = [];
-  }
 
   const systemPrompt =
     "You are a premium phone assistant. Be concise, friendly, and proactive. " +
@@ -254,13 +235,19 @@ wss.on("connection", (ws) => {
 
       if (process.env.DEEPGRAM_API_KEY) {
         dg = startDeepgramLinear16({
-          onOpen: () => { console.log("[Deepgram] opened (linear16, phonecall, ready for audio)"); },
+          onOpen: () => { console.log("[Deepgram] opened (ready for audio)"); },
           onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
           onFinal: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t); },
-          onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); }
+          onError: (e) => { console.error("[Deepgram] error cb:", e?.message || e); },
+          onAnyMessage: (ev) => {
+            // Log non-transcript messages to see warnings/errors/config acks
+            if (ev.type && ev.type !== "transcript") {
+              console.log("[Deepgram] msg:", JSON.stringify(ev));
+            }
+          }
         });
         setTimeout(() => {
-          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (check VAD/RMS)");
+          if (!dgOpened) console.log("(!) Deepgram connected but no transcripts yet (explicit start sent)");
         }, 5000);
       } else {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled (it won't hear you).");
@@ -285,18 +272,30 @@ wss.on("connection", (ws) => {
 
       if (dg) {
         pendingULaw.push(ulaw);
-        if (pendingULaw.length >= BATCH_FRAMES) flushBatch();
+        if (pendingULaw.length >= BATCH_FRAMES) {
+          const ulawChunk = Buffer.concat(pendingULaw);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          console.log(`[media→DG] send PCM16 chunk ${pcm16le.length}B (from ${ulawChunk.length}B μ-law)`);
+          try { dg.sendPCM16LE(pcm16le); } catch (e) { console.error("[media] sendPCM16 error:", e?.message || e); }
+          pendingULaw = [];
+        }
       }
     }
 
     else if (evt.event === "stop") {
       console.log("Twilio stream STOP");
-      flushBatch("on stop");
+      if (pendingULaw.length && dg) {
+        const ulawChunk = Buffer.concat(pendingULaw);
+        const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+        console.log(`[media→DG] final PCM16 chunk ${pcm16le.length}B (from ${ulawChunk.length}B μ-law) | on stop`);
+        try { dg.sendPCM16LE(pcm16le); } catch {}
+        pendingULaw = [];
+      }
       if (dg) dg.close();
     }
   });
 
-  ws.on("close", () => { flushBatch("on close"); if (dg) dg.close(); console.log("WS closed"); });
+  ws.on("close", () => { if (dg) dg.close(); console.log("WS closed"); });
   ws.on("error", (e) => console.error("WS error", e?.message || e));
 });
 
