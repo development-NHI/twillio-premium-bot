@@ -1,4 +1,4 @@
-// server.js — Twilio Stream + Deepgram + OpenAI + ElevenLabs + Make (Create/Read/Delete)
+// server.js — Twilio Connect/Stream + Deepgram + OpenAI brain + ElevenLabs TTS + Make integration
 
 const express = require("express");
 const http = require("http");
@@ -6,13 +6,11 @@ const { WebSocketServer } = require("ws");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const PORT = process.env.PORT || 10000;
+const MAKE_CREATE = process.env.MAKE_CREATE || "";
+const MAKE_READ   = process.env.MAKE_READ   || "";
+const MAKE_DELETE = process.env.MAKE_DELETE || "";
 
-// === YOUR MAKE WEBHOOKS (hard-coded here) ===
-const MAKE_CREATE = "https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm";
-const MAKE_READ   = "https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax";
-const MAKE_DELETE = "https://hook.us2.make.com/noy0e27knj7e1jlomtznw34z246i3xtv";
-
-// ================= μ-law conversion =================
+/* ========== μ-law decode ========== */
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -33,38 +31,51 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ================= Deepgram =================
-function startDeepgramLinear16({ onFinal }) {
+/* ========== Deepgram realtime ========== */
+function startDeepgramLinear16({ onOpen, onPartial, onFinal }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
+
   const url =
-    "wss://api.deepgram.com/v1/listen"
-    + "?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall"
-    + "&interim_results=true&smart_format=true&language=en-US&endpointing=250";
+    "wss://api.deepgram.com/v1/listen" +
+    "?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall" +
+    "&interim_results=true&smart_format=true&language=en-US&endpointing=250";
 
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${key}` },
     perMessageDeflate: false,
   });
 
-  dg.on("open", () => console.log("[Deepgram] connected"));
+  let open = false;
+  const q = [];
+
+  dg.on("open", () => {
+    open = true;
+    console.log("[Deepgram] ws open");
+    onOpen?.();
+    while (q.length) dg.send(q.shift());
+  });
+
   dg.on("message", (data) => {
     let ev;
     try { ev = JSON.parse(data.toString()); } catch { return; }
     if (ev.type !== "Results") return;
     const alt = ev.channel?.alternatives?.[0];
-    const text = (alt?.transcript || "").trim();
+    if (!alt) return;
+    const text = (alt.transcript || "").trim();
     if (!text) return;
-    if (ev.is_final) onFinal?.(text);
+    const isFinal = ev.is_final === true || ev.speech_final === true;
+    if (isFinal) onFinal?.(text);
+    else onPartial?.(text);
   });
 
   return {
-    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
+    sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
     close() { try { dg.close(); } catch {} },
   };
 }
 
-// ================= OpenAI =================
+/* ========== OpenAI brain ========== */
 async function brainReply({ systemPrompt, history, userText }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return `You said: "${userText}".`;
@@ -76,14 +87,14 @@ async function brainReply({ systemPrompt, history, userText }) {
       ...history,
       { role: "user", content: userText }
     ],
-    temperature: 0.4,
-    max_tokens: 200,
+    temperature: 0.5,
+    max_tokens: 120
   };
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
 
   if (!res.ok) return `You said: "${userText}".`;
@@ -91,7 +102,33 @@ async function brainReply({ systemPrompt, history, userText }) {
   return json.choices?.[0]?.message?.content?.trim() || `You said: "${userText}".`;
 }
 
-// ================= ElevenLabs =================
+/* ========== Strict JSON extractor ========== */
+async function extractBookingData(userText) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const body = {
+    model: "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: "Always return valid JSON only. Keys allowed: intent (CREATE, READ, DELETE), Event_Name, Start_Time, End_Time, Customer_Name, Customer_Phone, Customer_Email, Notes, id."
+      },
+      { role: "user", content: userText }
+    ]
+  };
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  const json = await res.json();
+  try { return JSON.parse(json.choices[0].message.content); }
+  catch { return {}; }
+}
+
+/* ========== ElevenLabs TTS ========== */
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid) return;
   const key = process.env.ELEVEN_API_KEY;
@@ -103,138 +140,114 @@ async function speakEleven(ws, streamSid, text) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "xi-api-key": key, "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text })
   });
+
   if (!res.ok || !res.body) return;
 
-  res.body.on("data", (chunk) => {
-    const base64 = Buffer.from(chunk).toString("base64");
-    ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
+  return new Promise((resolve) => {
+    res.body.on("data", (chunk) => {
+      const base64 = Buffer.from(chunk).toString("base64");
+      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
+    });
+    res.body.on("end", () => resolve());
   });
 }
 
-// ================= Call Make =================
-async function callMake(url, payload, label) {
+/* ========== Make call helper ========== */
+async function callMake(url, payload) {
+  if (!url) return null;
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload)
     });
-    console.log(`[Make] ${label} status`, res.status);
     return await res.json().catch(() => ({}));
   } catch (e) {
-    console.error(`[Make] ${label} error`, e?.message || e);
-    return {};
+    console.error("[Make] call failed", e.message);
+    return null;
   }
 }
 
-// ================= HTTP =================
+/* ========== Express server ========== */
 const app = express();
 app.get("/", (_, res) => res.type("text/plain").send("OK"));
+app.get("/twilio", (_, res) => res.status(426).send("Upgrade Required"));
 const server = http.createServer(app);
 
-// ================= WebSocket =================
+/* ========== WebSocket (Twilio) ========== */
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   const u = new URL(req.url, `http://${req.headers.host}`);
   if (!u.pathname.startsWith("/twilio")) {
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-    return socket.destroy();
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n"); socket.destroy(); return;
   }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-// ================= Session =================
+/* ========== Twilio call handling ========== */
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
+  const history = [];
+
+  const systemPrompt = process.env.AGENT_PROMPT || "You are a barbershop phone assistant.";
 
   async function handleUserText(text) {
     console.log("[user]", text);
+    const bookingData = await extractBookingData(text);
+    console.log("[extracted]", bookingData);
 
-    // Extract structured booking info
-    const extractionPrompt = `
-      Extract JSON with keys:
-      { Event_Name, Start_Time, End_Time, Customer_Name, Customer_Phone, Customer_Email, Notes, intent }.
-      intent should be CREATE, READ, or DELETE.
-      If no match, return {}.
-      User said: """${text}"""`;
+    if (bookingData.intent === "CREATE" && MAKE_CREATE) {
+      const payload = { api_key: "APPLES2025!", ...bookingData };
+      await callMake(MAKE_CREATE, payload);
+      return speakEleven(ws, streamSid, `Your ${bookingData.Event_Name || "appointment"} has been booked.`);
+    }
 
-    let bookingData = {};
-    try {
-      const raw = await brainReply({ systemPrompt: "Return JSON only.", history: [], userText: extractionPrompt });
-      bookingData = JSON.parse(raw);
-    } catch { bookingData = {}; }
-
-    // === Handle CREATE ===
-    if (bookingData.intent === "CREATE") {
-      const readPayload = {
-        api_key: "APPLES2025!",
-        intent: "READ",
-        biz: "acme-001",
-        source: "phone",
-        window: { start: bookingData.Start_Time, end: bookingData.End_Time },
-      };
-      const existing = await callMake(MAKE_READ, readPayload, "READ");
-      if (existing?.events?.length) {
-        return speakEleven(ws, streamSid, "That slot is already booked. Would you like another time?");
+    if (bookingData.intent === "READ" && MAKE_READ) {
+      const payload = { api_key: "APPLES2025!", ...bookingData };
+      const resp = await callMake(MAKE_READ, payload);
+      if (resp?.events?.length) {
+        const list = resp.events.map(e => `${e.summary} at ${e.start}`).join(", ");
+        return speakEleven(ws, streamSid, `Here are your appointments: ${list}`);
+      } else {
+        return speakEleven(ws, streamSid, "No appointments found in that timeframe.");
       }
-
-      const createPayload = {
-        api_key: "APPLES2025!",
-        intent: "CREATE",
-        biz: "acme-001",
-        source: "phone",
-        ...bookingData,
-      };
-      await callMake(MAKE_CREATE, createPayload, "CREATE");
-      return speakEleven(ws, streamSid, `Your ${bookingData.Event_Name} was booked for ${bookingData.Start_Time}.`);
     }
 
-    // === Handle DELETE ===
-    if (bookingData.intent === "DELETE") {
-      const delPayload = {
-        api_key: "APPLES2025!",
-        intent: "DELETE",
-        biz: "acme-001",
-        source: "phone",
-        id: bookingData.id,
-      };
-      await callMake(MAKE_DELETE, delPayload, "DELETE");
-      return speakEleven(ws, streamSid, "Your appointment was canceled.");
+    if (bookingData.intent === "DELETE" && MAKE_DELETE) {
+      const payload = { api_key: "APPLES2025!", ...bookingData };
+      await callMake(MAKE_DELETE, payload);
+      return speakEleven(ws, streamSid, "Your appointment has been cancelled.");
     }
 
-    // === Fallback chat ===
-    const reply = await brainReply({
-      systemPrompt: "You are a helpful barbershop phone agent.",
-      history: [],
-      userText: text,
-    });
-    await speakEleven(ws, streamSid, reply);
+    const reply = await brainReply({ systemPrompt, history, userText: text });
+    history.push({ role: "user", content: text }, { role: "assistant", content: reply });
+    return speakEleven(ws, streamSid, reply);
   }
 
-  ws.on("message", async (buf) => {
-    let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
-
+  ws.on("message", (buf) => {
+    const evt = JSON.parse(buf.toString());
     if (evt.event === "start") {
       streamSid = evt.start?.streamSid;
-      console.log("WS CONNECTED", streamSid);
-      dg = startDeepgramLinear16({ onFinal: (t) => handleUserText(t) });
-      await speakEleven(ws, streamSid, "Hi, welcome to Old Line Barbershop. How can I help?");
+      console.log("WS CONNECTED |", streamSid);
+      dg = startDeepgramLinear16({
+        onFinal: (t) => handleUserText(t)
+      });
+      speakEleven(ws, streamSid, "Hi there, this is Old Line Barbershop. How can I help?");
     }
     else if (evt.event === "media") {
-      const b64 = evt.media?.payload || "";
-      if (!b64) return;
-      const ulaw = Buffer.from(b64, "base64");
-      const pcm16le = ulawBufferToPCM16LEBuffer(ulaw);
-      dg?.sendPCM16LE(pcm16le);
+      const ulaw = Buffer.from(evt.media?.payload || "", "base64");
+      if (dg) dg.sendPCM16LE(ulawBufferToPCM16LEBuffer(ulaw));
     }
     else if (evt.event === "stop") {
-      console.log("Twilio STOP");
-      dg?.close();
+      console.log("Twilio stream STOP");
+      if (dg) dg.close();
     }
   });
+
+  ws.on("close", () => { if (dg) dg.close(); });
 });
 
-server.listen(PORT, () => console.log(`Server on :${PORT}`));
+server.listen(PORT, () => console.log(`Server running on ${PORT}`));
