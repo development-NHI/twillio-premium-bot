@@ -42,6 +42,10 @@ const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 // Minimal logger
 const log = (...args) => console.log(new Date().toISOString(), '-', ...args);
 
+// quick env sanity
+if (!OPENAI_API_KEY) log('(!) OPENAI_API_KEY missing');
+if (!ELEVENLABS_API_KEY) log('(!) ELEVENLABS_API_KEY missing');
+
 // ---------- Express HTTP (for health + Twilio token echo if needed) ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -345,6 +349,15 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
     return;
   }
 
+  // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  // REQUIRED FOR TWILIO: include streamSid on all media/mark frames
+  const streamSid = ws.__streamSid;
+  if (!streamSid) {
+    log('[TTS] missing streamSid; cannot send audio');
+    return;
+  }
+  // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
   // Build ElevenLabs streaming URL
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
 
@@ -382,13 +395,14 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
     const b64 = Buffer.from(value).toString('base64');
     const msg = {
       event: 'media',
+      streamSid,                   // <-- include streamSid
       media: { payload: b64 }
     };
     safeSend(ws, JSON.stringify(msg));
   }
 
   // Mark "mark" event so Twilio knows end of speech
-  safeSend(ws, JSON.stringify({ event: 'mark', mark: { name: 'eos' } }));
+  safeSend(ws, JSON.stringify({ event: 'mark', streamSid, mark: { name: 'eos' } }));
   log('[TTS] end', 'bytes:', total);
 }
 
@@ -584,11 +598,13 @@ wss.on('connection', (ws, req) => {
     if (evt === 'start') {
       const callSid = msg?.start?.callSid || '';
       const from = msg?.start?.customParameters?.from || msg?.start?.from || '';
+      const streamSid = msg?.start?.streamSid || ''; // <-- capture streamSid
       const convo = newConvo(callSid, biz);
       ws.__convo = convo;
+      ws.__streamSid = streamSid;                    // <-- store streamSid for TTS
       convo.callerPhone = from || '';
       convoMap.set(ws.__id, convo);
-      log('WS CONNECTED |', id, '| CallSid:', callSid, '| biz:', biz);
+      log('WS CONNECTED |', id, '| CallSid:', callSid, '| streamSid:', streamSid, '| biz:', biz);
 
       // Greeting (only once)
       convo.turns = 0;
