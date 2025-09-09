@@ -79,22 +79,28 @@ function formatPhone(d10) {
   return `(${d10.slice(0,3)}) ${d10.slice(3,6)}-${d10.slice(6)}`;
 }
 
-// ---------- network helpers (timeouts, faster fail) ----------
+// ---------- network helpers (timeouts, retry, faster fail) ----------
 async function fetchJson(url, opts = {}, tag = "") {
-  const controller = new AbortController();
-  const to = setTimeout(() => controller.abort(), opts.timeoutMs || 6000); // 6s timeout
-  try {
-    const res = await fetch(url, { ...opts, signal: controller.signal });
-    const text = await res.text();
-    let data; try { data = JSON.parse(text); } catch { data = text; }
-    log(`[${tag}] HTTP ${res.status} resp(${text.length}B)`);
-    return { ok: res.ok, status: res.status, data, text };
-  } catch (e) {
-    err(`[${tag}] net`, e?.message || e);
-    return { ok: false, status: 0, data: null, text: "" };
-  } finally {
-    clearTimeout(to);
-  }
+  const attempt = async (toMs) => {
+    const controller = new AbortController();
+    const to = setTimeout(() => controller.abort(), toMs);
+    try {
+      const res = await fetch(url, { ...opts, signal: controller.signal });
+      const text = await res.text();
+      let data; try { data = JSON.parse(text); } catch { data = text; }
+      log(`[${tag}] HTTP ${res.status} resp(${text.length}B)`);
+      return { ok: res.ok, status: res.status, data, text };
+    } catch (e) {
+      err(`[${tag}] net`, e?.message || e);
+      return { ok: false, status: 0, data: null, text: "" };
+    } finally {
+      clearTimeout(to);
+    }
+  };
+  // fast first attempt, one quick retry
+  const a1 = await attempt(opts.timeoutMs || 4500);
+  if (a1.ok) return a1;
+  return await attempt(3000);
 }
 
 // ---------- Deepgram realtime ----------
@@ -106,7 +112,7 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
   const url = "wss://api.deepgram.com/v1/listen"
     + "?encoding=linear16&sample_rate=8000&channels=1"
     + "&model=nova-2-phonecall&interim_results=true&smart_format=true"
-    + "&language=en-US&endpointing=250";
+    + "&language=en-US&endpointing=200"; // a bit snappier
 
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${key}` }, perMessageDeflate: false });
   let open = false;
@@ -136,7 +142,7 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
   };
 }
 
-// ---------- Make helper (with timeout) ----------
+// ---------- Make helper (with tighter timeout) ----------
 async function callMake(url, payload, tag) {
   const preview = JSON.stringify(payload);
   log(`[Make ${tag}] POST ${url} body(${preview.length}B): ${preview}`);
@@ -144,7 +150,7 @@ async function callMake(url, payload, tag) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: preview,
-    timeoutMs: 6000
+    timeoutMs: 4000
   }, `Make ${tag}`);
 }
 
@@ -169,11 +175,11 @@ async function extractBookingData(userText, memory, callId) {
       /cancel|reschedule.*cancel/i.test(text) ? "DELETE" :
       /availability|what.*appointments|any.*appointments|do you have|are you open|free slots|openings/i.test(text) ? "READ" :
       /book|appointment|schedule|reserve|make.*appointment/i.test(text) ? "CREATE" :
-      /price|how much|cost/i.test(text) ? "FAQ" :
+      /price|how much|cost|hours|time.*open|location|where/i.test(text) ? "FAQ" :
       "UNKNOWN";
     return {
       intent,
-      faq_topic: /price|how much|cost/i.test(text) ? "PRICES" : "",
+      faq_topic: /price|how much|cost/i.test(text) ? "PRICES" : /hours|time.*open/i.test(text) ? "HOURS" : /where|location/i.test(text) ? "LOCATION" : "",
       Event_Name: "", Start_Time: "", End_Time: "",
       Customer_Name: "", Customer_Phone: "", Customer_Email: "",
       id: "", Notes: "", window: { start: "", end: "" },
@@ -209,11 +215,9 @@ Schema:
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
     temperature: 0.2, // structure-first
-    max_tokens: 220,
+    max_tokens: 200,
     messages: [
-      // Render-supplied behavior prompt FIRST
-      { role: "system", content: AGENT_PROMPT },
-      // Then the extractor schema/contract
+      { role: "system", content: AGENT_PROMPT }, // Render prompt FIRST
       { role: "system", content: sys },
       { role: "user", content: `State:
 phase: ${memory.phase || "collect_time"}
@@ -227,7 +231,7 @@ CallID:${callId}` },
     method: "POST",
     headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    timeoutMs: 6000
+    timeoutMs: 4500
   }, "OpenAI extract");
 
   if (!res.ok) return { intent: "UNKNOWN", ask: "NONE", reply: "" };
@@ -246,16 +250,14 @@ async function generateReply({ userText, memory, phase, intent, faq_topic, facts
 Write exactly ONE short, conversational sentence for the phone next.
 Use contractions and micro-acks. If facts are provided, state them plainly.
 Ask only ONE clear question next (appropriate for the phase). If FAQ, end with a gentle nudge toward booking.
-Avoid repeating the same wording just used. Keep it under 25 words.`;
+Avoid repeating the same wording just used. Keep it under 22 words.`; // a bit tighter for speed
   const body = {
     model: "gpt-4o-mini",
-    temperature: 0.55,
-    top_p: 0.95,
-    max_tokens: 60,
+    temperature: 0.5,
+    top_p: 0.9,
+    max_tokens: 50,
     messages: [
-      // Render-supplied behavior prompt FIRST
       { role: "system", content: AGENT_PROMPT },
-      // Then style constraints
       { role: "system", content: sys },
       { role: "user", content: `phase=${phase}, intent=${intent}, faq_topic=${faq_topic}` },
       { role: "user", content: `known=${JSON.stringify({ name:memory.name, phone:memory.phone, service:memory.service, startISO:memory.startISO })}` },
@@ -266,9 +268,9 @@ Avoid repeating the same wording just used. Keep it under 25 words.`;
 
   const res = await fetchJson("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    headers: { "Authorization": `Bearer ${apiKey}", "Content-Type": "application/json" },
     body: JSON.stringify(body),
-    timeoutMs: 5500
+    timeoutMs: 4000
   }, "OpenAI nlg");
 
   if (!res.ok) return "";
@@ -280,13 +282,10 @@ const faqCache = new Map(); // key = topic
 async function getFaqFactsFromMake(topic) {
   if (faqCache.has(topic)) return faqCache.get(topic);
   const r = await callMake(MAKE_READ, { intent: "FAQ", topic }, "FAQ");
-  // Expect Make to return at least one of: prices/hoursText/address
   let facts = {};
   if (r.ok && r.data) {
     const d = r.data;
     if (d.prices || d.hoursText || d.address) facts = d;
-    else if (typeof d === "string") facts = { note: d };
-    else if (d.events) facts = {}; // wrong payload (calendar); ignore
   }
   faqCache.set(topic, facts);
   return facts;
@@ -352,8 +351,14 @@ wss.on("connection", (ws) => {
   // ask/reprompt guards
   let lastAsk = { kind: "", at: 0, text: "" };
   let sameAskCount = 0;
-  function recentlyAsked(kind, ms = 4000) { return lastAsk.kind === kind && Date.now() - lastAsk.at < ms; }
+
+  // booking/ending guards
+  let bookingInFlight = false;
+  let ended = false;
+
+  function recentlyAsked(kind, ms = 3500) { return lastAsk.kind === kind && Date.now() - lastAsk.at < ms; }
   async function ask(kind, text) {
+    if (ended) return;
     if (recentlyAsked(kind)) return;
     if (text === lastAsk.text) sameAskCount++; else sameAskCount = 0;
     lastAsk = { kind, at: Date.now(), text };
@@ -372,14 +377,14 @@ wss.on("connection", (ws) => {
   // conversational memory
   const memory = { name: "", phone: "", email: "", service: "", startISO: "", endISO: "", phase: "collect_time" };
 
-  // conversation phases: Collect -> Check -> Contact -> Confirm -> Book
-  let phase = "collect_time"; // initial phase after greeting
+  // conversation phases: Collect -> Check -> Contact -> Confirm -> Book -> ended
+  let phase = "collect_time";
   let lastSaid = "";
 
   function logSlots(where) { log(`[slots:${where}]`, JSON.stringify({ phase, ...memory })); }
 
   async function say(text) {
-    if (!text) return;
+    if (!text || ended) return;
     if (text === lastSaid) { log("[debounce] suppress repeat:", text); return; }
     lastSaid = text;
     await speakEleven(ws, streamSid, text);
@@ -387,10 +392,11 @@ wss.on("connection", (ws) => {
   }
 
   // gentle inactivity reprompt (smart, non-repeating, with examples)
-  const INACTIVITY_MS = 12000;
+  const INACTIVITY_MS = 10000;
   const repromptIv = setInterval(() => {
+    if (ended) return;
     const now = Date.now();
-    if (now - lastSpokenAt < 1500) return; // give space after speaking
+    if (now - lastSpokenAt < 1200) return; // give space after speaking
     const idle = now - lastUserAt;
     if (idle < INACTIVITY_MS) return;
 
@@ -400,7 +406,7 @@ wss.on("connection", (ws) => {
         : "Would you like a haircut or a beard trim?");
       if (!memory.startISO) {
         const text = sameAskCount >= 2
-          ? "What day and time works for you? (For example: “Tomorrow at 3 pm” or “Friday morning”)"
+          ? "What day and time works for you? (e.g., “Tomorrow at 3 pm” or “Friday morning”)"
           : "What day and time works for you?";
         return ask("TIME", text);
       }
@@ -415,10 +421,10 @@ wss.on("connection", (ws) => {
 
   // ask only ONE thing depending on phase (with ask-guard)
   async function nextQuestion() {
+    if (ended) return;
     if (phase === "collect_time") {
       if (!memory.service) return ask("SERVICE", "Would you like a haircut or a beard trim?");
       if (!memory.startISO) return ask("TIME", "What day and time would you like?");
-      // have both → advance
       phase = "check_availability";
       return await handlePhase();
     }
@@ -436,18 +442,19 @@ wss.on("connection", (ws) => {
 
   // availability check and booking
   async function handlePhase() {
+    if (ended) return;
     if (phase === "check_availability") {
-      // business hours gate first
+      if (!memory.startISO || !memory.service) return nextQuestion();
       if (!isBusinessHours(memory.startISO, LOCAL_TZ)) {
         log("[gate] outside business hours:", memory.startISO);
         return ask("TIME", "We book Monday to Friday, 9 to 5. What time works in those hours?");
       }
-      await ask("BACKCHANNEL", "One moment while I check availability.");
+      await ask("BACKCHANNEL", "Let me check."); // quick backchannel keeps latency feeling low
       const win = { start: memory.startISO, end: memory.endISO || memory.startISO };
       const check = await callMake(MAKE_READ, { intent: "READ", window: win }, "READ-check");
       const events = Array.isArray(check?.data?.events) ? check.data.events : [];
       if (events.length) {
-        log("[gate] conflict found]:", events.length);
+        log("[gate] conflict found:", events.length);
         return ask("TIME", "That time is already booked. What other time works for you?");
       }
       // available → move to contact collection
@@ -455,8 +462,7 @@ wss.on("connection", (ws) => {
       return nextQuestion();
     }
     if (phase === "confirm_booking") {
-      // speak confirm line in nextQuestion; actual booking after “yes”
-      return;
+      return; // voice confirmation handled in nextQuestion/YES branch
     }
   }
 
@@ -470,13 +476,10 @@ wss.on("connection", (ws) => {
     if (ex.Event_Name)     memory.service = normalizeService(ex.Event_Name) || memory.service;
     if (ex.Start_Time)     memory.startISO = ex.Start_Time;
     if (ex.End_Time)       memory.endISO = ex.End_Time;
-
-    // if service still unknown but the utterance contains hints, try to infer
     if (!memory.service && ex.utterance) {
       const maybe = normalizeService(ex.utterance);
       if (maybe) memory.service = maybe;
     }
-
     logSlots("merge");
   }
 
@@ -489,9 +492,11 @@ wss.on("connection", (ws) => {
   function isFlexible(txt="") {
     return /\b(any|whenever|no (preference|pref)|whenever works|any time|you pick|up to you)\b/i.test(txt);
   }
+  function looksLikeGreeting(s="") {
+    return /thanks for calling Old Line Barbershop|how can I help you today/i.test(s || "");
+  }
 
   async function proposeNextAvailable() {
-    // Ask Make for next available slot in business hours; implement on Make side.
     await ask("BACKCHANNEL", "Let me find the next available slot.");
     const r = await callMake(MAKE_READ, { intent: "NEXT_AVAILABLE", window: { start: new Date().toISOString(), end: "" } }, "READ-next");
     const slot = r?.data?.next || null; // expect ISO string or { start, end }
@@ -502,35 +507,46 @@ wss.on("connection", (ws) => {
       const when = pretty(startISO, LOCAL_TZ);
       return ask("CONFIRM", `I can do ${when}. Want to grab that?`);
     }
-    // fallback: ask for a day part
     return ask("TIME", "Morning or afternoon works better for you?");
   }
 
   async function onUserUtterance(txt) {
+    if (ended) return;
     lastUserAt = Date.now();
     currentTts.abort?.(); // barge-in
-    sameAskCount = 0;     // reset loop counter on new input
+    sameAskCount = 0;
 
     // Flexible time: user says "any time" → propose next available
     if (phase === "collect_time" && !memory.startISO && isFlexible(txt)) {
       return proposeNextAvailable();
     }
 
-    // Track phase in memory for the extractor
     memory.phase = phase;
 
-    // Use GPT to classify and optionally suggest the next line
     const ex = await extractBookingData(txt, memory, callSid);
     ex.utterance = txt;
     log("[extracted]", ex);
     mergeExtract(ex);
 
-    // FAQ → fetch facts from Make, then let GPT craft reply; return immediately to avoid double ask
+    // Ignore mid-call greetings
+    if (looksLikeGreeting(ex.reply) && phase !== "collect_time") {
+      ex.reply = "";
+    }
+
+    // SMALLTALK during checks/booking → short backchannel, don't derail
+    if (ex.intent === "SMALLTALK" && (phase === "check_availability" || bookingInFlight)) {
+      await say("Still here.");
+      return;
+    }
+
+    // FAQ → fetch facts from Make, then NLG; exit early to avoid double-ask
     if (ex.intent === "FAQ") {
       const facts = await getFaqFactsFromMake(ex.faq_topic || "");
-      const line = await generateReply({
-        userText: txt, memory, phase, intent: ex.intent, faq_topic: ex.faq_topic || "", facts
-      });
+      // tiny “typing” nudge if NLG might take a sec
+      const nlgPromise = generateReply({ userText: txt, memory, phase, intent: ex.intent, faq_topic: ex.faq_topic || "", facts });
+      const nudge = setTimeout(() => say("One sec."), 900);
+      const line = await nlgPromise;
+      clearTimeout(nudge);
       if (line) { await say(line); return; }
     }
 
@@ -539,12 +555,16 @@ wss.on("connection", (ws) => {
       if (!ex.id) return ask("DELETE", "What’s the appointment ID to cancel?");
       await ask("BACKCHANNEL", "Okay—cancelling that now.");
       const r = await callMake(MAKE_DELETE, { id: ex.id }, "DELETE");
-      if (r.ok) await say("Your appointment is cancelled. Thanks for calling Old Line Barbershop. Goodbye.");
-      else      await say("I couldn’t cancel that one. Want me to try again?");
+      if (r.ok) {
+        await say("Your appointment is cancelled. Thanks for calling Old Line Barbershop. Goodbye.");
+        ended = true; phase = "ended"; clearInterval(repromptIv); setTimeout(()=>{try{ws.close();}catch{}}, 600);
+      } else {
+        await say("I couldn’t cancel that one. Want me to try again?");
+      }
       return;
     }
 
-    // READ → number of events; GPT phrases it with facts
+    // READ → number of events; phrase via NLG
     if (ex.intent === "READ") {
       const win = ex.window?.start ? ex.window :
         (memory.startISO ? { start: memory.startISO, end: memory.endISO || memory.startISO }
@@ -552,17 +572,26 @@ wss.on("connection", (ws) => {
       await ask("BACKCHANNEL", "Let me check our schedule.");
       const r = await callMake(MAKE_READ, { intent: "READ", window: win }, "READ");
       const events = Array.isArray(r?.data?.events) ? r.data.events : [];
-      const line = await generateReply({
-        userText: txt, memory, phase, intent: "READ", faq_topic: "", facts: { count: events.length, window: win }
-      });
+      const line = await generateReply({ userText: txt, memory, phase, intent: "READ", faq_topic: "", facts: { count: events.length, window: win } });
       if (line) { await say(line); return; }
       if (!events.length) await ask("TIME", "No appointments in that window. What time works for you?");
       else                await ask("TIME", `I found ${events.length}. What time did you have in mind?`);
       return;
     }
 
-    // Prefer GPT’s suggested natural line if provided (and STOP; avoids double-ask)
-    if (ex.reply) { await say(ex.reply); return; }
+    // Prefer GPT’s suggested natural line if provided,
+    // BUT keep the state machine moving if we have enough info.
+    if (ex.reply) {
+      await say(ex.reply);
+      if (phase === "collect_time" && memory.service && memory.startISO) {
+        phase = "check_availability";
+        return handlePhase();
+      }
+      if (phase === "confirm_booking") {
+        return nextQuestion();
+      }
+      return;
+    }
 
     // CREATE / UNKNOWN go through phases with guards
     if (phase === "collect_time") {
@@ -596,6 +625,9 @@ wss.on("connection", (ws) => {
 
     if (phase === "confirm_booking") {
       if (isAffirmative(txt)) {
+        if (bookingInFlight) return;
+        bookingInFlight = true;
+
         const when = pretty(memory.startISO, LOCAL_TZ);
         const createReq = {
           Event_Name: memory.service || "Appointment",
@@ -608,18 +640,26 @@ wss.on("connection", (ws) => {
         };
         await ask("BACKCHANNEL", "Got it—booking that now.");
         const r = await callMake(MAKE_CREATE, createReq, "CREATE");
-        if (r.ok) await say(`All set — your ${memory.service} is booked for ${when}. Thanks for calling Old Line Barbershop. Goodbye.`);
-        else      await say("Sorry — I couldn’t complete the booking. Want me to try a different time?");
+        bookingInFlight = false;
+
+        if (r.ok) {
+          await say(`All set — your ${memory.service} is booked for ${when}. Thanks for calling Old Line Barbershop. Goodbye.`);
+          ended = true;
+          phase = "ended";
+          clearInterval(repromptIv);
+          setTimeout(() => { try { ws.close(); } catch {} }, 600);
+        } else {
+          await say("Sorry — I couldn’t complete the booking. Want me to try a different time?");
+          phase = "collect_time";
+        }
         return;
       }
       if (isNegative(txt)) {
         return ask("TIME", "Okay, I won’t book it. What other time works for you?");
       }
-      // unclear yes/no → rephrase once instead of repeating
       return ask("CONFIRM", "Should I lock that in, or do you want a different time?");
     }
 
-    // fallback
     return ask("HELP", "I can help book, reschedule, or cancel. What would you like to do?");
   }
 
@@ -631,10 +671,9 @@ wss.on("connection", (ws) => {
       streamSid = evt.start?.streamSid || null;
       callSid   = evt.start?.callSid || null;
       const b = evt.start?.customParameters?.biz || "default";
-      biz = b; // persist
+      biz = b;
       log("WS CONNECTED |", streamSid, "| CallSid:", callSid, "| biz:", biz);
 
-      // Deepgram
       const dg = startDeepgram({
         onOpen: () => log("[ASR] ready"),
         onPartial: () => { lastUserAt = Date.now(); currentTts.abort?.(); }, // barge-in ASAP
@@ -644,7 +683,6 @@ wss.on("connection", (ws) => {
       });
       ws._dg = dg;
 
-      // greet then go to collect_time phase
       await say("Hi, thanks for calling Old Line Barbershop. How can I help you today?");
       phase = "collect_time";
     }
