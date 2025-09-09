@@ -97,7 +97,6 @@ async function fetchJson(url, opts = {}, tag = "") {
       clearTimeout(to);
     }
   };
-  // fast first attempt, one quick retry
   const a1 = await attempt(opts.timeoutMs || 4500);
   if (a1.ok) return a1;
   return await attempt(3000);
@@ -112,7 +111,7 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
   const url = "wss://api.deepgram.com/v1/listen"
     + "?encoding=linear16&sample_rate=8000&channels=1"
     + "&model=nova-2-phonecall&interim_results=true&smart_format=true"
-    + "&language=en-US&endpointing=200"; // a bit snappier
+    + "&language=en-US&endpointing=200";
 
   const dg = new WebSocket(url, { headers: { Authorization: `Token ${key}` }, perMessageDeflate: false });
   let open = false;
@@ -214,10 +213,10 @@ Schema:
   const body = {
     model: "gpt-4o-mini",
     response_format: { type: "json_object" },
-    temperature: 0.2, // structure-first
+    temperature: 0.2,
     max_tokens: 200,
     messages: [
-      { role: "system", content: AGENT_PROMPT }, // Render prompt FIRST
+      { role: "system", content: AGENT_PROMPT },
       { role: "system", content: sys },
       { role: "user", content: `State:
 phase: ${memory.phase || "collect_time"}
@@ -250,7 +249,7 @@ async function generateReply({ userText, memory, phase, intent, faq_topic, facts
 Write exactly ONE short, conversational sentence for the phone next.
 Use contractions and micro-acks. If facts are provided, state them plainly.
 Ask only ONE clear question next (appropriate for the phase). If FAQ, end with a gentle nudge toward booking.
-Avoid repeating the same wording just used. Keep it under 22 words.`; // a bit tighter for speed
+Avoid repeating the same wording just used. Keep it under 22 words.`;
   const body = {
     model: "gpt-4o-mini",
     temperature: 0.5,
@@ -268,7 +267,7 @@ Avoid repeating the same wording just used. Keep it under 22 words.`; // a bit t
 
   const res = await fetchJson("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { "Authorization": `Bearer ${apiKey}", "Content-Type": "application/json" },
+    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
     timeoutMs: 4000
   }, "OpenAI nlg");
@@ -391,12 +390,12 @@ wss.on("connection", (ws) => {
     lastSpokenAt = Date.now();
   }
 
-  // gentle inactivity reprompt (smart, non-repeating, with examples)
+  // gentle inactivity reprompt (smart, non-repeating)
   const INACTIVITY_MS = 10000;
   const repromptIv = setInterval(() => {
     if (ended) return;
     const now = Date.now();
-    if (now - lastSpokenAt < 1200) return; // give space after speaking
+    if (now - lastSpokenAt < 1200) return;
     const idle = now - lastUserAt;
     if (idle < INACTIVITY_MS) return;
 
@@ -449,7 +448,7 @@ wss.on("connection", (ws) => {
         log("[gate] outside business hours:", memory.startISO);
         return ask("TIME", "We book Monday to Friday, 9 to 5. What time works in those hours?");
       }
-      await ask("BACKCHANNEL", "Let me check."); // quick backchannel keeps latency feeling low
+      await ask("BACKCHANNEL", "Let me check.");
       const win = { start: memory.startISO, end: memory.endISO || memory.startISO };
       const check = await callMake(MAKE_READ, { intent: "READ", window: win }, "READ-check");
       const events = Array.isArray(check?.data?.events) ? check.data.events : [];
@@ -462,7 +461,7 @@ wss.on("connection", (ws) => {
       return nextQuestion();
     }
     if (phase === "confirm_booking") {
-      return; // voice confirmation handled in nextQuestion/YES branch
+      return;
     }
   }
 
@@ -499,7 +498,7 @@ wss.on("connection", (ws) => {
   async function proposeNextAvailable() {
     await ask("BACKCHANNEL", "Let me find the next available slot.");
     const r = await callMake(MAKE_READ, { intent: "NEXT_AVAILABLE", window: { start: new Date().toISOString(), end: "" } }, "READ-next");
-    const slot = r?.data?.next || null; // expect ISO string or { start, end }
+    const slot = r?.data?.next || null;
     if (slot?.start || slot) {
       const startISO = slot.start || slot;
       memory.startISO = startISO;
@@ -516,7 +515,6 @@ wss.on("connection", (ws) => {
     currentTts.abort?.(); // barge-in
     sameAskCount = 0;
 
-    // Flexible time: user says "any time" → propose next available
     if (phase === "collect_time" && !memory.startISO && isFlexible(txt)) {
       return proposeNextAvailable();
     }
@@ -528,21 +526,17 @@ wss.on("connection", (ws) => {
     log("[extracted]", ex);
     mergeExtract(ex);
 
-    // Ignore mid-call greetings
     if (looksLikeGreeting(ex.reply) && phase !== "collect_time") {
       ex.reply = "";
     }
 
-    // SMALLTALK during checks/booking → short backchannel, don't derail
     if (ex.intent === "SMALLTALK" && (phase === "check_availability" || bookingInFlight)) {
       await say("Still here.");
       return;
     }
 
-    // FAQ → fetch facts from Make, then NLG; exit early to avoid double-ask
     if (ex.intent === "FAQ") {
       const facts = await getFaqFactsFromMake(ex.faq_topic || "");
-      // tiny “typing” nudge if NLG might take a sec
       const nlgPromise = generateReply({ userText: txt, memory, phase, intent: ex.intent, faq_topic: ex.faq_topic || "", facts });
       const nudge = setTimeout(() => say("One sec."), 900);
       const line = await nlgPromise;
@@ -550,7 +544,6 @@ wss.on("connection", (ws) => {
       if (line) { await say(line); return; }
     }
 
-    // DELETE by id
     if (ex.intent === "DELETE") {
       if (!ex.id) return ask("DELETE", "What’s the appointment ID to cancel?");
       await ask("BACKCHANNEL", "Okay—cancelling that now.");
@@ -564,7 +557,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // READ → number of events; phrase via NLG
     if (ex.intent === "READ") {
       const win = ex.window?.start ? ex.window :
         (memory.startISO ? { start: memory.startISO, end: memory.endISO || memory.startISO }
@@ -593,7 +585,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // CREATE / UNKNOWN go through phases with guards
     if (phase === "collect_time") {
       if (memory.service && memory.startISO) {
         phase = "check_availability";
@@ -676,7 +667,7 @@ wss.on("connection", (ws) => {
 
       const dg = startDeepgram({
         onOpen: () => log("[ASR] ready"),
-        onPartial: () => { lastUserAt = Date.now(); currentTts.abort?.(); }, // barge-in ASAP
+        onPartial: () => { lastUserAt = Date.now(); currentTts.abort?.(); },
         onFinal: (txt) => onUserUtterance(txt),
         onError: (e) => err("[ASR] err cb", e?.message || e),
         onAny:   (m) => { if (m.type && m.type !== "Results") log("[ASR msg]", JSON.stringify(m)); }
