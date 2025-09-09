@@ -1,9 +1,9 @@
 /**
- * server.js — Old Line Barbershop voice agent
+ * server.js — Old Line Barbershop voice agent (WORKING PIPE)
  * - Twilio Media Streams WS
- * - Deepgram ASR (pass-through; stubbed hooks)
+ * - Deepgram ASR (URL-config WS; μ-law → PCM16LE @ 8kHz mono)
  * - OpenAI for extraction + NLG (JSON contract)
- * - ElevenLabs TTS (ulaw_8000 streaming)
+ * - ElevenLabs TTS (ulaw_8000 streaming) — includes streamSid on frames
  * - Make.com webhooks for FAQ log + CREATE booking
  *
  * Env:
@@ -21,32 +21,30 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const fetch = require('node-fetch');
 const { URL } = require('url');
 const { randomUUID } = require('crypto');
-const zlib = require('zlib');
+const https = require('https');
 
 // ---------- Config / Globals ----------
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || 'https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm';
 const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || 'https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax';
 
 // HTTP keep-alive agents to shave latency
-const keepAliveAgent = new (require('http')).Agent({ keepAlive: true });
-const https = require('https');
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 
 // Minimal logger
 const log = (...args) => console.log(new Date().toISOString(), '-', ...args);
 
-// quick env sanity
+// Quick env sanity
 if (!OPENAI_API_KEY) log('(!) OPENAI_API_KEY missing');
+if (!DEEPGRAM_API_KEY) log('(!) DEEPGRAM_API_KEY missing');
 if (!ELEVENLABS_API_KEY) log('(!) ELEVENLABS_API_KEY missing');
 
-// ---------- Express HTTP (for health + Twilio token echo if needed) ----------
+// ---------- Express HTTP (health) ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_, res) => res.status(200).send('OK'));
@@ -116,7 +114,7 @@ function newConvo(callSid, biz) {
     phase: 'idle',
     callerPhone: '',
     asrText: '',
-    // slots are what we ultimately need
+    // slots
     slots: {
       service: '',
       startISO: '',
@@ -125,6 +123,77 @@ function newConvo(callSid, biz) {
       phone: '',
       email: ''
     }
+  };
+}
+
+// ---------- μ-law → PCM16LE (8k mono) ----------
+function ulawByteToPcm16(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
+  if (sign) sample = -sample;
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+  return sample;
+}
+function ulawBufferToPCM16LEBuffer(ulawBuf) {
+  const out = Buffer.alloc(ulawBuf.length * 2);
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const s = ulawByteToPcm16(ulawBuf[i]);
+    out.writeInt16LE(s, i * 2);
+  }
+  return out;
+}
+
+// ---------- Deepgram realtime (URL-config) ----------
+function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
+  const url =
+    'wss://api.deepgram.com/v1/listen'
+    + '?encoding=linear16'
+    + '&sample_rate=8000'
+    + '&channels=1'
+    + '&model=nova-2-phonecall'
+    + '&interim_results=true'
+    + '&smart_format=true'
+    + '&language=en-US'
+    + '&endpointing=250';
+
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    perMessageDeflate: false
+  });
+
+  let open = false;
+  const q = [];
+
+  dg.on('open', () => {
+    open = true;
+    onOpen?.();
+    while (q.length) dg.send(q.shift());
+  });
+
+  dg.on('message', (data) => {
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch { return; }
+    onAnyMessage?.(ev);
+    if (ev.type !== 'Results') return;
+    const alt = ev.channel?.alternatives?.[0];
+    if (!alt) return;
+    const text = (alt.transcript || '').trim();
+    if (!text) return;
+    const isFinal = ev.is_final === true || ev.speech_final === true;
+    if (isFinal) onFinal?.(text);
+    else onPartial?.(text);
+  });
+
+  dg.on('error', (e) => onError?.(e));
+  dg.on('close', (c, r) => log('[Deepgram] closed', c, (r||'').toString?.() || ''));
+
+  return {
+    sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
+    close() { try { dg.close(); } catch {} }
   };
 }
 
@@ -137,7 +206,6 @@ function normalizeService(text) {
   if (/\bhair\s*cut|\bhaircut\b/.test(t)) return 'haircut';
   return '';
 }
-
 function computeEndISO(startISO) {
   try {
     if (!startISO) return '';
@@ -147,7 +215,6 @@ function computeEndISO(startISO) {
     return end.toISOString();
   } catch { return ''; }
 }
-
 function isReadyToCreate(slots) {
   return Boolean(
     slots.service &&
@@ -157,11 +224,9 @@ function isReadyToCreate(slots) {
     (slots.phone || '').trim()
   );
 }
-
 function safeJSON(val, fallback = {}) {
   try { return JSON.parse(val); } catch { return fallback; }
 }
-
 function debounceRepeat(convo, text, ms = 2500) {
   const now = Date.now();
   if (!text) return false;
@@ -171,7 +236,7 @@ function debounceRepeat(convo, text, ms = 2500) {
   return false;
 }
 
-// ---------- OpenAI ----------
+// ---------- OpenAI (extract) ----------
 async function openAIExtract(utterance, convo) {
   const sys = [
     `Return a strict JSON object with fields:
@@ -208,7 +273,7 @@ name=${convo.slots.name}
 phone=${convo.slots.phone}
 callerPhone=${convo.callerPhone}
 `,
-    `AGENT PROMPT (business policy & tone):
+    `AGENT PROMPT:
 ${AGENT_PROMPT}`
   ].join('\n\n');
 
@@ -228,8 +293,7 @@ ${AGENT_PROMPT}`
         { role: 'system', content: sys },
         { role: 'user', content: user }
       ],
-      response_format: { type: 'json_object' },
-      timeout: 15000
+      response_format: { type: 'json_object' }
     })
   });
 
@@ -246,19 +310,15 @@ ${AGENT_PROMPT}`
     ask: 'NONE',
     reply: ''
   });
-
   return parsed;
 }
 
 function ensureReplyOrAsk(parsed, utterance, phase) {
-  // Normalize/derive service from utterance if missing
   const svcU = normalizeService(utterance);
   if (svcU && !parsed.service && !parsed.Event_Name) {
     parsed.service = svcU;
     parsed.Event_Name = svcU;
   }
-
-  // Guarantee we have a reply
   if (parsed.reply && parsed.reply.trim()) return parsed;
 
   if ((parsed.intent === 'CREATE' || phase === 'collect_time')) {
@@ -269,19 +329,17 @@ function ensureReplyOrAsk(parsed, utterance, phase) {
       return parsed;
     }
   }
-
   if (parsed.intent === 'FAQ' && parsed.faq_topic) {
-    parsed.reply = 'Happy to help with that. Anything else I can answer?';
+    parsed.reply = 'We’re set; anything else I can answer?';
     parsed.ask = 'NONE';
     return parsed;
   }
-
   parsed.reply = 'Got it. How can I help further?';
   parsed.ask = 'NONE';
   return parsed;
 }
 
-// ---------- NLG (short, conversational, single question) ----------
+// ---------- NLG ----------
 async function openAINLG(convo, promptHints = '') {
   const sys = `
 You are a warm front-desk receptionist.
@@ -324,8 +382,7 @@ ${promptHints ? 'Hint: ' + promptHints : ''}
         { role: 'system', content: sys },
         { role: 'system', content: ctx },
         { role: 'user', content: user }
-      ],
-      timeout: 12000
+      ]
     })
   });
 
@@ -342,23 +399,22 @@ ${promptHints ? 'Hint: ' + promptHints : ''}
 async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
   if (!text) return;
 
-  // debounce same line
   const convo = ws.__convo;
   if (debounceRepeat(convo, text)) {
     log('[debounce] suppress repeat:', text);
     return;
   }
 
-  // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-  // REQUIRED FOR TWILIO: include streamSid on all media/mark frames
   const streamSid = ws.__streamSid;
   if (!streamSid) {
     log('[TTS] missing streamSid; cannot send audio');
     return;
   }
-  // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+  if (!ELEVENLABS_API_KEY) {
+    log('[TTS] ELEVENLABS_API_KEY missing; skipping audio');
+    return;
+  }
 
-  // Build ElevenLabs streaming URL
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
 
   const resp = await fetch(url, {
@@ -373,8 +429,7 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
       text,
       voice_settings: { stability: 0.5, similarity_boost: 0.8 },
       generation_config: { chunk_length_schedule: [120, 160, 200, 240] }
-    }),
-    timeout: 20000
+    })
   });
 
   if (!resp.ok) {
@@ -383,33 +438,21 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
     return;
   }
 
-  // Stream audio chunks to Twilio WS as "media"
   const reader = resp.body.getReader();
   let total = 0;
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
     total += value.length;
-
-    // value is PCM/ulaw wav payload; Twilio expects base64 audio payloads in JSON frames
     const b64 = Buffer.from(value).toString('base64');
-    const msg = {
-      event: 'media',
-      streamSid,                   // <-- include streamSid
-      media: { payload: b64 }
-    };
-    safeSend(ws, JSON.stringify(msg));
+    safeSend(ws, JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
   }
 
-  // Mark "mark" event so Twilio knows end of speech
   safeSend(ws, JSON.stringify({ event: 'mark', streamSid, mark: { name: 'eos' } }));
-  log('[TTS] end', 'bytes:', total);
+  log('[TTS] end bytes:', total);
 }
 
-// ---------- ASR (Deepgram) stubs ----------
-// You already have a working DG WS in your app; here we simply parse “media” and pass audio upstream.
-// For brevity, we’ll keep simple hooks. Integrate with your existing DG pipe.
-
+// ---------- ASR final hook ----------
 function handleASRFinal(ws, text) {
   const convo = ws.__convo;
   if (!convo) return;
@@ -419,22 +462,15 @@ function handleASRFinal(ws, text) {
 
 // ---------- Twilio helpers ----------
 function safeSend(ws, data) {
-  try {
-    if (ws.readyState === WebSocket.OPEN) ws.send(data);
-  } catch {}
+  try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch {}
 }
-
-function twilioSay(ws, text) {
-  // Shortcut for quick speak using our TTS bridge
-  return ttsToTwilio(ws, text);
-}
+function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
 
 // ---------- Flow Orchestration ----------
 async function onUserUtterance(ws, utterance) {
   const convo = ws.__convo;
   if (!convo) return;
 
-  // Extract semantic intent/slots from GPT
   let parsed = {};
   try {
     parsed = await openAIExtract(utterance, convo);
@@ -443,34 +479,24 @@ async function onUserUtterance(ws, utterance) {
     parsed = { intent: 'UNKNOWN', ask: 'NONE', reply: '' };
   }
 
-  // Normalize + ensure we always reply
   parsed = ensureReplyOrAsk(parsed, utterance, convo.phase);
 
-  // Merge slots & phase
-  // Service
+  // Merge slots
   if (parsed.service || parsed.Event_Name) {
     const svc = parsed.service || normalizeService(parsed.Event_Name);
     if (svc) convo.slots.service = svc;
   }
-
-  // Time(s)
   if (parsed.Start_Time) convo.slots.startISO = parsed.Start_Time;
   if (!convo.slots.endISO && parsed.End_Time) convo.slots.endISO = parsed.End_Time;
   if (!convo.slots.endISO && convo.slots.startISO) {
     convo.slots.endISO = computeEndISO(convo.slots.startISO);
   }
-
-  // Contact
   if (parsed.Customer_Name) convo.slots.name = parsed.Customer_Name;
   if (parsed.Customer_Phone) convo.slots.phone = parsed.Customer_Phone;
-  if (!convo.slots.phone && convo.callerPhone) {
-    // Let GPT confirm in wording; we just expose the value
-  }
   if (parsed.Customer_Email) convo.slots.email = parsed.Customer_Email;
 
-  // Phase/ask
-  let ask = parsed.ask || 'NONE';
-  // Move phases according to booking order
+  // Phase
+  const ask = parsed.ask || 'NONE';
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else if (parsed.intent === 'CREATE') {
@@ -478,46 +504,34 @@ async function onUserUtterance(ws, utterance) {
     else if (!convo.slots.startISO) convo.phase = 'collect_time';
     else if (!convo.slots.name || !(convo.slots.phone || convo.callerPhone)) convo.phase = 'collect_contact';
     else convo.phase = 'confirm_booking';
-  } else {
-    // keep previous
   }
 
   // Log FAQ to Make (non-blocking)
-  if (parsed.intent === 'FAQ') {
-    postToMakeFAQ(parsed.faq_topic).catch(() => {});
-  }
+  if (parsed.intent === 'FAQ') postToMakeFAQ(parsed.faq_topic).catch(() => {});
 
-  // If ready to create, fire Make CREATE
+  // Create if ready
   if (convo.phase === 'confirm_booking' && isReadyToCreate(convo.slots)) {
-    await finalizeCreate(ws, convo, parsed.reply);
+    await finalizeCreate(ws, convo);
     return;
   }
 
-  // Not yet ready — speak parsed.reply OR craft a better NLG based on state
+  // Speak
   let line = (parsed.reply || '').trim();
-
-  // If we need to confirm callerPhone
   if (!convo.slots.phone && convo.callerPhone && (ask === 'PHONE' || convo.phase === 'collect_contact')) {
-    // Ask GPT to phrase the confirmation with suggestedPhone
     line = await openAINLG({ ...convo, forbidGreet: true }, `Confirm this phone number is okay to use: ${convo.callerPhone}`);
   } else if (!line) {
-    // Use NLG to keep flow moving
     line = await openAINLG({ ...convo, forbidGreet: true });
   }
 
   convo.turns += 1;
   convo.forbidGreet = true;
-
-  // Say it
   await twilioSay(ws, line);
 }
 
-async function finalizeCreate(ws, convo, lastReply) {
-  // Ensure End_Time
+async function finalizeCreate(ws, convo) {
   if (!convo.slots.endISO && convo.slots.startISO) {
     convo.slots.endISO = computeEndISO(convo.slots.startISO);
   }
-  // Fill phone from caller if still missing
   if (!convo.slots.phone && convo.callerPhone) {
     convo.slots.phone = convo.callerPhone;
   }
@@ -532,105 +546,134 @@ async function finalizeCreate(ws, convo, lastReply) {
     Notes: `Booked by phone agent. CallSid=${convo.callSid || ''}`
   };
 
-  // Post to Make
   try {
     const r = await fetch(MAKE_CREATE_URL, {
       method: 'POST',
       agent: keepAliveHttpsAgent,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      timeout: 10000
+      body: JSON.stringify(payload)
     });
-    const ok = r.ok;
-    if (!ok) {
-      const t = await r.text().catch(() => '');
-      log('[Make CREATE] non-200', r.status, t);
-    } else {
-      log('[Make CREATE] ok');
-    }
+    if (!r.ok) log('[Make CREATE] non-200', r.status, await r.text().catch(() => ''));
+    else log('[Make CREATE] ok');
   } catch (e) {
     log('[Make CREATE] error', e.message);
   }
 
-  // Confirmation line via NLG to keep it natural and avoid exact repeats
   const confirmLine = await openAINLG(
     { ...convo, forbidGreet: true, phase: 'done' },
     `Confirm booking with details and say goodbye. Service=${convo.slots.service}, start=${convo.slots.startISO}`
   );
-
   await twilioSay(ws, confirmLine);
 }
 
 async function postToMakeFAQ(topic) {
-  if (!topic) topic = '';
   try {
     await fetch(MAKE_FAQ_URL, {
       method: 'POST',
       agent: keepAliveHttpsAgent,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intent: 'FAQ', topic }),
-      timeout: 4000
+      body: JSON.stringify({ intent: 'FAQ', topic: topic || '' })
     });
   } catch {}
 }
 
 // ---------- WS Handlers ----------
 wss.on('connection', (ws, req) => {
-  // Twilio sends querystring / headers we can parse
   const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
   const biz = params.get('biz') || 'acme-001';
   const id = randomUUID();
   ws.__id = id;
 
+  // Deepgram pipe state
+  let dg = null;
+  let dgOpened = false;
+  let frameCount = 0;
+  const BATCH_FRAMES = 5;     // 5 * 20ms = ~100ms batches
+  let pendingULaw = [];
+
   ws.on('error', (err) => log('WS error', err.message));
   ws.on('close', () => {
+    try { dg?.close(); } catch {}
     convoMap.delete(ws.__id);
     log('WS closed');
   });
 
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    // Twilio media stream events: start, media, mark, stop
+  ws.on('message', async (raw) => {
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     const evt = msg.event;
 
     if (evt === 'start') {
       const callSid = msg?.start?.callSid || '';
       const from = msg?.start?.customParameters?.from || msg?.start?.from || '';
-      const streamSid = msg?.start?.streamSid || ''; // <-- capture streamSid
+      const streamSid = msg?.start?.streamSid || '';
       const convo = newConvo(callSid, biz);
       ws.__convo = convo;
-      ws.__streamSid = streamSid;                    // <-- store streamSid for TTS
+      ws.__streamSid = streamSid;
       convo.callerPhone = from || '';
       convoMap.set(ws.__id, convo);
       log('WS CONNECTED |', id, '| CallSid:', callSid, '| streamSid:', streamSid, '| biz:', biz);
 
-      // Greeting (only once)
-      convo.turns = 0;
-      convo.forbidGreet = false;
+      // Start Deepgram if key present
+      if (DEEPGRAM_API_KEY) {
+        dg = startDeepgramLinear16({
+          onOpen: () => log('[Deepgram] opened'),
+          onPartial: (t) => { if (!dgOpened) { dgOpened = true; log('[Deepgram] receiving transcripts'); } },
+          onFinal:   (t) => { if (!dgOpened) { dgOpened = true; log('[Deepgram] receiving transcripts'); } handleASRFinal(ws, t); },
+          onError:   (e) => log('[Deepgram] error', e?.message || e),
+          onAnyMessage: (ev) => { if (ev.type && ev.type !== 'Results') log('[Deepgram] msg:', ev.type); }
+        });
+        setTimeout(() => {
+          if (!dgOpened) log('(!) Deepgram connected but no transcripts yet');
+        }, 5000);
+      } else {
+        log('(!) No DEEPGRAM_API_KEY — ASR disabled');
+      }
+
+      // Greeting
+      ws.__convo.turns = 0;
+      ws.__convo.forbidGreet = false;
       twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?').catch(() => {});
       return;
     }
 
     if (evt === 'media') {
-      // You can forward payload to Deepgram here
-      // For this template we wait for DG final messages (handled elsewhere)
+      frameCount++;
+      const b64 = msg.media?.payload || '';
+      if (!b64) return;
+
+      // Collect μ-law frames and batch to ~100ms
+      if (dg) {
+        const ulaw = Buffer.from(b64, 'base64');
+        pendingULaw.push(ulaw);
+        if (pendingULaw.length >= BATCH_FRAMES) {
+          const ulawChunk = Buffer.concat(pendingULaw);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          try { dg.sendPCM16LE(pcm16le); } catch (e) { log('[media→DG] send error:', e?.message || e); }
+          pendingULaw = [];
+        }
+      }
       return;
     }
 
-    if (evt === 'mark') {
-      return;
-    }
+    if (evt === 'mark') return;
 
     if (evt === 'stop') {
       log('Twilio stream STOP');
+      // flush any remaining audio to DG
+      if (pendingULaw.length && dg) {
+        try {
+          const ulawChunk = Buffer.concat(pendingULaw);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          dg.sendPCM16LE(pcm16le);
+        } catch {}
+        pendingULaw = [];
+      }
+      try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
       return;
     }
 
-    // Deepgram passthrough in your stack likely sends "asr" events back to this WS handler in your app;
-    // If you keep that pattern, also handle a synthetic "asr" event:
+    // Optional synthetic "asr" event passthrough (if your infra pipes DG back)
     if (evt === 'asr') {
       const final = msg?.text || '';
       if (final) handleASRFinal(ws, final);
