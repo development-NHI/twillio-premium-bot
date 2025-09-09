@@ -29,9 +29,9 @@ const https = require('https');
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || 'https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm';
-const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || 'https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax';
+const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
+const MAKE_CREATE_URL = process.env.MAKE_CREATE|| 'https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm';
+const MAKE_FAQ_URL = process.env.MAKE_READ || 'https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax';
 
 // HTTP keep-alive agents to shave latency
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
@@ -686,3 +686,4 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   log('Server running on', PORT);
 });
+
