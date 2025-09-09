@@ -1,19 +1,9 @@
-// server.js — Premium phone agent with DEEP logs + slot-filling + conflict check + Make READ/CREATE/DELETE
-// Uses: Deepgram (ASR) -> OpenAI (extraction) -> Make (calendar) -> ElevenLabs (TTS)
-//
-// ENV (optional)
-//  - OPENAI_API_KEY
-//  - DEEPGRAM_API_KEY
-//  - ELEVEN_API_KEY
-//  - ELEVEN_VOICE_ID
-//  - AGENT_PROMPT
-//  - LOCAL_TZ (default America/New_York)
-//  - PORT (Render provides)
+// server.js — Premium phone agent with phased flow (one question at a time) + deep logs
+// Pipeline: Twilio Media Streams (μ-law 8k) -> Deepgram (ASR) -> OpenAI (extraction JSON) -> Make (READ/CREATE/DELETE) -> ElevenLabs (TTS)
 
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const PORT = process.env.PORT || 10000;
@@ -24,11 +14,11 @@ const MAKE_CREATE = "https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm"
 const MAKE_READ   = "https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax";
 const MAKE_DELETE = "https://hook.us2.make.com/noy0e27knj7e1jlomtznw34z246i3xtv";
 
-// ---------- tiny logging helpers ----------
+// ---------- logging helpers ----------
 const log = (...a) => console.log(new Date().toISOString(), "-", ...a);
 const err = (...a) => console.error(new Date().toISOString(), "!", ...a);
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ---------- time helpers ----------
 function nowContext() { return { nowISO: new Date().toISOString(), tz: LOCAL_TZ }; }
 function pretty(dtISO, tz = LOCAL_TZ) {
   try {
@@ -44,7 +34,7 @@ function isBusinessHours(dtISO, tz = LOCAL_TZ) {
   const dayShort = new Intl.DateTimeFormat("en-US", { weekday: "short", timeZone: tz }).format(d);
   const hour = Number(new Intl.DateTimeFormat("en-US", { hour: "numeric", hour12: false, timeZone: tz }).format(d));
   const isMonFri = ["Mon","Tue","Wed","Thu","Fri"].includes(dayShort);
-  return isMonFri && hour >= 9 && hour < 17; // 9–16 start
+  return isMonFri && hour >= 9 && hour < 17;
 }
 
 // ---------- μ-law -> PCM16 ----------
@@ -104,23 +94,24 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
   };
 }
 
-// ---------- OpenAI: extraction-only (json) ----------
+// ---------- OpenAI extraction (JSON only) ----------
 async function extractBookingData(userText, memory, callId) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    log("(!) OPENAI_API_KEY missing — heuristic extractor fallback.");
+    // heuristic fallback
     return {
       intent: /cancel/i.test(userText) ? "DELETE" :
               /read|availability|open|what.*appointments|any.*appointments/i.test(userText) ? "READ" :
               /book|appointment|schedule|reserve/i.test(userText) ? "CREATE" : "UNKNOWN",
-      Event_Name: "", Start_Time: "", End_Time: "", Customer_Name: "", Customer_Phone: "", Customer_Email: "", id: "", Notes: "", window: null
+      Event_Name: "", Start_Time: "", End_Time: "", Customer_Name: "", Customer_Phone: "", Customer_Email: "",
+      id: "", Notes: "", window: null
     };
   }
 
   const { nowISO, tz } = nowContext();
   const sys = `Return ONLY JSON. Current time: ${nowISO} ${tz}.
-- Interpret times in ${tz}
-- If info is missing, use "" (empty string). Do NOT write "unknown".
+- Interpret times in ${tz}.
+- If any info is missing, use "" (empty string).
 Schema:
 {
   "intent": "CREATE|READ|DELETE|UNKNOWN",
@@ -132,7 +123,7 @@ Schema:
   "Customer_Email": string,
   "id": string,
   "Notes": string,
-  "window": { "start": string, "end": string } // for READ
+  "window": { "start": string, "end": string }
 }`;
 
   const body = {
@@ -142,7 +133,7 @@ Schema:
     max_tokens: 220,
     messages: [
       { role: "system", content: sys },
-      { role: "user", content: `CallID: ${callId}\nKnown slots: ${JSON.stringify(memory)}` },
+      { role: "user", content: `Known slots: ${JSON.stringify(memory)}\nCallID:${callId}` },
       { role: "user", content: userText }
     ]
   };
@@ -165,7 +156,7 @@ Schema:
   return out;
 }
 
-// ---------- ElevenLabs TTS ----------
+// ---------- TTS: ElevenLabs ----------
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid || !text) return;
   const key = process.env.ELEVEN_API_KEY, voiceId = process.env.ELEVEN_VOICE_ID;
@@ -188,7 +179,7 @@ async function speakEleven(ws, streamSid, text) {
     res.body.on("data", (chunk) => {
       try {
         ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: Buffer.from(chunk).toString("base64") } }));
-      } catch (e) { err("[TTS] ws send", e?.message || e); }
+      } catch (e) { err("[TTS] ws send]", e?.message || e); }
     });
     res.body.on("end", () => { log("[TTS] end"); resolve(); });
   });
@@ -207,7 +198,7 @@ async function callMake(url, payload, tag) {
   } catch (e) { err(`[Make ${tag}] net`, e?.message || e); return { ok: false, data: null, status: 0 }; }
 }
 
-// ---------- Agent persona (short, friendly) ----------
+// ---------- Persona (short, friendly) ----------
 const DEFAULT_PROMPT = `
 You are a friendly, confident receptionist for Old Line Barbershop.
 Keep sentences short and natural. Never guess.
@@ -237,14 +228,15 @@ wss.on("connection", (ws) => {
   let dg = null;
   let frames = 0;
 
+  // conversational memory
   const memory = { name: "", phone: "", email: "", service: "", startISO: "", endISO: "" };
   const AGENT_PROMPT = process.env.AGENT_PROMPT || DEFAULT_PROMPT;
 
-  let lastSaid = "";            // debounce repeating same line
-  let lastHelpAt = 0;           // avoid spamming help line
-  const HELP_COOLDOWN_MS = 7000;
+  // conversation phases: Collect -> Check -> Contact -> Confirm -> Book
+  let phase = "collect_time"; // initial phase after greeting
+  let lastSaid = "";
 
-  function logSlots(where) { log(`[slots:${where}]`, JSON.stringify(memory)); }
+  function logSlots(where) { log(`[slots:${where}]`, JSON.stringify({ phase, ...memory })); }
 
   async function say(text) {
     if (!text) return;
@@ -253,17 +245,54 @@ wss.on("connection", (ws) => {
     await speakEleven(ws, streamSid, text);
   }
 
-  async function askFor(missing) {
-    const lines = [];
-    if (missing.includes("name"))    lines.push("What name should I put on it?");
-    if (missing.includes("phone"))   lines.push("What’s the best phone number?");
-    if (missing.includes("service")) lines.push("What service would you like — haircut or beard trim?");
-    if (missing.includes("datetime"))lines.push("What day and time works for you?");
-    await say(lines.join(" "));
+  // ask only ONE thing depending on phase
+  async function nextQuestion() {
+    if (phase === "collect_time") {
+      if (!memory.service) return say("What service would you like — haircut or beard trim?");
+      if (!memory.startISO) return say("What day and time would you like?");
+      // have both → advance
+      phase = "check_availability";
+      return await handlePhase();
+    }
+    if (phase === "collect_contact") {
+      if (!memory.name)  return say("What name should I put on it?");
+      if (!memory.phone) return say("What’s the best phone number?");
+      phase = "confirm_booking";
+      return await handlePhase();
+    }
+    if (phase === "confirm_booking") {
+      const when = pretty(memory.startISO, LOCAL_TZ);
+      return say(`Great — a ${memory.service} for ${memory.name} at ${when}. Should I book it?`);
+    }
   }
 
-  async function handleExtracted(ex) {
-    // Merge slots (ignore "" so we don’t overwrite known info)
+  // availability check and booking
+  async function handlePhase() {
+    if (phase === "check_availability") {
+      // business hours gate first
+      if (!isBusinessHours(memory.startISO, LOCAL_TZ)) {
+        log("[gate] outside business hours:", memory.startISO);
+        return say("We book Monday to Friday, 9 to 5. What time works in those hours?");
+      }
+      const win = { start: memory.startISO, end: memory.endISO || memory.startISO };
+      const check = await callMake(MAKE_READ, { intent: "READ", window: win }, "READ-check");
+      const events = Array.isArray(check?.data?.events) ? check.data.events : [];
+      if (events.length) {
+        log("[gate] conflict found:", events.length);
+        return say("That time is already booked. Do you want to pick a different time?");
+      }
+      // available → move to contact collection
+      phase = "collect_contact";
+      return nextQuestion();
+    }
+
+    if (phase === "confirm_booking") {
+      // will speak confirmation line in nextQuestion; actual booking after “yes”
+      return;
+    }
+  }
+
+  function mergeExtract(ex) {
     if (ex.Customer_Name)  memory.name = ex.Customer_Name;
     if (ex.Customer_Phone) memory.phone = ex.Customer_Phone;
     if (ex.Customer_Email) memory.email = ex.Customer_Email;
@@ -271,65 +300,31 @@ wss.on("connection", (ws) => {
     if (ex.Start_Time)     memory.startISO = ex.Start_Time;
     if (ex.End_Time)       memory.endISO = ex.End_Time;
     logSlots("merge");
+  }
 
-    // Simple yes/no confirm
-    if (/^(yes|yeah|yep|sure|please|do it|confirm)\b/i.test(ex.utterance || "")) {
-      ws.emit("_confirm_yes");
-      return;
-    }
-    if (/^(no|nah|nope|stop|wait)\b/i.test(ex.utterance || "")) {
-      await say("Okay, I won’t book it yet. What time works Monday to Friday, nine to five?");
-      return;
-    }
+  function isAffirmative(txt) {
+    return /\b(yes|yeah|yep|sure|please|go ahead|book it|confirm)\b/i.test(txt || "");
+  }
+  function isNegative(txt) {
+    return /\b(no|nah|nope|stop|wait|hold on|cancel)\b/i.test(txt || "");
+  }
 
-    // Branch
-    if (ex.intent === "CREATE") {
-      const missing = [];
-      if (!memory.name)    missing.push("name");
-      if (!memory.phone)   missing.push("phone");
-      if (!memory.service) missing.push("service");
-      if (!memory.startISO)missing.push("datetime");
-      if (missing.length) {
-        log("[gate] missing for CREATE:", missing);
-        await askFor(missing);
-        return;
-      }
+  async function onUserUtterance(txt) {
+    const ex = await extractBookingData(txt, memory, callSid);
+    ex.utterance = txt;
+    log("[extracted]", ex);
+    mergeExtract(ex);
 
-      if (!isBusinessHours(memory.startISO, LOCAL_TZ)) {
-        log("[gate] outside business hours:", memory.startISO);
-        await say("We book Monday to Friday, 9 to 5. Want a time in those hours?");
-        return;
-      }
-
-      // conflict check (READ)
-      const win = { start: memory.startISO, end: memory.endISO || memory.startISO };
-      const check = await callMake(MAKE_READ, { intent: "READ", window: win }, "READ-check");
-      const events = Array.isArray(check?.data?.events) ? check.data.events : [];
-      if (events.length) {
-        log("[gate] conflict:", events.length);
-        await say("That time is already booked. Would you like a different time?");
-        return;
-      }
-
-      const when = pretty(memory.startISO, LOCAL_TZ);
-      await say(`Got it. A ${memory.service} for ${memory.name} at ${when}. Should I book it?`);
-      ws.once("_confirm_yes", async () => {
-        const createReq = {
-          Event_Name: memory.service || "Appointment",
-          Start_Time: memory.startISO,
-          End_Time:   memory.endISO || "",
-          Customer_Name:  memory.name,
-          Customer_Phone: memory.phone,
-          Customer_Email: memory.email || "",
-          Notes: `Booked by phone agent. CallSid=${callSid}`
-        };
-        const r = await callMake(MAKE_CREATE, createReq, "CREATE");
-        if (r.ok) { await say(`All set — your ${memory.service} is booked for ${when}. Thanks for calling Old Line Barbershop. Goodbye.`); }
-        else      { await say("Sorry — I couldn’t complete the booking. Want me to try a different time?"); }
-      });
+    // quick intent: DELETE by id
+    if (ex.intent === "DELETE") {
+      if (!ex.id) return say("What’s the appointment ID to cancel?");
+      const r = await callMake(MAKE_DELETE, { id: ex.id }, "DELETE");
+      if (r.ok) await say("Your appointment is cancelled. Thanks for calling Old Line Barbershop. Goodbye.");
+      else      await say("I couldn’t cancel that one. Want me to try again?");
       return;
     }
 
+    // READ intent → answer count quickly
     if (ex.intent === "READ") {
       const win = ex.window?.start ? ex.window :
         (memory.startISO ? { start: memory.startISO, end: memory.endISO || memory.startISO }
@@ -341,26 +336,59 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (ex.intent === "DELETE") {
-      const id = ex.id || "";
-      if (!id) { await say("What’s the appointment ID to cancel?"); return; }
-      const r = await callMake(MAKE_DELETE, { id }, "DELETE");
-      if (r.ok) await say("Your appointment is cancelled.");
-      else      await say("I couldn’t cancel that one. Want me to try again?");
-      return;
+    // CREATE / UNKNOWN go through phases
+    if (phase === "collect_time") {
+      // if both now present, jump to availability
+      if (memory.service && memory.startISO) {
+        phase = "check_availability";
+        return handlePhase();
+      }
+      return nextQuestion();
     }
 
-    // UNKNOWN intent: ask a helpful, non-repeating follow-up
-    const now = Date.now();
-    if (now - lastHelpAt > HELP_COOLDOWN_MS) {
-      lastHelpAt = now;
-      await say("I can help book, reschedule, or cancel. What would you like to do?");
-    } else {
-      log("[help] cooldown — not repeating help prompt");
+    if (phase === "check_availability") {
+      // if user changed time/service, re-check; else keep asking
+      if (memory.service && memory.startISO) return handlePhase();
+      return nextQuestion();
     }
+
+    if (phase === "collect_contact") {
+      if (memory.name && memory.phone) {
+        phase = "confirm_booking";
+        return handlePhase().then(nextQuestion);
+      }
+      return nextQuestion();
+    }
+
+    if (phase === "confirm_booking") {
+      if (isAffirmative(txt)) {
+        const when = pretty(memory.startISO, LOCAL_TZ);
+        const createReq = {
+          Event_Name: memory.service || "Appointment",
+          Start_Time: memory.startISO,
+          End_Time:   memory.endISO || "",
+          Customer_Name:  memory.name,
+          Customer_Phone: memory.phone,
+          Customer_Email: memory.email || "",
+          Notes: `Booked by phone agent. CallSid=${callSid}`
+        };
+        const r = await callMake(MAKE_CREATE, createReq, "CREATE");
+        if (r.ok) await say(`All set — your ${memory.service} is booked for ${when}. Thanks for calling Old Line Barbershop. Goodbye.`);
+        else      await say("Sorry — I couldn’t complete the booking. Want me to try a different time?");
+        return;
+      }
+      if (isNegative(txt)) {
+        return say("Okay, I won’t book it. Want a different time or service?");
+      }
+      // not a clear yes/no → repeat confirm line once
+      return nextQuestion();
+    }
+
+    // fallback
+    return say("I can help book, reschedule, or cancel. What would you like to do?");
   }
 
-// ---------- WS handlers ----------
+  // ---------- WS handlers ----------
   ws.on("message", async (buf) => {
     let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
 
@@ -370,41 +398,42 @@ wss.on("connection", (ws) => {
       const biz = evt.start?.customParameters?.biz || "default";
       log("WS CONNECTED |", streamSid, "| CallSid:", callSid, "| biz:", biz);
 
-      dg = startDeepgram({
+      // Deepgram
+      const dg = startDeepgram({
         onOpen: () => log("[ASR] ready"),
         onPartial: () => {},
-        onFinal: async (txt) => {
-          const ex = await extractBookingData(txt, memory, callSid);
-          ex.utterance = txt;
-          await handleExtracted(ex);
-        },
+        onFinal: (txt) => onUserUtterance(txt),
         onError: (e) => err("[ASR] err cb", e?.message || e),
         onAny:   (m) => { if (m.type && m.type !== "Results") log("[ASR msg]", JSON.stringify(m)); }
       });
+      ws._dg = dg;
 
+      // greet then go to collect_time phase
       await say("Hi, thanks for calling Old Line Barbershop. How can I help you today?");
+      phase = "collect_time";
     }
 
     else if (evt.event === "media") {
+      if (!ws._dg) return;
       frames++;
       if (frames % 50 === 1) log("[media] frames:", frames);
       const b64 = evt.media?.payload;
-      if (!b64 || !dg) return;
+      if (!b64) return;
       try {
         const ulaw = Buffer.from(b64, "base64");
-        const pcm = ulawBufferToPCM16LEBuffer(ulaw); // 20ms → 1600 samples → 3200B
-        dg.sendPCM16LE(pcm);
+        const pcm = ulawBufferToPCM16LEBuffer(ulaw);
+        ws._dg.sendPCM16LE(pcm);
       } catch (e) { err("[media] decode/send", e?.message || e); }
     }
 
     else if (evt.event === "stop") {
       log("Twilio stream STOP");
-      try { dg?.close(); } catch {}
+      try { ws._dg?.close(); } catch {}
     }
   });
 
-  ws.on("close", () => { try { dg?.close(); } catch {}; log("WS closed"); });
+  ws.on("close", () => { try { ws._dg?.close(); } catch {}; log("WS closed"); });
   ws.on("error", (e) => err("WS error", e?.message || e));
 });
 
-server.listen(PORT, () => log(`Server running on ${PORT}`));
+const appServer = server.listen(PORT, () => log(`Server running on ${PORT}`));
