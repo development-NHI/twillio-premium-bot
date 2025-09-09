@@ -1,4 +1,4 @@
-// server.js — Twilio Connect/Stream + Deepgram (URL-config) + OpenAI brain + ElevenLabs TTS + Make webhooks
+// server.js — Twilio Stream + Deepgram + OpenAI + ElevenLabs + Make (Create/Read/Delete)
 
 const express = require("express");
 const http = require("http");
@@ -7,12 +7,12 @@ const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...ar
 
 const PORT = process.env.PORT || 10000;
 
-// === Make.com webhook URLs (set in .env) ===
-const MAKE_CREATE = process.env.MAKE_CREATE || "";
-const MAKE_READ   = process.env.MAKE_READ   || "";
-const MAKE_DELETE = process.env.MAKE_DELETE || "";
+// === YOUR MAKE WEBHOOKS (hard-coded here) ===
+const MAKE_CREATE = "https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm";
+const MAKE_READ   = "https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax";
+const MAKE_DELETE = "https://hook.us2.make.com/noy0e27knj7e1jlomtznw34z246i3xtv";
 
-/* ===================== μ-law -> PCM16LE (correct) ===================== */
+// ================= μ-law conversion =================
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -33,74 +33,41 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-/* ===================== Deepgram realtime (URL-config) ===================== */
-function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
+// ================= Deepgram =================
+function startDeepgramLinear16({ onFinal }) {
   const WebSocket = require("ws");
   const key = process.env.DEEPGRAM_API_KEY || "";
-
   const url =
     "wss://api.deepgram.com/v1/listen"
-    + "?encoding=linear16"
-    + "&sample_rate=8000"
-    + "&channels=1"
-    + "&model=nova-2-phonecall"
-    + "&interim_results=true"
-    + "&smart_format=true"
-    + "&language=en-US"
-    + "&endpointing=250";
+    + "?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall"
+    + "&interim_results=true&smart_format=true&language=en-US&endpointing=250";
 
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${key}` },
     perMessageDeflate: false,
   });
 
-  let open = false;
-  const q = [];
-
-  dg.on("open", () => {
-    open = true;
-    console.log("[Deepgram] ws open (URL-config)");
-    onOpen?.();
-    while (q.length) dg.send(q.shift());
-  });
-
+  dg.on("open", () => console.log("[Deepgram] connected"));
   dg.on("message", (data) => {
     let ev;
     try { ev = JSON.parse(data.toString()); } catch { return; }
-    onAnyMessage?.(ev);
-
     if (ev.type !== "Results") return;
     const alt = ev.channel?.alternatives?.[0];
-    if (!alt) return;
-    const text = (alt.transcript || "").trim();
+    const text = (alt?.transcript || "").trim();
     if (!text) return;
-    const isFinal = ev.is_final === true || ev.speech_final === true;
-    if (isFinal) onFinal?.(text);
-    else onPartial?.(text);
-  });
-
-  dg.on("error", (e) => {
-    console.error("[Deepgram] ws error:", e?.message || e);
-    onError?.(e);
-  });
-
-  dg.on("close", (c, r) => {
-    console.log("[Deepgram] ws closed", c, r?.toString?.() || "");
+    if (ev.is_final) onFinal?.(text);
   });
 
   return {
-    sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
+    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
     close() { try { dg.close(); } catch {} },
   };
 }
 
-/* ===================== OpenAI brain ===================== */
+// ================= OpenAI =================
 async function brainReply({ systemPrompt, history, userText }) {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.log("(!) OPENAI_API_KEY missing — using echo fallback.");
-    return `You said: "${userText}".`;
-  }
+  if (!apiKey) return `You said: "${userText}".`;
 
   const body = {
     model: "gpt-4o-mini",
@@ -109,177 +76,141 @@ async function brainReply({ systemPrompt, history, userText }) {
       ...history,
       { role: "user", content: userText }
     ],
-    temperature: 0.5,
-    max_tokens: 120
+    temperature: 0.4,
+    max_tokens: 200,
   };
 
-  let res;
-  try {
-    res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-  } catch (e) {
-    console.error("[OpenAI] network error:", e?.message || e);
-    return `You said: "${userText}".`;
-  }
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
-  if (!res.ok) {
-    console.error("[OpenAI] HTTP", res.status, await safeRead(res));
-    return `You said: "${userText}".`;
-  }
-
+  if (!res.ok) return `You said: "${userText}".`;
   const json = await res.json();
-  const txt = json.choices?.[0]?.message?.content?.trim();
-  return txt || `You said: "${userText}".`;
+  return json.choices?.[0]?.message?.content?.trim() || `You said: "${userText}".`;
 }
-async function safeRead(res) { try { return await res.text(); } catch { return "(no body)"; } }
 
-/* ===================== ElevenLabs TTS ===================== */
+// ================= ElevenLabs =================
 async function speakEleven(ws, streamSid, text) {
   if (!streamSid) return;
   const key = process.env.ELEVEN_API_KEY;
   const voiceId = process.env.ELEVEN_VOICE_ID;
-  if (!key || !voiceId) {
-    console.log("(!) ELEVEN vars missing — skipping TTS");
-    return;
-  }
+  if (!key || !voiceId) return;
+
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
 
-  let res;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "xi-api-key": key, "Content-Type": "application/json" },
-      body: JSON.stringify({ text, voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
-    });
-  } catch (e) {
-    console.error("[TTS] network error:", e?.message || e);
-    return;
-  }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "xi-api-key": key, "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok || !res.body) return;
 
-  if (!res.ok || !res.body) {
-    console.error("[TTS] HTTP", res.status, await safeRead(res));
-    return;
-  }
-
-  console.log("[TTS] streaming reply bytes…");
-  return new Promise((resolve, reject) => {
-    res.body.on("data", (chunk) => {
-      const base64 = Buffer.from(chunk).toString("base64");
-      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
-    });
-    res.body.on("end", () => { console.log("[TTS] stream end"); resolve(); });
-    res.body.on("error", (e) => { console.error("[TTS] stream error:", e?.message || e); reject(e); });
+  res.body.on("data", (chunk) => {
+    const base64 = Buffer.from(chunk).toString("base64");
+    ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64 } }));
   });
 }
 
-/* ===================== Make Webhook Helpers ===================== */
-async function callMake(webhook, payload, label) {
-  if (!webhook) return;
+// ================= Call Make =================
+async function callMake(url, payload, label) {
   try {
-    const res = await fetch(webhook, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
-    const text = await res.text();
-    console.log(`[Make ${label}] HTTP ${res.status}: ${text}`);
+    console.log(`[Make] ${label} status`, res.status);
+    return await res.json().catch(() => ({}));
   } catch (e) {
-    console.error(`[Make ${label}] webhook failed:`, e?.message || e);
+    console.error(`[Make] ${label} error`, e?.message || e);
+    return {};
   }
 }
 
-async function maybeFireMake(words, callSid) {
-  if (/book|appointment|schedule|reserve/i.test(words)) {
-    const payload = {
-      api_key: "APPLES2025!",
-      intent: "CREATE",
-      biz: "acme-001",
-      source: "phone",
-      Event_Name: "Haircut",
-      Start_Time: "2025-09-09T10:00:00-04:00",
-      End_Time: "2025-09-09T10:30:00-04:00",
-      Customer_Name: "John Doe",
-      Customer_Phone: "+15551234567",
-      Customer_Email: "john@example.com",
-      Notes: words
-    };
-    callMake(MAKE_CREATE, payload, "CREATE");
-  }
-
-  if (/what.*schedule|show.*appointments|when.*available/i.test(words)) {
-    const payload = {
-      api_key: "APPLES2025!",
-      intent: "READ",
-      biz: "acme-001",
-      source: "phone",
-      window: {
-        start: "2025-01-01T00:00:00-05:00",
-        end: "2025-12-31T23:59:59-05:00"
-      }
-    };
-    callMake(MAKE_READ, payload, "READ");
-  }
-
-  if (/cancel|delete|remove/i.test(words)) {
-    const payload = {
-      api_key: "APPLES2025!",
-      intent: "DELETE",
-      biz: "acme-001",
-      source: "phone",
-      event_id: "REPLACE_WITH_REAL_ID"
-    };
-    callMake(MAKE_DELETE, payload, "DELETE");
-  }
-}
-
-/* ===================== HTTP app (health + browser check) ===================== */
+// ================= HTTP =================
 const app = express();
-app.get("/",  (_, res) => res.type("text/plain").send("OK"));
-app.get("/twilio",  (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio"));
-app.get("/twilio/", (_, res) => res.status(426).type("text/plain").send("Upgrade Required: connect via wss://<host>/twilio/"));
+app.get("/", (_, res) => res.type("text/plain").send("OK"));
 const server = http.createServer(app);
 
-/* ===================== WebSocket (manual upgrade) ===================== */
-const { WebSocketServer: WSS } = require("ws");
-const wss = new WSS({ noServer: true, perMessageDeflate: false });
+// ================= WebSocket =================
+const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
-  try {
-    const u = new URL(req.url, `http://${req.headers.host}`);
-    console.log("[UPGRADE] path:", u.pathname, "search:", u.search);
-    if (u.pathname !== "/twilio" && u.pathname !== "/twilio/") {
-      socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
-      socket.destroy(); return;
-    }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } catch (e) {
-    console.error("[UPGRADE] exception:", e?.message || e);
-    try { socket.destroy(); } catch {}
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  if (!u.pathname.startsWith("/twilio")) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    return socket.destroy();
   }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
-/* ===================== Twilio μ-law → Deepgram → OpenAI → ElevenLabs ===================== */
+// ================= Session =================
 wss.on("connection", (ws) => {
   let streamSid = null;
   let dg = null;
-  let dgOpened = false;
-  let frameCount = 0;
-  const history = [];
 
-  const BATCH_FRAMES = 5;
-  let pendingULaw = [];
+  async function handleUserText(text) {
+    console.log("[user]", text);
 
-  const systemPrompt =
-    process.env.AGENT_PROMPT ||
-    "You are a premium phone assistant. Be concise, friendly, and proactive.";
+    // Extract structured booking info
+    const extractionPrompt = `
+      Extract JSON with keys:
+      { Event_Name, Start_Time, End_Time, Customer_Name, Customer_Phone, Customer_Email, Notes, intent }.
+      intent should be CREATE, READ, or DELETE.
+      If no match, return {}.
+      User said: """${text}"""`;
 
-  async function handleUserText(text, callSid) {
-    console.log("[final ]", text);
-    maybeFireMake(text, callSid).catch(() => {});
-    const reply = await brainReply({ systemPrompt, history, userText: text });
-    history.push({ role: "user", content: text }, { role: "assistant", content: reply });
+    let bookingData = {};
+    try {
+      const raw = await brainReply({ systemPrompt: "Return JSON only.", history: [], userText: extractionPrompt });
+      bookingData = JSON.parse(raw);
+    } catch { bookingData = {}; }
+
+    // === Handle CREATE ===
+    if (bookingData.intent === "CREATE") {
+      const readPayload = {
+        api_key: "APPLES2025!",
+        intent: "READ",
+        biz: "acme-001",
+        source: "phone",
+        window: { start: bookingData.Start_Time, end: bookingData.End_Time },
+      };
+      const existing = await callMake(MAKE_READ, readPayload, "READ");
+      if (existing?.events?.length) {
+        return speakEleven(ws, streamSid, "That slot is already booked. Would you like another time?");
+      }
+
+      const createPayload = {
+        api_key: "APPLES2025!",
+        intent: "CREATE",
+        biz: "acme-001",
+        source: "phone",
+        ...bookingData,
+      };
+      await callMake(MAKE_CREATE, createPayload, "CREATE");
+      return speakEleven(ws, streamSid, `Your ${bookingData.Event_Name} was booked for ${bookingData.Start_Time}.`);
+    }
+
+    // === Handle DELETE ===
+    if (bookingData.intent === "DELETE") {
+      const delPayload = {
+        api_key: "APPLES2025!",
+        intent: "DELETE",
+        biz: "acme-001",
+        source: "phone",
+        id: bookingData.id,
+      };
+      await callMake(MAKE_DELETE, delPayload, "DELETE");
+      return speakEleven(ws, streamSid, "Your appointment was canceled.");
+    }
+
+    // === Fallback chat ===
+    const reply = await brainReply({
+      systemPrompt: "You are a helpful barbershop phone agent.",
+      history: [],
+      userText: text,
+    });
     await speakEleven(ws, streamSid, reply);
   }
 
@@ -287,55 +218,23 @@ wss.on("connection", (ws) => {
     let evt; try { evt = JSON.parse(buf.toString()); } catch { return; }
 
     if (evt.event === "start") {
-      streamSid = evt.start?.streamSid || null;
-      const callSid = evt.start?.callSid || null;
-      console.log("WS CONNECTED | streamSid:", streamSid);
-
-      if (process.env.DEEPGRAM_API_KEY) {
-        dg = startDeepgramLinear16({
-          onOpen: () => console.log("[Deepgram] opened (ready for audio)"),
-          onPartial: (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } console.log("[partial]", t); },
-          onFinal:   (t) => { if (!dgOpened) { console.log("[deepgram] receiving transcripts"); dgOpened = true; } handleUserText(t, callSid); },
-          onError:   (e) => console.error("[Deepgram] error cb:", e?.message || e),
-          onAnyMessage: (ev) => { if (ev.type && ev.type !== "Results") console.log("[Deepgram] msg:", JSON.stringify(ev)); }
-        });
-      } else {
-        console.log("(!) No DEEPGRAM_API_KEY — ASR disabled.");
-      }
-
-      await speakEleven(ws, streamSid, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
+      streamSid = evt.start?.streamSid;
+      console.log("WS CONNECTED", streamSid);
+      dg = startDeepgramLinear16({ onFinal: (t) => handleUserText(t) });
+      await speakEleven(ws, streamSid, "Hi, welcome to Old Line Barbershop. How can I help?");
     }
-
     else if (evt.event === "media") {
-      frameCount++;
       const b64 = evt.media?.payload || "";
       if (!b64) return;
-
       const ulaw = Buffer.from(b64, "base64");
-      pendingULaw.push(ulaw);
-      if (pendingULaw.length >= BATCH_FRAMES && dg) {
-        const ulawChunk = Buffer.concat(pendingULaw);
-        const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-        dg.sendPCM16LE(pcm16le);
-        pendingULaw = [];
-      }
+      const pcm16le = ulawBufferToPCM16LEBuffer(ulaw);
+      dg?.sendPCM16LE(pcm16le);
     }
-
     else if (evt.event === "stop") {
-      console.log("Twilio stream STOP");
-      if (pendingULaw.length && dg) {
-        const ulawChunk = Buffer.concat(pendingULaw);
-        const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-        dg.sendPCM16LE(pcm16le);
-        pendingULaw = [];
-      }
-      if (dg) dg.close();
+      console.log("Twilio STOP");
+      dg?.close();
     }
   });
-
-  ws.on("close", () => { if (dg) dg.close(); console.log("WS closed"); });
-  ws.on("error", (e) => console.error("WS error", e?.message || e));
 });
 
-server.listen(PORT, () => console.log(`Server running on 0.0.0.0:${PORT}`));
-
+server.listen(PORT, () => console.log(`Server on :${PORT}`));
