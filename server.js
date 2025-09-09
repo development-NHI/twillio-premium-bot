@@ -303,7 +303,7 @@ wss.on("connection", (ws) => {
         console.log("(!) No DEEPGRAM_API_KEY — ASR disabled.");
       }
 
-      await speakEleven(ws, streamSid, "Hi there. How can I help you?");
+      await speakEleven(ws, streamSid, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
     }
 
     else if (evt.event === "media") {
@@ -338,3 +338,4 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => console.log(`Server running on 0.0.0.0:${PORT}`));
+
