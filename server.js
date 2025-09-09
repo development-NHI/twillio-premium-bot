@@ -55,6 +55,31 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
+// ---------- simple normalization ----------
+const SERVICE_ALIASES = {
+  "haircut": ["haircut", "cut", "men's cut", "mens cut", "trim hair", "basic haircut", "standard haircut"],
+  "Beard Trim": ["beard trim", "trim", "beard", "line up", "line-up", "beard lineup", "beard shape"]
+};
+function normalizeService(raw) {
+  if (!raw) return "";
+  const s = String(raw).toLowerCase().trim();
+  for (const canonical of Object.keys(SERVICE_ALIASES)) {
+    if (SERVICE_ALIASES[canonical].some(a => s.includes(a))) return canonical;
+  }
+  // if caller said something like "bazillion haircut", keep only if it contains haircut/beard keywords
+  if (/\bhair\s*cut|haircut\b/.test(s)) return "haircut";
+  if (/\bbeard\b/.test(s)) return "Beard Trim";
+  return ""; // unknown -> will trigger clarification
+}
+function digitsOnlyPhone(p) {
+  if (!p) return "";
+  return (""+p).replace(/\D+/g, "").slice(-10); // last 10 digits
+}
+function formatPhone(d10) {
+  if (!d10 || d10.length !== 10) return d10 || "";
+  return `(${d10.slice(0,3)}) ${d10.slice(3,6)}-${d10.slice(6)}`;
+}
+
 // ---------- Deepgram realtime ----------
 function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
   const WebSocket = require("ws");
@@ -66,7 +91,8 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
     + "&model=nova-2-phonecall&interim_results=true&smart_format=true"
     + "&language=en-US&endpointing=250";
 
-  const dg = new WebSocket(url, { headers: { Authorization: `token ${key}` }, perMessageDeflate: false });
+  // IMPORTANT: Deepgram expects "Token <key>"
+  const dg = new WebSocket(url, { headers: { Authorization: `Token ${key}` }, perMessageDeflate: false });
   let open = false;
   const q = [];
 
@@ -98,13 +124,18 @@ function startDeepgram({ onOpen, onPartial, onFinal, onError, onAny }) {
 async function extractBookingData(userText, memory, callId) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    // heuristic fallback
+    // heuristic fallback (+ stronger mapping to reduce UNKNOWN hops)
+    const text = userText || "";
+    const intent =
+      /cancel|reschedule.*cancel/i.test(text) ? "DELETE" :
+      /availability|what.*appointments|any.*appointments|do you have|are you open|free slots|openings/i.test(text) ? "READ" :
+      /book|appointment|schedule|reserve|make.*appointment/i.test(text) ? "CREATE" :
+      "UNKNOWN";
     return {
-      intent: /cancel/i.test(userText) ? "DELETE" :
-              /read|availability|open|what.*appointments|any.*appointments/i.test(userText) ? "READ" :
-              /book|appointment|schedule|reserve/i.test(userText) ? "CREATE" : "UNKNOWN",
-      Event_Name: "", Start_Time: "", End_Time: "", Customer_Name: "", Customer_Phone: "", Customer_Email: "",
-      id: "", Notes: "", window: null
+      intent,
+      Event_Name: "", Start_Time: "", End_Time: "",
+      Customer_Name: "", Customer_Phone: "", Customer_Email: "",
+      id: "", Notes: "", window: { start: "", end: "" }
     };
   }
 
@@ -112,6 +143,7 @@ async function extractBookingData(userText, memory, callId) {
   const sys = `Return ONLY JSON. Current time: ${nowISO} ${tz}.
 - Interpret times in ${tz}.
 - If any info is missing, use "" (empty string).
+- If the user says "tomorrow at noon/1pm/etc", resolve to full ISO in ${tz}.
 Schema:
 {
   "intent": "CREATE|READ|DELETE|UNKNOWN",
@@ -225,8 +257,17 @@ server.on("upgrade", (req, socket, head) => {
 wss.on("connection", (ws) => {
   let streamSid = null;
   let callSid = null;
-  let dg = null;
   let frames = 0;
+  let lastUserAt = Date.now();
+
+  // ping/pong to keep the socket alive (and detect dead connections)
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+  const pingIv = setInterval(() => {
+    if (ws.isAlive === false) { try { ws.terminate(); } catch {} return; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }, 25000);
 
   // conversational memory
   const memory = { name: "", phone: "", email: "", service: "", startISO: "", endISO: "" };
@@ -244,6 +285,24 @@ wss.on("connection", (ws) => {
     lastSaid = text;
     await speakEleven(ws, streamSid, text);
   }
+
+  // gentle inactivity reprompt
+  const INACTIVITY_MS = 12000;
+  const repromptIv = setInterval(() => {
+    const idle = Date.now() - lastUserAt;
+    if (idle < INACTIVITY_MS) return;
+    // pick a concise reprompt based on phase/slots
+    if (phase === "collect_time") {
+      if (!memory.service) return say("I can help with a haircut or a beard trim. Which would you like?");
+      if (!memory.startISO) return say("What day and time works for you?");
+    } else if (phase === "collect_contact") {
+      if (!memory.name)  return say("What name should I put on it?");
+      if (!memory.phone) return say("What’s the best phone number?");
+    } else if (phase === "confirm_booking") {
+      const when = pretty(memory.startISO, LOCAL_TZ);
+      return say(`Should I book ${memory.service} for ${memory.name} at ${when}?`);
+    }
+  }, 3000);
 
   // ask only ONE thing depending on phase
   async function nextQuestion() {
@@ -285,7 +344,6 @@ wss.on("connection", (ws) => {
       phase = "collect_contact";
       return nextQuestion();
     }
-
     if (phase === "confirm_booking") {
       // will speak confirmation line in nextQuestion; actual booking after “yes”
       return;
@@ -293,24 +351,44 @@ wss.on("connection", (ws) => {
   }
 
   function mergeExtract(ex) {
-    if (ex.Customer_Name)  memory.name = ex.Customer_Name;
-    if (ex.Customer_Phone) memory.phone = ex.Customer_Phone;
+    if (ex.Customer_Name)  memory.name = ex.Customer_Name.trim();
+    if (ex.Customer_Phone) {
+      const d = digitsOnlyPhone(ex.Customer_Phone);
+      memory.phone = d ? formatPhone(d) : memory.phone;
+    }
     if (ex.Customer_Email) memory.email = ex.Customer_Email;
-    if (ex.Event_Name)     memory.service = ex.Event_Name;
+    if (ex.Event_Name)     memory.service = normalizeService(ex.Event_Name) || memory.service;
     if (ex.Start_Time)     memory.startISO = ex.Start_Time;
     if (ex.End_Time)       memory.endISO = ex.End_Time;
+
+    // if the service is still unknown but the utterance contains hints, try to infer
+    if (!memory.service && ex.utterance) {
+      const maybe = normalizeService(ex.utterance);
+      if (maybe) memory.service = maybe;
+    }
+
     logSlots("merge");
   }
 
   function isAffirmative(txt) {
-    return /\b(yes|yeah|yep|sure|please|go ahead|book it|confirm)\b/i.test(txt || "");
+    return /\b(yes|yeah|yep|sure|please|go ahead|book it|confirm|sounds good|that works|okay|ok)\b/i.test(txt || "");
   }
   function isNegative(txt) {
-    return /\b(no|nah|nope|stop|wait|hold on|cancel)\b/i.test(txt || "");
+    return /\b(no|nah|nope|stop|wait|hold on|cancel|not now)\b/i.test(txt || "");
   }
 
   async function onUserUtterance(txt) {
+    lastUserAt = Date.now();
+
+    // quick pre-map to reduce UNKNOWN hops
+    const lower = (txt || "").toLowerCase();
+    let preIntent = "";
+    if (/cancel/.test(lower)) preIntent = "DELETE";
+    else if (/(availability|openings|free|are you open|what.*appointments|any.*appointments)/.test(lower)) preIntent = "READ";
+    else if (/(book|appointment|schedule|reserve|make.*appointment)/.test(lower)) preIntent = "CREATE";
+
     const ex = await extractBookingData(txt, memory, callSid);
+    ex.intent = ex.intent === "UNKNOWN" && preIntent ? preIntent : ex.intent;
     ex.utterance = txt;
     log("[extracted]", ex);
     mergeExtract(ex);
@@ -336,6 +414,14 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // If we still don't recognize the service, clarify explicitly once.
+    if (phase === "collect_time" && !memory.service && /hair|beard|trim|cut/i.test(txt)) {
+      const guess = normalizeService(txt);
+      if (!guess) {
+        return say("Did you want a haircut or a beard trim?");
+      }
+    }
+
     // CREATE / UNKNOWN go through phases
     if (phase === "collect_time") {
       // if both now present, jump to availability
@@ -347,7 +433,6 @@ wss.on("connection", (ws) => {
     }
 
     if (phase === "check_availability") {
-      // if user changed time/service, re-check; else keep asking
       if (memory.service && memory.startISO) return handlePhase();
       return nextQuestion();
     }
@@ -401,7 +486,7 @@ wss.on("connection", (ws) => {
       // Deepgram
       const dg = startDeepgram({
         onOpen: () => log("[ASR] ready"),
-        onPartial: () => {},
+        onPartial: () => { lastUserAt = Date.now(); },
         onFinal: (txt) => onUserUtterance(txt),
         onError: (e) => err("[ASR] err cb", e?.message || e),
         onAny:   (m) => { if (m.type && m.type !== "Results") log("[ASR msg]", JSON.stringify(m)); }
@@ -432,8 +517,14 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => { try { ws._dg?.close(); } catch {}; log("WS closed"); });
-  ws.on("error", (e) => err("WS error", e?.message || e));
+  function cleanup() {
+    try { ws._dg?.close(); } catch {};
+    clearInterval(pingIv);
+    clearInterval(repromptIv);
+    log("WS closed");
+  }
+  ws.on("close", cleanup);
+  ws.on("error", (e) => { err("WS error", e?.message || e); cleanup(); });
 });
 
 const appServer = server.listen(PORT, () => log(`Server running on ${PORT}`));
