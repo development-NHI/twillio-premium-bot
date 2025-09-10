@@ -1,19 +1,19 @@
 /**
- * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST, availability-aware, de-looped, robust time parsing)
- * (Twilio Media Streams WS + Deepgram ASR + OpenAI extract/NLG + ElevenLabs TTS + Make.com)
+ * server.js — Old Line Barbershop voice agent
+ * - CONFIRM-FIRST
+ * - MAKE_READ availability check BEFORE booking, and again right before CREATE
+ * - Robust date/time parsing (today/tomorrow/weekday like "next Monday", split "Friday …" then "9AM")
+ * - Name/phone loops fixed (local extract + ask throttling)
+ * - Natural, non-robotic phrasing
  *
  * Env:
  *  PORT
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
- *  ELEVEN_API_KEY              (preferred)   |
- *  ELEVENLABS_API_KEY          (fallbacks)   |→ any will work
- *  ELEVEN_VOICE_ID             (preferred)   |
- *  ELEVENLABS_VOICE_ID         (fallbacks)   |
- *  MAKE_CREATE                 (preferred)   |
- *  MAKE_CREATE_URL             (fallbacks)   |→ URL to create/POST a booking
- *  MAKE_READ                   (preferred)   |
- *  MAKE_READ_URL               (fallbacks)   |→ URL to read/check availability
+ *  ELEVEN_API_KEY | ELEVENLABS_API_KEY
+ *  ELEVEN_VOICE_ID | ELEVENLABS_VOICE_ID (optional; defaults to Adam)
+ *  MAKE_CREATE | MAKE_CREATE_URL
+ *  MAKE_READ   | MAKE_READ_URL
  *  AGENT_PROMPT (optional)
  */
 
@@ -28,7 +28,7 @@ const https = require('https');
 
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const DEEPGRAM_API_KEY = process.env.DEPPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY || '';
+const DEEPGRAM_API_KEY = process.env.DEEPPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY || '';
 const ELEVENLABS_API_KEY =
   process.env.ELEVEN_API_KEY ||
   process.env.ELEVENLABS_API_KEY ||
@@ -36,21 +36,19 @@ const ELEVENLABS_API_KEY =
 const ELEVENLABS_VOICE_ID =
   process.env.ELEVEN_VOICE_ID ||
   process.env.ELEVENLABS_VOICE_ID ||
-  '21m00Tcm4TlvDq8ikWAM'; // Adam default
+  '21m00Tcm4TlvDq8ikWAM'; // Adam
 
 const MAKE_CREATE_URL =
   process.env.MAKE_CREATE ||
-  process.env.MAKE_CREATE_URL ||
-  '';
+  process.env.MAKE_CREATE_URL || '';
 const MAKE_READ_URL =
   process.env.MAKE_READ ||
-  process.env.MAKE_READ_URL ||
-  '';
+  process.env.MAKE_READ_URL || '';
 
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 const fetchFN = (...args) => globalThis.fetch(...args);
 
-// ---------------------- Logger ----------------------
+// ---------- Logger ----------
 function log(level, msg, meta = undefined) {
   if (meta && Object.keys(meta).length) {
     console.log(`${new Date().toISOString()} - [${level}] - ${msg} | ${JSON.stringify(meta)}`);
@@ -75,16 +73,16 @@ if (!ELEVENLABS_API_KEY) log('WARN', 'ELEVEN_API_KEY/ELEVENLABS_API_KEY missing 
 if (!MAKE_CREATE_URL) log('WARN', 'MAKE_CREATE_URL missing (CREATE won’t be posted)');
 if (!MAKE_READ_URL) log('WARN', 'MAKE_READ_URL missing (availability checks disabled)');
 
-// ---------------------- Express HTTP ----------------------
+// ---------- Express ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_, res) => res.status(200).send('OK'));
 const server = http.createServer(app);
 
-// ---------------------- WS Server ----------------------
+// ---------- WS ----------
 const wss = new WebSocket.Server({ server });
 
-// ---------------------- Agent Prompt ----------------------
+// ---------- Prompt ----------
 const DEFAULT_AGENT_PROMPT = `
 You are a friendly, human-sounding AI receptionist for Old Line Barbershop.
 
@@ -96,35 +94,35 @@ Core Responsibilities
 Booking Order (strict):
 1) Service (haircut, beard trim, combo = haircut + beard trim).
 2) Preferred date/time.
-3) Confirm availability (assume a single 30-min slot, business hours Mon–Fri 9–5).
-4) After availability, ask for name and phone (confirm caller’s number if provided by caller ID).
-5) Read back all details and ask for a yes/no confirmation.
-6) On yes, finalize the booking. On no, ask what to change.
+3) Confirm availability (30-min slot, Mon–Fri 9–5).
+4) After availability, ask for name and phone (confirm caller ID number if present).
+5) Read back details and ask for a yes/no confirmation.
+6) On yes, finalize. On no, ask what to change.
 
 Rules
-- Only book Mon–Fri, 9am–5pm; suggest nearest slot if outside hours.
-- Never double-book; if details already confirmed and booked, don’t rebook.
-- Speak in short natural sentences (<~22 words). One question at a time.
-- Vary phrasing; use contractions; micro-acks.
+- Only book Mon–Fri, 9am–5pm; suggest the nearest slot if outside hours.
+- Never double-book; if already confirmed and created, don’t rebook.
+- Short natural sentences (<~22 words). One question at a time.
+- Vary phrasing, use contractions, micro-acks.
 - If answering FAQs, give the fact, then optionally offer to book.
 - Don’t start booking unless they ask to book/reschedule/cancel.
-- If unsure, say you’ll transfer and end.
+- If unsure, apologize and offer to text the shop to call back.
 - Don’t re-ask details already provided.
-- Keep caller informed (“Let me check…”, “That time is available…”, “Your appointment is confirmed.”)
-- When saying goodbye, hang up immediately.
+- Keep caller informed (“Let me check…”, “That time’s open…”, “All set.”)
+- Say goodbye and hang up when done.
 
-Vocabulary: Treat “both/ combo / haircut and beard / haircut + beard” as the combo service.
-If caller said “combo” and wants to book, keep that and move on to date/time.
+Vocabulary
+- “both / combo / haircut + beard / haircut and beard” => service=combo
 
 System Controls
 - If forbidGreet=true, don’t greet again.
-- If suggestedPhone is set and phone not yet collected, confirm that number.
+- If suggestedPhone exists and phone is missing, confirm that number.
 - Never output JSON to the caller.
 `.trim();
 
 const AGENT_PROMPT = (process.env.AGENT_PROMPT || DEFAULT_AGENT_PROMPT);
 
-// ---------------------- State ----------------------
+// ---------- State ----------
 function newConvo(callSid, biz) {
   return {
     id: randomUUID(),
@@ -140,8 +138,8 @@ function newConvo(callSid, biz) {
     awaitingAsk: 'NONE', // SERVICE|TIME|NAME|PHONE|CONFIRM|WRAPUP|NONE
     created: false,
     createInFlight: false,
-    lastAskAt: {}, // throttle map by ask key
-    temp: { pendingDate: null, pendingTime: null },
+    lastAskAt: {},
+    temp: { pendingDate: null, pendingTime: null, suggestTries: 0 },
     slots: {
       service: '',
       startISO: '',
@@ -153,7 +151,7 @@ function newConvo(callSid, biz) {
   };
 }
 
-// ---------------------- Audio utils ----------------------
+// ---------- Audio utils ----------
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -174,10 +172,9 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------------------- Deepgram realtime ----------------------
+// ---------- Deepgram ----------
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   if (!DEEPGRAM_API_KEY) return null;
-
   const url =
     'wss://api.deepgram.com/v1/listen'
     + '?encoding=linear16'
@@ -196,14 +193,12 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
 
   let open = false;
   const q = [];
-
   dg.on('open', () => {
     open = true;
     log('INFO', '[ASR] Deepgram open');
     onOpen?.();
     while (q.length) dg.send(q.shift());
   });
-
   dg.on('message', (data) => {
     let ev;
     try { ev = JSON.parse(data.toString()); } catch { return; }
@@ -214,20 +209,17 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
     const text = (alt.transcript || '').trim();
     if (!text) return;
     const isFinal = ev.is_final === true || ev.speech_final === true;
-    if (isFinal) onFinal?.(text);
-    else onPartial?.(text);
+    if (isFinal) onFinal?.(text); else onPartial?.(text);
   });
-
   dg.on('error', (e) => { log('ERROR', '[ASR] error', { error: e?.message || String(e) }); onError?.(e); });
   dg.on('close', (c, r) => log('INFO', '[ASR] Deepgram closed', { code: c, reason: (r||'').toString?.() || '' }));
-
   return {
     sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
     close() { try { dg.close(); } catch {} }
   };
 }
 
-// ---------------------- Utilities ----------------------
+// ---------- Utilities ----------
 function normalizeService(text) {
   if (!text) return '';
   const t = text.toLowerCase();
@@ -255,9 +247,7 @@ function debounceRepeat(convo, text, ms = 2500) {
   const now = Date.now();
   if (!text) return false;
   if (text === convo.lastTTS && (now - convo.lastTTSAt) < ms) return true;
-  convo.lastTTS = text;
-  convo.lastTTSAt = now;
-  return false;
+  convo.lastTTS = text; convo.lastTTSAt = now; return false;
 }
 function throttleAsk(convo, askKey, minMs = 3000) {
   const now = Date.now();
@@ -281,7 +271,9 @@ function normalizeFutureStart(iso) {
   if (isNaN(+dt)) return iso;
   const now = new Date();
   if (dt.getTime() < now.getTime()) {
-    const bumped = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
+    // keep same weekday/time — bump to the NEXT occurrence of that weekday/time
+    const bumped = new Date(now);
+    bumped.setDate(now.getDate() + 7);
     bumped.setHours(dt.getHours(), dt.getMinutes(), 0, 0);
     log('WARN', '[time guardrail] bumped parsed Start_Time to future', { from: iso, to: bumped.toISOString() });
     return bumped.toISOString();
@@ -351,12 +343,37 @@ function maybeExtractPhone(utterance) {
   return '';
 }
 
-// ---- Local TIME parsing (single or split utterances) ----
+// ---- Date/Time parsing: adds weekday ("Friday", "next Monday") ----
+const WD = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+function parseWeekdayFromUtterance(u, now = new Date()) {
+  if (!u) return null;
+  const m = u.toLowerCase().match(/\b(next|this)?\s*(sun|sunday|mon|monday|tue|tues|tuesday|wed|weds|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday)\b/);
+  if (!m) return null;
+  const kw = (m[1] || '').toLowerCase();
+  const wdStr = m[2];
+  let idx = WD.findIndex(d => wdStr.startsWith(d.substr(0,3)));
+  if (idx < 0) return null;
+
+  const d0 = new Date(now);
+  const today = d0.getDay();
+  let delta = (idx - today + 7) % 7;
+
+  // “next Monday”: ensure strictly next week; “this Monday”: today or later this week
+  if (kw === 'next') delta = delta === 0 ? 7 : delta; // if today, jump a week
+  if (kw === 'this') { /* keep delta as computed */ }
+  // bare "Friday": if today and time not provided or in the past → next week when needed (handled later)
+  return { y: d0.getFullYear(), m: d0.getMonth()+1, d: d0.getDate() + delta, weekdayMode: kw || 'bare', weekdayIndex: idx };
+}
+
 function parseDateFromUtterance(u, now = new Date()) {
   if (!u) return null;
+
+  // Weekday support first
+  const wd = parseWeekdayFromUtterance(u, now);
+  if (wd) return wd;
+
   const t = u.toLowerCase();
 
-  // Tomorrow / today
   if (/\btomorrow\b/.test(t)) {
     const d = new Date(now.getTime() + 24*3600*1000);
     return { y: d.getFullYear(), m: d.getMonth()+1, d: d.getDate() };
@@ -389,7 +406,6 @@ function parseDateFromUtterance(u, now = new Date()) {
 }
 function parseTimeFromUtterance(u) {
   if (!u) return null;
-  // at 10AM / 10 AM / 10:30 am / 14:00
   const m = u.match(/\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
   if (m) {
     let hh = parseInt(m[1],10);
@@ -397,32 +413,42 @@ function parseTimeFromUtterance(u) {
     const ap = m[3] ? m[3].toLowerCase() : null;
     if (ap === 'pm' && hh < 12) hh += 12;
     if (ap === 'am' && hh === 12) hh = 0;
-    if (!ap && hh <= 7) hh += 12; // small bias: 1-7 as afternoon if no AM/PM
+    if (!ap && hh <= 7) hh += 12; // bias 1–7 to afternoon if no AM/PM
     return { hh, mi };
   }
   return null;
 }
-function buildISOFromParts(datePart, timePart) {
+function buildISOFromParts(datePart, timePart, now = new Date()) {
   if (!datePart || !timePart) return '';
-  const { y, m, d } = datePart;
-  const { hh, mi } = timePart;
-  const dt = new Date(y, m-1, d, hh, mi || 0, 0, 0);
+  // If datePart came from weekday and is “bare Friday today in the past”, roll to next week
+  const base = new Date(now);
+  base.setDate(datePart.d);
+  base.setMonth(datePart.m - 1);
+  base.setFullYear(datePart.y);
+  base.setHours(timePart.hh, timePart.mi || 0, 0, 0);
+  const dt = new Date(base);
+  if (datePart.weekdayIndex != null) {
+    if (dt.getTime() <= now.getTime()) {
+      dt.setDate(dt.getDate() + 7); // next week same weekday/time
+    }
+  }
   return dt.toISOString();
 }
 function tryParseAndSetTime(convo, utterance) {
-  // Combined in one utterance?
-  const dp = parseDateFromUtterance(utterance);
+  const now = new Date();
+  const dp = parseDateFromUtterance(utterance, now);
   const tp = parseTimeFromUtterance(utterance);
+
   if (dp && tp) {
-    const iso = normalizeFutureStart(buildISOFromParts(dp, tp));
+    const iso = normalizeFutureStart(buildISOFromParts(dp, tp, now));
     if (iso) { setSlot(convo, 'startISO', iso); return 'SET'; }
   }
 
-  // Two-step capture
   if (dp && !tp) { convo.temp.pendingDate = dp; }
   if (tp && !dp) { convo.temp.pendingTime = tp; }
+
   if (convo.temp.pendingDate && convo.temp.pendingTime) {
-    const iso = normalizeFutureStart(buildISOFromParts(convo.temp.pendingDate, convo.temp.pendingTime));
+    const iso = normalizeFutureStart(buildISOFromParts(convo.temp.pendingDate, convo.temp.pendingTime, now));
     if (iso) {
       setSlot(convo, 'startISO', iso);
       convo.temp.pendingDate = null;
@@ -433,7 +459,7 @@ function tryParseAndSetTime(convo, utterance) {
   return 'NOSET';
 }
 
-// ---------------------- Make.com — availability & create ----------------------
+// ---------- Make.com ----------
 async function makeCheckAvailability(startISO, endISO) {
   if (!MAKE_READ_URL || !startISO) return { ok: false, available: true };
   const payload = { intent: 'READ', window: { start: startISO, end: endISO || computeEndISO(startISO) } };
@@ -450,13 +476,14 @@ async function makeCheckAvailability(startISO, endISO) {
       return { ok: false, available: true };
     }
     const data = await r.json().catch(()=> ({}));
-    return { ok: true, available: !!data.available, nextOpenISO: data.nextOpenISO || '' };
+    const res = { ok: true, available: !!data.available, nextOpenISO: data.nextOpenISO || '' };
+    log('INFO', '[Make READ] result', res);
+    return res;
   } catch (e) {
     log('ERROR', '[Make READ]', { error: e.message });
     return { ok: false, available: true };
   }
 }
-
 async function makeCreateBooking(convo) {
   const payload = {
     Event_Name: convo.slots.service || 'Appointment',
@@ -492,7 +519,35 @@ async function makeCreateBooking(convo) {
   }
 }
 
-// ---------------------- OpenAI (extract) ----------------------
+// Best-effort “next open” if your READ doesn’t return nextOpenISO
+async function findNextOpenSlot(seedISO) {
+  let probe = new Date(seedISO ? seedISO : Date.now());
+  // constrain to business hours 9–5
+  function clampToBusinessHours(d) {
+    const h = d.getHours();
+    if (h < 9) d.setHours(9, 0, 0, 0);
+    if (h >= 17) { d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); }
+    // Mon–Fri only
+    while (d.getDay() === 0 || d.getDay() === 6) { // Sun/Sat
+      d.setDate(d.getDate() + 1); d.setHours(9,0,0,0);
+    }
+  }
+  clampToBusinessHours(probe);
+
+  for (let i = 0; i < 40; i++) { // scan up to ~20 hours of half-hour slots
+    const candidate = new Date(probe);
+    const start = candidate.toISOString();
+    const end = computeEndISO(start);
+    const chk = await makeCheckAvailability(start, end);
+    if (chk.available) return start;
+    // move 30 minutes forward, keep business rules
+    probe = new Date(probe.getTime() + 30*60*1000);
+    clampToBusinessHours(probe);
+  }
+  return '';
+}
+
+// ---------- OpenAI (extract/NLG) ----------
 async function openAIExtract(utterance, convo) {
   const sys = [
     `Return a strict JSON object with fields:
@@ -560,8 +615,7 @@ ${AGENT_PROMPT}`
   }
 }
 
-// ---------------------- NLG ----------------------
-async function openAINLG(convo, promptHints = '') {
+async function openAINLG(convo, hint = '') {
   const sys = `
 You are a warm front-desk receptionist.
 Write ONE short, conversational sentence next (<22 words).
@@ -585,7 +639,7 @@ ${AGENT_PROMPT}
 
   const user = `
 Compose the next thing to say to the caller.
-${promptHints ? 'Hint: ' + promptHints : ''}
+${hint ? 'Hint: ' + hint : ''}
 `.trim();
 
   try {
@@ -616,12 +670,12 @@ ${promptHints ? 'Hint: ' + promptHints : ''}
   }
 }
 
-// ---------------------- ensureReplyOrAsk ----------------------
+// ---------- Reply logic ----------
 function ensureReplyOrAsk(parsed, utterance, convo) {
   const inBooking = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
   const canCollect = parsed.intent === 'CREATE' || inBooking;
 
-  // Merge service from extractor or raw utterance
+  // Merge service
   const inferredService = parsed.service || normalizeService(parsed.Event_Name) || normalizeService(utterance);
   if (!convo.slots.service && inferredService) setSlot(convo, 'service', inferredService);
 
@@ -662,22 +716,19 @@ function ensureReplyOrAsk(parsed, utterance, convo) {
   return parsed;
 }
 
-// ---------------------- TTS -> Twilio ----------------------
+// ---------- Twilio TTS ----------
 async function ttsToTwilio(ws, text, voiceId = ELEVENLABS_VOICE_ID) {
   if (!text) return;
-
   const convo = ws.__convo;
   if (debounceRepeat(convo, text)) {
     log('DEBUG', '[debounce] suppress repeat', { text });
     return;
   }
-
   const streamSid = ws.__streamSid;
   if (!streamSid) { log('WARN', '[TTS] missing streamSid; cannot send audio'); return; }
   if (!ELEVENLABS_API_KEY) { log('WARN', '[TTS] ELEVEN_API_KEY missing; skipping audio'); return; }
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-
   try {
     log('INFO', '[TTS ->]', { text });
     const resp = await fetchFN(url, {
@@ -694,13 +745,11 @@ async function ttsToTwilio(ws, text, voiceId = ELEVENLABS_VOICE_ID) {
         generation_config: { chunk_length_schedule: [120, 160, 200, 240] }
       })
     });
-
     if (!resp.ok) {
       const t = await resp.text().catch(() => '');
       log('ERROR', '[TTS fetch]', { error: `${resp.status} ${t}` });
       return;
     }
-
     const reader = resp.body.getReader();
     while (true) {
       const { value, done } = await reader.read();
@@ -717,32 +766,186 @@ async function ttsToTwilio(ws, text, voiceId = ELEVENLABS_VOICE_ID) {
 function safeSend(ws, data) { try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch {} }
 function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
 
-// ---------------------- Flow ----------------------
-async function onUserUtterance(ws, utterance) {
-  const convo = ws.__convo;
-  if (!convo) return;
+// ---------- Availability helpers ----------
+async function askOnce(ws, convo, askKey, explicitLine) {
+  if (throttleAsk(convo, askKey, 2750)) {
+    log('DEBUG', '[ask throttle]', { ask: askKey });
+    return;
+  }
+  const line = explicitLine || makeQuestionForAsk(askKey, convo);
+  await twilioSay(ws, line);
+}
 
-  // Wrap-up handler (post-booking)
-  if (convo.awaitingAsk === 'WRAPUP') {
-    if (noish(utterance)) {
-      await twilioSay(ws, 'Thanks for calling Old Line Barbershop. Take care!');
-      gracefulHangup(ws);
+async function handleAvailabilityAnswer(ws, convo) {
+  await twilioSay(ws, 'One moment while I check the schedule.');
+  const info = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
+  if (info.available) {
+    const when = fmtTime(convo.slots.startISO);
+    if (!convo.slots.service) {
+      convo.phase = 'collect_service';
+      convo.awaitingAsk = 'SERVICE';
+      await twilioSay(ws, `Good news—${when} is open. Do you want a haircut, beard trim, or the combo?`);
+    } else {
+      convo.phase = 'collect_contact';
+      convo.awaitingAsk = 'NAME';
+      await twilioSay(ws, `Good news—${when} is open. What’s your first name?`);
+    }
+  } else {
+    if (info.nextOpenISO) {
+      const alt = fmtTime(info.nextOpenISO);
+      convo.slots.startISO = info.nextOpenISO;
+      convo.slots.endISO = computeEndISO(info.nextOpenISO);
+      convo.phase = 'confirm_booking';
+      convo.awaitingAsk = 'CONFIRM';
+      await twilioSay(ws, `That time’s taken. ${alt} is open. Should I book that?`);
+    } else {
+      // Our own next-open probe
+      const fallback = await findNextOpenSlot(convo.slots.startISO);
+      if (fallback) {
+        const alt = fmtTime(fallback);
+        convo.slots.startISO = fallback;
+        convo.slots.endISO = computeEndISO(fallback);
+        convo.phase = 'confirm_booking';
+        convo.awaitingAsk = 'CONFIRM';
+        await twilioSay(ws, `${alt} is available. Should I book that?`);
+      } else {
+        convo.phase = 'collect_time';
+        convo.awaitingAsk = 'TIME';
+        await twilioSay(ws, 'That time’s taken. Morning or afternoon work better?');
+      }
+    }
+  }
+}
+
+// ---------- Create finalization ----------
+async function finalizeCreate(ws, convo) {
+  if (convo.created || convo.createInFlight) {
+    log('INFO', '[CREATE] already done/in-flight; skipping');
+    await twilioSay(ws, 'Your appointment is confirmed. Anything else I can help with?');
+    convo.awaitingAsk = 'WRAPUP';
+    convo.phase = 'wrapup';
+    return;
+  }
+  convo.createInFlight = true;
+
+  if (!convo.slots.endISO && convo.slots.startISO) {
+    convo.slots.endISO = computeEndISO(convo.slots.startISO);
+  }
+  if (!convo.slots.phone && convo.callerPhone) {
+    convo.slots.phone = convo.callerPhone;
+  }
+
+  // One last availability check
+  const check = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
+  if (!check.available) {
+    convo.createInFlight = false;
+    if (check.nextOpenISO) {
+      convo.slots.startISO = check.nextOpenISO;
+      convo.slots.endISO = computeEndISO(check.nextOpenISO);
+      convo.phase = 'confirm_booking';
+      convo.awaitingAsk = 'CONFIRM';
+      await twilioSay(ws, `Shoot—someone just took that time. ${fmtTime(check.nextOpenISO)} is open. Book that instead?`);
       return;
     }
-    if (yesish(utterance)) {
-      convo.phase = 'idle';
-      convo.awaitingAsk = 'NONE';
-      await twilioSay(ws, 'Sure—what else can I help you with?');
+    const fallback = await findNextOpenSlot(convo.slots.startISO);
+    if (fallback) {
+      convo.slots.startISO = fallback;
+      convo.slots.endISO = computeEndISO(fallback);
+      convo.phase = 'confirm_booking';
+      convo.awaitingAsk = 'CONFIRM';
+      await twilioSay(ws, `Shoot—someone just took that time. ${fmtTime(fallback)} is open. Book that instead?`);
       return;
     }
-    await twilioSay(ws, 'Anything else you need today?');
+    convo.phase = 'collect_time';
+    convo.awaitingAsk = 'TIME';
+    await twilioSay(ws, 'Looks like that time just got booked. What other time works?');
     return;
   }
 
+  const result = await makeCreateBooking(convo);
+  convo.created = !!result.ok;
+  convo.createInFlight = false;
+
+  if (!result.ok) {
+    await twilioSay(ws, 'I couldn’t finalize that just now. Want me to try a different time?');
+    convo.phase = 'collect_time';
+    convo.awaitingAsk = 'TIME';
+    return;
+  }
+
+  convo.phase = 'wrapup';
+  convo.awaitingAsk = 'WRAPUP';
+  const confirmLine = `All set. ${readbackLine(convo)} Do you need anything else before I hang up?`;
+  await twilioSay(ws, confirmLine);
+}
+
+function gracefulHangup(ws) {
+  try { ws.__dg?.close(); } catch {}
+  try { ws.close(); } catch {}
+}
+
+// ---------- ASR final hook ----------
+function handleASRFinal(ws, text) {
+  const convo = ws.__convo;
+  if (!convo) return;
+  convo.asrText = text;
+
+  // CONFIRM shortcut
+  if (convo.awaitingAsk === 'CONFIRM') {
+    if (yesish(text)) {
+      finalizeCreate(ws, convo).catch(err => log('ERROR', '[finalizeCreate]', { error: err.message }));
+      return;
+    }
+    if (noish(text)) {
+      convo.phase = 'collect_service';
+      convo.awaitingAsk = 'SERVICE';
+      twilioSay(ws, 'No problem. What would you like to change—the service, the time, or your contact?').catch(()=>{});
+      return;
+    }
+  }
+
+  // WRAPUP shortcut
+  if (convo.awaitingAsk === 'WRAPUP') {
+    if (noish(text)) {
+      twilioSay(ws, 'Thanks for calling Old Line Barbershop. Take care!').then(()=> gracefulHangup(ws)).catch(()=> gracefulHangup(ws));
+      convo.phase = 'done';
+      return;
+    }
+    if (yesish(text)) {
+      convo.phase = 'idle';
+      convo.awaitingAsk = 'NONE';
+      twilioSay(ws, 'Sure—what else can I help you with?').catch(()=>{});
+      return;
+    }
+  }
+
+  onUserUtterance(ws, text).catch(err => log('ERROR', '[onUserUtterance]', { error: err.message }));
+}
+
+// ---------- Main flow ----------
+async function onUserUtterance(ws, utterance) {
+  const convo = ws.__convo;
+  if (!convo) return;
   if (convo.phase === 'done') return;
+
   log('INFO', '[USER]', { text: utterance });
 
-  // ----- Fast path: name/phone local parsing -----
+  // Soft profanity/frustration handler
+  if (/\b(stupid|idiot|retard|retarded|dumb)\b/i.test(utterance)) {
+    await twilioSay(ws, 'Sorry about that. Let me try a different option.');
+  }
+
+  // If user says “Yes” to booking after FAQ
+  if (convo.phase === 'faq' || convo.phase === 'idle') {
+    if (yesish(utterance)) {
+      convo.phase = 'collect_service';
+      convo.awaitingAsk = 'SERVICE';
+      await askOnce(ws, convo, 'SERVICE');
+      return;
+    }
+  }
+
+  // NAME fast-path
   if (convo.awaitingAsk === 'NAME') {
     const nm = maybeExtractName(utterance);
     if (nm) {
@@ -757,6 +960,7 @@ async function onUserUtterance(ws, utterance) {
       return;
     }
   }
+  // PHONE fast-path
   if (convo.awaitingAsk === 'PHONE') {
     const ph = maybeExtractPhone(utterance);
     if (ph) {
@@ -768,43 +972,35 @@ async function onUserUtterance(ws, utterance) {
     }
   }
 
-  // ----- Fast path: TIME local parsing (handles "09/11/2025 at 10AM" and split messages) -----
-  if (convo.awaitingAsk === 'TIME' || /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|tomorrow|today)\b/i.test(utterance)) {
+  // TIME fast-path (handles weekday + split)
+  if (convo.awaitingAsk === 'TIME' || /\b(tomorrow|today|mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/i.test(utterance)) {
     const r = tryParseAndSetTime(convo, utterance);
     if (r === 'SET') {
-      // Once we got a time, check availability or move forward
-      if (convo.phase === 'collect_time' || convo.awaitingAsk === 'NAME') {
-        await handleAvailabilityAnswer(ws, convo);
-        return;
-      }
+      await handleAvailabilityAnswer(ws, convo);
+      return;
     }
   }
 
-  // 1) Extract semantics (LLM)
+  // 1) LLM extract
   let parsed = await openAIExtract(utterance, convo);
 
-  // 2) Merge slots (including any LLM time)
+  // 2) Merge slots from LLM
   if (parsed.Event_Name) {
     const svc = normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
   }
-
-  // Time from LLM if present or we’re in TIME phase
   const wantTime = (parsed.Start_Time && !convo.slots.startISO) || convo.awaitingAsk === 'TIME';
-  if (wantTime) {
-    const chosenStart = parsed.Start_Time || '';
-    if (chosenStart) setSlot(convo, 'startISO', normalizeFutureStart(chosenStart));
+  if (wantTime && parsed.Start_Time) {
+    setSlot(convo, 'startISO', normalizeFutureStart(parsed.Start_Time));
     if (parsed.End_Time && !convo.slots.endISO) setSlot(convo, 'endISO', parsed.End_Time);
   }
-
-  // Contact from LLM if present
   if (parsed.Customer_Name) setSlot(convo, 'name', parsed.Customer_Name);
   if (parsed.Customer_Phone) setSlot(convo, 'phone', parsed.Customer_Phone);
   if (parsed.Customer_Email) setSlot(convo, 'email', parsed.Customer_Email);
 
   ensureEndMatchesStart(convo);
 
-  // 3) Phase determination
+  // 3) Phase
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else if (parsed.intent === 'READ') {
@@ -839,15 +1035,24 @@ async function onUserUtterance(ws, utterance) {
         convo.phase = 'confirm_booking';
         return;
       } else {
+        const fallback = await findNextOpenSlot(convo.slots.startISO);
+        if (fallback) {
+          await twilioSay(ws, `${fmtTime(fallback)} is available. Book that one?`);
+          convo.slots.startISO = fallback;
+          convo.slots.endISO = computeEndISO(fallback);
+          convo.awaitingAsk = 'CONFIRM';
+          convo.phase = 'confirm_booking';
+          return;
+        }
         convo.phase = 'collect_time';
         convo.awaitingAsk = 'TIME';
-        await twilioSay(ws, 'That time’s taken. What other time works for you?');
+        await twilioSay(ws, 'That time’s taken. Morning or afternoon work better?');
         return;
       }
     }
   }
 
-  // Track awaitingAsk
+  // Ask (throttled) or speak reply
   if (parsed.ask && parsed.ask !== 'NONE') {
     convo.awaitingAsk = parsed.ask;
     await askOnce(ws, convo, parsed.ask, parsed.reply);
@@ -856,149 +1061,13 @@ async function onUserUtterance(ws, utterance) {
     return;
   }
 
-  // Fallback to NLG
   const line = (parsed.reply || '').trim() || await openAINLG({ ...convo, forbidGreet: true });
   convo.turns += 1;
   convo.forbidGreet = true;
   await twilioSay(ws, line);
 }
 
-async function askOnce(ws, convo, askKey, explicitLine) {
-  if (throttleAsk(convo, askKey, 2750)) {
-    log('DEBUG', '[ask throttle]', { ask: askKey });
-    return;
-  }
-  const line = explicitLine || makeQuestionForAsk(askKey, convo);
-  await twilioSay(ws, line);
-}
-
-async function handleAvailabilityAnswer(ws, convo) {
-  await twilioSay(ws, 'One moment while I check the schedule.');
-  const info = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
-  if (info.available) {
-    const when = fmtTime(convo.slots.startISO);
-    if (!convo.slots.service) {
-      convo.phase = 'collect_service';
-      convo.awaitingAsk = 'SERVICE';
-      await twilioSay(ws, `Good news—${when} is open. Do you want a haircut, beard trim, or the combo?`);
-    } else {
-      convo.phase = 'collect_contact';
-      convo.awaitingAsk = 'NAME';
-      await twilioSay(ws, `Good news—${when} is open. What’s your first name?`);
-    }
-  } else {
-    if (info.nextOpenISO) {
-      const alt = fmtTime(info.nextOpenISO);
-      convo.slots.startISO = info.nextOpenISO;
-      convo.slots.endISO = computeEndISO(info.nextOpenISO);
-      convo.phase = 'confirm_booking';
-      convo.awaitingAsk = 'CONFIRM';
-      await twilioSay(ws, `That time’s taken. ${alt} is open. Should I book that?`);
-    } else {
-      convo.phase = 'collect_time';
-      convo.awaitingAsk = 'TIME';
-      await twilioSay(ws, 'That time’s taken. What other time works for you?');
-    }
-  }
-}
-
-async function finalizeCreate(ws, convo) {
-  if (convo.created || convo.createInFlight) {
-    log('INFO', '[CREATE] already done/in-flight; skipping');
-    await twilioSay(ws, 'Your appointment is confirmed. Anything else I can help with?');
-    convo.awaitingAsk = 'WRAPUP';
-    convo.phase = 'wrapup';
-    return;
-  }
-  convo.createInFlight = true;
-
-  if (!convo.slots.endISO && convo.slots.startISO) {
-    convo.slots.endISO = computeEndISO(convo.slots.startISO);
-  }
-  if (!convo.slots.phone && convo.callerPhone) {
-    convo.slots.phone = convo.callerPhone;
-  }
-
-  // Safety: one last availability check right before posting
-  const check = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
-  if (!check.available) {
-    convo.createInFlight = false;
-    if (check.nextOpenISO) {
-      convo.slots.startISO = check.nextOpenISO;
-      convo.slots.endISO = computeEndISO(check.nextOpenISO);
-      convo.phase = 'confirm_booking';
-      convo.awaitingAsk = 'CONFIRM';
-      await twilioSay(ws, `Shoot—someone just took that time. ${fmtTime(check.nextOpenISO)} is open. Book that instead?`);
-      return;
-    }
-    convo.phase = 'collect_time';
-    convo.awaitingAsk = 'TIME';
-    await twilioSay(ws, 'Looks like that time just got booked. What other time works?');
-    return;
-  }
-
-  const result = await makeCreateBooking(convo);
-  convo.created = !!result.ok;
-  convo.createInFlight = false;
-
-  if (!result.ok) {
-    await twilioSay(ws, 'I couldn’t finalize that just now. Want me to try a different time?');
-    convo.phase = 'collect_time';
-    convo.awaitingAsk = 'TIME';
-    return;
-  }
-
-  convo.phase = 'wrapup';
-  convo.awaitingAsk = 'WRAPUP';
-
-  const confirmLine = `All set. ${readbackLine(convo)} Do you need anything else before I hang up?`;
-  await twilioSay(ws, confirmLine);
-}
-
-function gracefulHangup(ws) {
-  try { ws.__dg?.close(); } catch {}
-  try { ws.close(); } catch {}
-}
-
-// ---------------------- ASR final hook ----------------------
-function handleASRFinal(ws, text) {
-  const convo = ws.__convo;
-  if (!convo) return;
-  convo.asrText = text;
-
-  // Confirmation shortcut: if awaiting confirmation, catch yes/no locally
-  if (convo.awaitingAsk === 'CONFIRM') {
-    if (yesish(text)) {
-      finalizeCreate(ws, convo).catch(err => log('ERROR', '[finalizeCreate]', { error: err.message }));
-      return;
-    }
-    if (noish(text)) {
-      convo.phase = 'collect_service';
-      convo.awaitingAsk = 'SERVICE';
-      twilioSay(ws, 'No problem. What would you like to change—the service, the time, or your contact?').catch(()=>{});
-      return;
-    }
-  }
-
-  // Wrap-up yes/no
-  if (convo.awaitingAsk === 'WRAPUP') {
-    if (noish(text)) {
-      twilioSay(ws, 'Thanks for calling Old Line Barbershop. Take care!').then(()=> gracefulHangup(ws)).catch(()=> gracefulHangup(ws));
-      convo.phase = 'done';
-      return;
-    }
-    if (yesish(text)) {
-      convo.phase = 'idle';
-      convo.awaitingAsk = 'NONE';
-      twilioSay(ws, 'Sure—what else can I help you with?').catch(()=>{});
-      return;
-    }
-  }
-
-  onUserUtterance(ws, text).catch(err => log('ERROR', '[onUserUtterance]', { error: err.message }));
-}
-
-// ---------------------- WS Handlers ----------------------
+// ---------- WS Handlers ----------
 wss.on('connection', (ws, req) => {
   const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
   const biz = params.get('biz') || 'acme-001';
@@ -1006,10 +1075,7 @@ wss.on('connection', (ws, req) => {
   ws.__id = id;
 
   ws.on('error', (err) => log('ERROR', 'WS error', { error: err.message }));
-  ws.on('close', () => {
-    try { ws.__dg?.close(); } catch {}
-    log('INFO', 'WS closed');
-  });
+  ws.on('close', () => { try { ws.__dg?.close(); } catch {} log('INFO', 'WS closed'); });
 
   ws.on('message', async (raw) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch {
@@ -1030,7 +1096,7 @@ wss.on('connection', (ws, req) => {
       log('INFO', 'WS CONNECTED', { path: req.url, callSid, streamSid, biz });
       log('INFO', '[agent prompt 120]', { text: AGENT_PROMPT.slice(0, 120) });
 
-      // Start Deepgram
+      // Deepgram
       let dgOpened = false;
       ws.__dg = startDeepgramLinear16({
         onOpen: () => {},
@@ -1048,13 +1114,12 @@ wss.on('connection', (ws, req) => {
     }
 
     if (evt === 'media') {
-      if (!ws.__frameCount) ws.__frameCount = 0;
-      ws.__frameCount++;
       const b64 = msg.media?.payload || '';
       if (!b64) return;
-
       if (!ws.__ulawBatch) ws.__ulawBatch = [];
       ws.__ulawBatch.push(Buffer.from(b64, 'base64'));
+      if (!ws.__frameCount) ws.__frameCount = 0;
+      ws.__frameCount++;
 
       const BATCH_FRAMES = 5; // ~100ms
       if (ws.__ulawBatch.length >= BATCH_FRAMES && ws.__dg) {
@@ -1097,7 +1162,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ---------------------- Start server ----------------------
+// ---------- Start ----------
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
