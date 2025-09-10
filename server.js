@@ -1,9 +1,5 @@
 /**
- * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST)
- * Fixes:
- * - Availability READ is liberal (supports many schemas; empty schedule => available)
- * - Split date/time: asks missing piece instead of repeating
- * - Natural, short phrasing; throttled re-asks
+ * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST, v3)
  *
  * Env:
  *  PORT
@@ -13,6 +9,7 @@
  *  ELEVEN_VOICE_ID | ELEVENLABS_VOICE_ID (optional; defaults Adam)
  *  MAKE_CREATE | MAKE_CREATE_URL
  *  MAKE_READ   | MAKE_READ_URL
+ *  BUSINESS_TZ (optional; default America/New_York)
  *  AGENT_PROMPT (optional)
  */
 
@@ -32,6 +29,7 @@ const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_
 const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Adam
 const MAKE_CREATE_URL = process.env.MAKE_CREATE || process.env.MAKE_CREATE_URL || '';
 const MAKE_READ_URL   = process.env.MAKE_READ   || process.env.MAKE_READ_URL   || '';
+const BUSINESS_TZ     = process.env.BUSINESS_TZ || 'America/New_York';
 
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 const fetchFN = (...args) => globalThis.fetch(...args);
@@ -48,7 +46,8 @@ log('INFO', 'Startup env', {
   hasEleven: !!ELEVENLABS_API_KEY,
   hasMakeCreate: !!MAKE_CREATE_URL,
   hasMakeRead: !!MAKE_READ_URL,
-  node: process.version
+  node: process.version,
+  tz: BUSINESS_TZ
 });
 
 if (!OPENAI_API_KEY) log('WARN', 'OPENAI_API_KEY missing');
@@ -78,8 +77,8 @@ Core Responsibilities
 Booking Order (strict):
 1) Service (haircut, beard trim, combo = haircut + beard trim)
 2) Preferred date/time
-3) Confirm availability (30-min slots, Mon–Fri 9–5)
-4) Then ask for name + phone (confirm caller ID if present)
+3) Confirm availability (30-min slots, Mon–Fri 9–5) BEFORE asking for name/phone
+4) Then ask for first name and phone (confirm caller ID if present)
 5) Read back details and get a yes/no
 6) On yes, finalize; on no, ask what to change
 
@@ -88,8 +87,8 @@ Rules
 - Never double-book; if already created, don’t rebook.
 - Short, natural sentences (<22 words). One question at a time.
 - Vary phrasing; use contractions; micro-acknowledge.
-- If answering FAQs, give the fact, then offer to book.
-- Don’t re-ask things already provided.
+- Give prices in one concise sentence.
+- Don’t re-ask things already given.
 - Keep caller informed (“Let me check…”, “That’s open…”, “All set.”)
 - Say goodbye and hang up when done.
 
@@ -117,6 +116,7 @@ function newConvo(callSid, biz) {
     awaitingAsk: 'NONE', // SERVICE|TIME|NAME|PHONE|CONFIRM|WRAPUP|NONE
     created: false, createInFlight: false,
     lastAskAt: {},
+    lastAvailabilityCheckAt: 0,
     temp: { pendingDate: null, pendingTime: null },
     slots: { service: '', startISO: '', endISO: '', name: '', phone: '', email: '' }
   };
@@ -135,7 +135,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
     + '&model=nova-2-phonecall'
     + '&interim_results=true&smart_format=true'
     + '&language=en-US'
-    + '&endpointing=200'; // snappier endpointing
+    + '&endpointing=200'; // snappier end
 
   const dg = new WebSocket(url, { headers: { Authorization: `token ${DEEPGRAM_API_KEY}` }, perMessageDeflate: false });
   let open=false; const q=[];
@@ -184,22 +184,36 @@ function normalizeFutureStart(iso){
 }
 function ensureEndMatchesStart(convo){ if(convo.slots.startISO && !convo.slots.endISO) convo.slots.endISO=computeEndISO(convo.slots.startISO) }
 function setSlot(convo,k,v){ if(typeof v==='string') v=v.trim(); if(!v) return; convo.slots[k]=v; log('INFO','[slot set]',{k,v}); if(k==='service' && convo.awaitingAsk==='SERVICE') convo.awaitingAsk='TIME'; if(k==='startISO' && convo.awaitingAsk==='TIME') convo.awaitingAsk='NAME'; if(k==='name' && convo.awaitingAsk==='NAME') convo.awaitingAsk='PHONE'; if(k==='phone' && convo.awaitingAsk==='PHONE') convo.awaitingAsk='NONE'; ensureEndMatchesStart(convo) }
-function yesish(s){ return /\b(yes|yep|yeah|sure|correct|right|sounds good|that'?s (fine|right|correct)|confirm|book it|go ahead|please do)\b/i.test(s) }
-function noish(s){ return /\b(no|nope|nah|not (quite|correct|right)|change|wrong|different|actually|don'?t|stop|hold off)\b/i.test(s) }
+function yesish(s){ return /\b(yes|yep|yeah|sure|correct|right|sounds good|that'?s (fine|right|correct)|confirm|book it|go ahead|please do|yup)\b/i.test(s) }
+function noish(s){ return /\b(no|nope|nah|not (quite|correct|right)|change|wrong|different|actually|don'?t|stop|hold off|not now)\b/i.test(s) }
 
 function fmtTime(dtISO){ try{ const d=new Date(dtISO); return d.toLocaleString('en-US',{weekday:'long',month:'long',day:'numeric',hour:'numeric',minute:'2-digit'}) }catch{ return dtISO } }
+function formatPhoneHuman(s10){ if(!s10) return ''; const d=s10.replace(/\D+/g,'').slice(-10); if(d.length!==10) return s10; return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}` }
 function readbackLine(convo){
-  const s=convo.slots, when=s.startISO?fmtTime(s.startISO):'', phone=s.phone||convo.callerPhone||'';
+  const s=convo.slots, when=s.startISO?fmtTime(s.startISO):'', phone=formatPhoneHuman(s.phone||convo.callerPhone||'');
   const bits=[ s.service?`${s.service}`:'', when?`on ${when}`:'', s.name?`for ${s.name}`:'', phone?`at ${phone}`:'' ].filter(Boolean).join(', ');
   return bits?`Here are the details: ${bits}.`:'Let me confirm the details.';
 }
 
-// ---- Name / Phone helpers (to avoid loops) ----
+// ---- Name / Phone helpers (stopwords to avoid loops) ----
+const NAME_STOP = new Set(['no','nah','nope','yeah','yes','ok','okay','thanks','thank','sure','uh','um','hmm','mm']);
+const TWO_LETTER_OK = new Set(['ed','bo','al','ty','jo','li','an','aj','dj','ry']);
 function titleCaseName(s){ return s.toLowerCase().replace(/\b([a-z])/g,(m,c)=>c.toUpperCase()) }
-function maybeExtractName(u){ if(!u) return ''; let t=String(u).trim(); t=t.replace(/\b(my name is|this is|it'?s|i'?m)\b\s*/i,''); t=t.replace(/[?.!,]+$/g,'').trim(); t=t.replace(/[^a-zA-Z'\-\s]/g,' ').replace(/\s+/g,' ').trim(); if(!t) return ''; const token=t.split(' ')[0]; if(!token) return ''; if(!/^[a-zA-Z][a-zA-Z'\-]{1,19}$/.test(token)) return ''; return titleCaseName(token) }
+function maybeExtractName(u){
+  if(!u) return ''; let t=String(u).trim();
+  t=t.replace(/\b(my name is|this is|it'?s|i'?m|name's)\b\s*/i,'');
+  t=t.replace(/[?.!,]+$/g,'').trim();
+  t=t.replace(/[^a-zA-Z'\-\s]/g,' ').replace(/\s+/g,' ').trim();
+  if(!t) return '';
+  const token=t.split(' ')[0].toLowerCase();
+  if (NAME_STOP.has(token)) return '';
+  if (token.length===2 && !TWO_LETTER_OK.has(token)) return '';
+  if (!/^[a-z][a-z'\-]{1,19}$/.test(token)) return '';
+  return titleCaseName(token);
+}
 function maybeExtractPhone(u){ if(!u) return ''; const d=u.replace(/\D+/g,''); if(d.length===11 && d.startsWith('1')) return d.slice(1); if(d.length>=10) return d.slice(-10); return '' }
 
-// ---- Date/Time parsing (supports “Friday”, “next Monday”, split parts) ----
+// ---- Date/Time parsing (supports “Friday”, split parts) ----
 const WD=['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
 function parseWeekdayFromUtterance(u, now=new Date()){
   if(!u) return null;
@@ -255,28 +269,44 @@ function tryParseAndSetTime(convo, utterance){
 function withTimeout(ms){ const controller=new AbortController(); const t=setTimeout(()=>controller.abort(),ms); return { signal:controller.signal, cancel:()=>clearTimeout(t) } }
 
 function truthyAvailabilityShape(data){
-  // Accept many possible availability schemas
   if (data == null) return { known:false, available:true };
   const availCandidates = [
     data.available, data.isAvailable, data.free, data.open,
     data.status && String(data.status).toLowerCase()==='open' ? true : undefined,
     Array.isArray(data.events) ? (data.events.length===0) : undefined,
     Array.isArray(data.busy)   ? (data.busy.length===0)   : undefined,
-    data.conflicts===false,
-    data.busy===false,
-    data.hasConflict===false
+    data.conflicts===false, data.busy===false, data.hasConflict===false
   ].filter(v => v!==undefined);
 
-  // If any candidate is true => available; if any is false => maybe taken
   if (availCandidates.includes(true)) return { known:true, available:true };
   if (availCandidates.includes(false)) return { known:true, available:false };
 
-  return { known:false, available:true }; // default to available for unknown shapes
+  return { known:false, available:true }; // unknown shapes => assume available
+}
+
+function toLocalPieces(iso){
+  const d = new Date(iso);
+  // Provide local components too (some Make scenarios want this)
+  return {
+    startISO: iso,
+    endISO: computeEndISO(iso),
+    year: d.getFullYear(),
+    month: d.getMonth()+1,
+    day: d.getDate(),
+    hour: d.getHours(),
+    minute: d.getMinutes(),
+    tz: BUSINESS_TZ
+  };
 }
 
 async function makeCheckAvailability(startISO, endISO){
   if (!MAKE_READ_URL || !startISO) return { ok:false, available:true };
-  const payload = { intent:'READ', window:{ start:startISO, end:endISO||computeEndISO(startISO) } };
+  const local = toLocalPieces(startISO);
+  const payload = {
+    intent:'READ',
+    window:{ start:startISO, end:endISO||computeEndISO(startISO) },
+    local, BUSINESS_TZ
+  };
   try{
     const { signal, cancel } = withTimeout(2500);
     const r = await fetchFN(MAKE_READ_URL, { method:'POST', agent:keepAliveHttpsAgent, headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal });
@@ -285,7 +315,6 @@ async function makeCheckAvailability(startISO, endISO){
     const data = await r.json().catch(()=> ({}));
     const interp = truthyAvailabilityShape(data);
     log('INFO','[Make READ] result',{ raw:data, interpreted:interp });
-    // Special case: provider returns available:false but events/busy are empty → treat as available (empty schedule)
     if (interp.known && interp.available===false) {
       if (Array.isArray(data.events) && data.events.length===0) return { ok:true, available:true };
       if (Array.isArray(data.busy)   && data.busy.length===0)   return { ok:true, available:true };
@@ -304,6 +333,7 @@ async function makeCreateBooking(convo){
     Customer_Name:  convo.slots.name || '',
     Customer_Phone: convo.slots.phone|| '',
     Customer_Email: convo.slots.email|| '',
+    BUSINESS_TZ,
     Notes: `Booked by phone agent. CallSid=${convo.callSid||''}`
   };
   if(!MAKE_CREATE_URL){ log('WARN','[Make CREATE] skipped; MAKE_CREATE_URL missing',payload); return { ok:false } }
@@ -317,7 +347,7 @@ async function makeCreateBooking(convo){
   }catch(e){ log('ERROR','[Make CREATE]',{error:e.message}); return { ok:false } }
 }
 
-// Best-effort “next open” if READ doesn’t provide one
+// Best-effort next open if READ doesn’t provide one
 async function findNextOpenSlot(seedISO){
   let probe = new Date(seedISO ? seedISO : Date.now());
   function clamp(d){
@@ -346,6 +376,7 @@ async function openAIExtract(utterance, convo){
  "Customer_Name":"","Customer_Phone":"","Customer_Email":"",
  "window":{"start":"","end":""},"ask":"NONE"|"SERVICE"|"TIME"|"NAME"|"PHONE"|"CONFIRM","reply":""}
 Rules:
+- For pricing, reply in one short sentence: "Haircut is $30, beard trim $15, combo $40."
 - If they ask to book or about availability, prefer intent="CREATE" unless clearly only checking.
 - Recognize “combo/both/haircut + beard”.
 - If day/time provided, fill Start_Time (ISO if obvious).
@@ -406,6 +437,8 @@ async function askOnce(ws, convo, askKey, line){
 async function handleAvailabilityAnswer(ws, convo){
   await twilioSay(ws, 'One moment while I check the schedule.');
   const info = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
+  convo.lastAvailabilityCheckAt = Date.now();
+
   if (info.available) {
     const when = fmtTime(convo.slots.startISO);
     if (!convo.slots.service) { convo.phase='collect_service'; convo.awaitingAsk='SERVICE'; await twilioSay(ws, `Good news—${when} is open. Do you want a haircut, beard trim, or the combo?`); }
@@ -475,12 +508,17 @@ async function finalizeCreate(ws, convo){
   if(!convo.slots.endISO && convo.slots.startISO) convo.slots.endISO=computeEndISO(convo.slots.startISO);
   if(!convo.slots.phone && convo.callerPhone) convo.slots.phone=convo.callerPhone;
 
-  const recheck=await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
-  if(!recheck.available){
-    convo.createInFlight=false;
-    const alt = recheck.nextOpenISO || await findNextOpenSlot(convo.slots.startISO);
-    if (alt){ convo.slots.startISO=alt; convo.slots.endISO=computeEndISO(alt); convo.phase='confirm_booking'; convo.awaitingAsk='CONFIRM'; await twilioSay(ws, `Shoot—someone just took that time. ${fmtTime(alt)} is open. Book that instead?`); return; }
-    convo.phase='collect_time'; convo.awaitingAsk='TIME'; await twilioSay(ws,'Looks like that time just got booked. What other time works?'); return;
+  // Skip recheck if we just checked within 10 seconds
+  const now = Date.now();
+  if (now - (convo.lastAvailabilityCheckAt||0) > 10000) {
+    const recheck=await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
+    convo.lastAvailabilityCheckAt = now;
+    if(!recheck.available){
+      convo.createInFlight=false;
+      const alt = recheck.nextOpenISO || await findNextOpenSlot(convo.slots.startISO);
+      if (alt){ convo.slots.startISO=alt; convo.slots.endISO=computeEndISO(alt); convo.phase='confirm_booking'; convo.awaitingAsk='CONFIRM'; await twilioSay(ws, `Shoot—someone just took that time. ${fmtTime(alt)} is open. Book that instead?`); return; }
+      convo.phase='collect_time'; convo.awaitingAsk='TIME'; await twilioSay(ws,'Looks like that time just got booked. What other time works?'); return;
+    }
   }
 
   const result=await makeCreateBooking(convo);
@@ -498,7 +536,8 @@ async function askMissingFromPartial(ws, convo, status, dp, tp){
     return true;
   }
   if (status==='NEED_DATE' && tp){
-    const tStr = `${(tp.hh%12)||12}:${String(tp.mi||0).padStart(2,'0')} ${tp.hh>=12?'PM':'AM'}`;
+    const hh12 = (tp.hh%12)||12, ampm = tp.hh>=12?'PM':'AM';
+    const tStr = `${hh12}${tp.mi?':'+String(tp.mi).padStart(2,'0'):''} ${ampm}`;
     await askOnce(ws, convo, 'TIME', `Got it—${tStr}. Which day did you have in mind?`);
     return true;
   }
@@ -527,7 +566,7 @@ async function onUserUtterance(ws, utterance){
   const convo=ws.__convo; if(!convo || convo.phase==='done') return;
   log('INFO','[USER]',{text:utterance});
 
-  // De-escalate insults
+  // De-escalate insults (but keep flow moving)
   if (/\b(stupid|idiot|retard|retarded|dumb|moron)\b/i.test(utterance)) {
     await twilioSay(ws, 'Sorry about that. Let me try a different option.');
   }
@@ -551,7 +590,7 @@ async function onUserUtterance(ws, utterance){
     if(ph){ setSlot(convo,'phone',ph); convo.phase='confirm_booking'; convo.awaitingAsk='CONFIRM'; await twilioSay(ws, readbackLine(convo)+' Everything look right?'); return; }
   }
 
-  // Time parsing (also handles split)
+  // Time parsing (handles split)
   if (convo.awaitingAsk==='TIME' || /\b(tomorrow|today|mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|noon|midday)\b/i.test(utterance)) {
     const r = tryParseAndSetTime(convo, utterance);
     if (r.status==='SET'){ await handleAvailabilityAnswer(ws,convo); return; }
@@ -574,6 +613,12 @@ async function onUserUtterance(ws, utterance){
   // 3) Phase
   if (parsed.intent==='FAQ') {
     convo.phase='faq';
+    // Make FAQs concise and one-shot
+    if (parsed.faq_topic==='PRICES') {
+      await twilioSay(ws, 'Haircut is $30, beard trim $15, and the combo is $40. Want me to book one?');
+      convo.forbidGreet = true;
+      return;
+    }
   } else if (parsed.intent==='READ') {
     if (convo.slots.startISO) { await handleAvailabilityAnswer(ws,convo); return; }
     convo.phase='collect_time'; convo.awaitingAsk='TIME'; await askOnce(ws,convo,'TIME'); return;
@@ -590,6 +635,7 @@ async function onUserUtterance(ws, utterance){
   // Availability pre-check: have service+time but not contact yet
   if (convo.phase==='collect_contact' && convo.slots.startISO){
     const info=await makeCheckAvailability(convo.slots.startISO,convo.slots.endISO);
+    convo.lastAvailabilityCheckAt = Date.now();
     if(!info.available){
       const alt=info.nextOpenISO || await findNextOpenSlot(convo.slots.startISO);
       if(alt){ convo.slots.startISO=alt; convo.slots.endISO=computeEndISO(alt); convo.awaitingAsk='CONFIRM'; convo.phase='confirm_booking'; await twilioSay(ws, `${fmtTime(alt)} is available. Book that one?`); return; }
@@ -629,8 +675,10 @@ wss.on('connection', (ws, req) => {
         onOpen:()=>{}, onPartial:(t)=>log('DEBUG','[ASR partial]',{t}), onFinal:(t)=>{log('INFO','[ASR final]',{t}); handleASRFinal(ws,t)}, onError:()=>{}, onAnyMessage:(ev)=>{ if(ev.type && ev.type!=='Results') log('DEBUG','[ASR event]',{type:ev.type}) }
       });
 
-      convo.awaitingAsk='NONE'; convo.turns=0; convo.forbidGreet=false;
-      twilioSay(ws,'Hi, thanks for calling Old Line Barbershop. How can I help you today?').catch(()=>{});
+      // Greet
+      const greet = 'Hi, thanks for calling Old Line Barbershop. How can I help you today?';
+      convo.awaitingAsk='NONE'; convo.turns=0; convo.forbidGreet=false; convo.lastTTS=''; convo.lastTTSAt=0;
+      twilioSay(ws,greet).catch(()=>{});
       return;
     }
 
@@ -670,3 +718,4 @@ wss.on('connection', (ws, req) => {
 
 // ---------------------- Start server ----------------------
 server.listen(PORT, () => { log('INFO','Server running',{PORT:String(PORT)}) });
+v
