@@ -23,10 +23,10 @@ const { randomUUID } = require('crypto');
 // ---------- Config / Globals ----------
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
-const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE || '';
-const MAKE_FAQ_URL = process.env.MAKE_READ || '';
+const DEEPGRAM_API_KEY = process.env.DEPPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY || ''; // tolerate typo
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVEN_API_KEY || '';
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || process.env.MAKE_CREATE || '';
+const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || process.env.MAKE_READ || '';
 
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 
@@ -119,6 +119,7 @@ function newConvo(callSid, biz) {
     forbidGreet: false,
     phase: 'idle',
     callerPhone: '',
+    awaitingAsk: 'NONE', // tracks which slot question we’re waiting on
     asrText: '',
     slots: { service: '', startISO: '', endISO: '', name: '', phone: '', email: '' }
   };
@@ -145,7 +146,7 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- Deepgram realtime (URL params) ----------
+// ---------- Deepgram realtime ----------
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   const url =
     'wss://api.deepgram.com/v1/listen'
@@ -179,7 +180,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
     else onPartial?.(text);
   });
   dg.on('error', (e) => onError?.(e));
-  dg.on('close', (c, r) => log('INFO', '[Deepgram] closed', { code: c, reason: r || '' }));
+  dg.on('close', (c, r) => log('INFO', '[ASR] Deepgram closed', { code: c, reason: r || '' }));
 
   return {
     sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
@@ -224,14 +225,12 @@ function nextMissing(slots) {
   return '';
 }
 function normalizeFutureStart(startISO) {
-  // If parsed time is in the past, bump to the same time next valid future day (heuristic)
   try {
     if (!startISO) return startISO;
     const s = new Date(startISO);
     if (isNaN(s.getTime())) return startISO;
     const now = Date.now();
     if (s.getTime() < now) {
-      // bump +7 days until in the future (cheap guardrail)
       let bumped = new Date(s.getTime());
       while (bumped.getTime() < now) bumped = new Date(bumped.getTime() + 7 * 24 * 3600 * 1000);
       log('WARN', '[time guardrail] bumped parsed Start_Time to future', { from: startISO, to: bumped.toISOString() });
@@ -240,8 +239,27 @@ function normalizeFutureStart(startISO) {
     return s.toISOString();
   } catch { return startISO; }
 }
+function ensureEndMatchesStart(convo) {
+  if (!convo.slots.startISO) return;
+  const s = Date.parse(convo.slots.startISO);
+  const e = Date.parse(convo.slots.endISO || '');
+  if (!isNaN(s) && (isNaN(e) || e <= s)) {
+    convo.slots.endISO = computeEndISO(convo.slots.startISO);
+    log('INFO', '[end fix] aligning End_Time to Start_Time +30m', { start: convo.slots.startISO, end: convo.slots.endISO });
+  }
+}
 
-// NEW: force crisp questions for slot asks
+// ---- Filler / short utterance detection
+const FILLER_RE = /^(hi|hello|hey|yes|yep|yeah|ok|okay|sure|mh+mm+|yo|what'?s up|howdy|good (?:morning|afternoon|evening))[\.\!\?]*$/i;
+function isFiller(text) {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (trimmed.length <= 3) return true;           // “ok”, “hi”, etc.
+  if (FILLER_RE.test(trimmed)) return true;
+  return false;
+}
+
+// ---- Crisp slot questions
 function makeQuestionForAsk(ask, convo) {
   if (ask === 'TIME') {
     const svc = convo.slots.service || 'appointment';
@@ -255,17 +273,6 @@ function makeQuestionForAsk(ask, convo) {
   }
   if (ask === 'SERVICE') return `What service would you like — a haircut, beard trim, or the combo?`;
   return '';
-}
-
-// NEW: align End_Time to Start_Time + 30m if mismatched
-function ensureEndMatchesStart(convo) {
-  if (!convo.slots.startISO) return;
-  const s = Date.parse(convo.slots.startISO);
-  const e = Date.parse(convo.slots.endISO || '');
-  if (!isNaN(s) && (isNaN(e) || e <= s)) {
-    convo.slots.endISO = computeEndISO(convo.slots.startISO);
-    log('INFO', '[end fix] aligning End_Time to Start_Time +30m', { start: convo.slots.startISO, end: convo.slots.endISO });
-  }
 }
 
 // ---------- OpenAI: Extract ----------
@@ -426,51 +433,70 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
 function safeSend(ws, data) {
   try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch (e) { log('ERROR', '[WS send]', { error: e.message }); }
 }
-function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
+function twilioSay(ws, text, askType = 'NONE') {
+  ws.__convo.awaitingAsk = askType || 'NONE';
+  log('DEBUG', '[awaitingAsk set]', { awaitingAsk: ws.__convo.awaitingAsk });
+  return ttsToTwilio(ws, text);
+}
 
-// ---------- ensureReplyOrAsk (FORCED QUESTIONS + CONFIRM) ----------
-function ensureReplyOrAsk(parsed, utterance, phase, convo) {
-  // Promote asks if we already have a slot
-  if (parsed.ask === 'SERVICE' && convo?.slots?.service) parsed.ask = 'TIME';
-  if (parsed.ask === 'TIME' && convo?.slots?.startISO) parsed.ask = 'NAME';
+// ---------- ensureReplyOrAsk (GATED slot collection) ----------
+function ensureReplyOrAsk(parsed, utterance, convo) {
+  const inBookingPhase = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
+  const canCollect = parsed.intent === 'CREATE' || inBookingPhase;
 
-  // If we’re missing a specific slot, force a crisp question
-  const askNeeded =
-    (!convo.slots.service && 'SERVICE') ||
-    (!convo.slots.startISO && 'TIME') ||
-    (!convo.slots.name && 'NAME') ||
-    (!convo.slots.phone && 'PHONE') || 'NONE';
+  // Promote asks if we already have a slot (only when allowed to collect)
+  if (canCollect) {
+    if (parsed.ask === 'SERVICE' && convo.slots.service) parsed.ask = 'TIME';
+    if (parsed.ask === 'TIME' && convo.slots.startISO) parsed.ask = 'NAME';
+  }
 
-  if (askNeeded !== 'NONE') {
-    parsed.ask = askNeeded;
-    parsed.reply = makeQuestionForAsk(askNeeded, convo);
+  // If we’re missing a specific slot and we ARE allowed to collect, force a crisp question
+  if (canCollect) {
+    const askNeeded =
+      (!convo.slots.service && 'SERVICE') ||
+      (!convo.slots.startISO && 'TIME') ||
+      (!convo.slots.name && 'NAME') ||
+      (!convo.slots.phone && 'PHONE') || 'NONE';
+
+    if (askNeeded !== 'NONE') {
+      parsed.ask = askNeeded;
+      parsed.reply = makeQuestionForAsk(askNeeded, convo);
+      return parsed;
+    }
+  }
+
+  // If not collecting, keep it lightweight
+  if (!canCollect) {
+    if (parsed.intent === 'FAQ' && parsed.faq_topic) {
+      parsed.ask = 'NONE';
+      parsed.reply = parsed.reply || 'Anything else I can help with?';
+      return parsed;
+    }
+    parsed.ask = 'NONE';
+    parsed.reply = parsed.reply || 'How can I help you today?';
     return parsed;
   }
 
-  // In confirm phase, force a confirm question
+  // Confirm phase
   if (convo.phase === 'confirm_booking') {
     parsed.ask = 'CONFIRM';
     parsed.reply = `Just to confirm: ${convo.slots.service} at ${convo.slots.startISO} for ${convo.slots.name}. Is that right?`;
     return parsed;
   }
 
-  // fallback: keep flow moving
+  // Fallback within collection
   const svcU = normalizeService(utterance);
-  if ((parsed.intent === 'CREATE' || phase === 'collect_time')) {
-    const svc = parsed.service || normalizeService(parsed.Event_Name) || svcU || convo?.slots?.service;
-    if (svc && phase !== 'confirm_booking') {
+  if ((parsed.intent === 'CREATE' || convo.phase === 'collect_time')) {
+    const svc = parsed.service || normalizeService(parsed.Event_Name) || svcU || convo.slots.service;
+    if (svc && convo.phase !== 'confirm_booking') {
       parsed.ask = 'TIME';
       parsed.reply = `Got it — ${svc}. What date and time work for you?`;
       return parsed;
     }
   }
-  if (parsed.intent === 'FAQ' && parsed.faq_topic) {
-    parsed.ask = 'NONE';
-    parsed.reply = 'Anything else I can help with?';
-    return parsed;
-  }
+
   parsed.ask = 'NONE';
-  parsed.reply = 'Got it. How can I help further?';
+  parsed.reply = parsed.reply || 'Got it. How can I help further?';
   return parsed;
 }
 
@@ -480,6 +506,18 @@ async function onUserUtterance(ws, utterance) {
   if (!convo) return;
 
   log('INFO', '[USER]', { text: utterance });
+
+  // Filler guard: if we are NOT awaiting a specific slot question, drop/soft-prompt
+  if (isFiller(utterance) && (!convo.awaitingAsk || convo.awaitingAsk === 'NONE')) {
+    log('DEBUG', '[filler ignored]', { utterance });
+    // Soft nudge once after greeting
+    if (!convo.turns) {
+      convo.turns += 1;
+      convo.forbidGreet = true;
+      return twilioSay(ws, 'How can I help you today?', 'NONE');
+    }
+    return; // do nothing further
+  }
 
   // Extract semantics
   let parsed;
@@ -491,7 +529,7 @@ async function onUserUtterance(ws, utterance) {
   }
 
   // Normalize/ensure reply
-  parsed = ensureReplyOrAsk(parsed, utterance, convo.phase, convo);
+  parsed = ensureReplyOrAsk(parsed, utterance, convo);
 
   // Merge slots
   if (parsed.service || parsed.Event_Name) {
@@ -514,7 +552,7 @@ async function onUserUtterance(ws, utterance) {
   // Phase transitions
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
-  } else if (parsed.intent === 'CREATE') {
+  } else if (parsed.intent === 'CREATE' || ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase)) {
     if (!convo.slots.service) convo.phase = 'collect_service';
     else if (!convo.slots.startISO) convo.phase = 'collect_time';
     else if (!convo.slots.name || !(convo.slots.phone || convo.callerPhone)) convo.phase = 'collect_contact';
@@ -533,26 +571,29 @@ async function onUserUtterance(ws, utterance) {
     return;
   }
 
-  // Decide what to say: prefer forced slot question when applicable
+  // Decide what to say
   let line = (parsed.reply || '').trim();
+  let askType = parsed.ask || 'NONE';
 
-  if (parsed.ask && ['SERVICE','TIME','NAME','PHONE'].includes(parsed.ask)) {
-    line = makeQuestionForAsk(parsed.ask, convo) || line;
+  // If we’re allowed to collect, ensure crisp slot question
+  const inBookingPhase = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
+  if (inBookingPhase && ['SERVICE','TIME','NAME','PHONE'].includes(askType)) {
+    line = makeQuestionForAsk(askType, convo) || line;
   }
 
   if (!line) {
     const missing = nextMissing(convo.slots);
-    line = makeQuestionForAsk(
+    askType =
       missing === 'service' ? 'SERVICE' :
       missing === 'startISO' ? 'TIME' :
       missing === 'name' ? 'NAME' :
-      missing === 'phone' ? 'PHONE' : 'NONE', convo
-    ) || await openAINLG({ ...convo, forbidGreet:true }).catch(()=> 'Okay.');
+      missing === 'phone' ? 'PHONE' : 'NONE';
+    line = makeQuestionForAsk(askType, convo) || await openAINLG({ ...convo, forbidGreet:true }).catch(()=> 'Okay.');
   }
 
   convo.turns += 1;
   convo.forbidGreet = true;
-  await twilioSay(ws, line);
+  await twilioSay(ws, line, askType);
 }
 
 async function finalizeCreate(ws, convo) {
@@ -593,7 +634,9 @@ async function finalizeCreate(ws, convo) {
     { ...convo, forbidGreet: true, phase: 'done' },
     `Confirm booking and say goodbye. Service=${convo.slots.service}, start=${convo.slots.startISO}, name=${convo.slots.name}`
   ).catch(()=> 'Your appointment is confirmed. Thanks for calling!');
-  await twilioSay(ws, confirmLine);
+  convo.awaitingAsk = 'NONE';
+  log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
+  await twilioSay(ws, confirmLine, 'NONE');
 }
 
 async function postToMakeFAQ(topic) {
@@ -664,7 +707,9 @@ wss.on('connection', (ws, req) => {
       // Greeting
       ws.__convo.turns = 0;
       ws.__convo.forbidGreet = false;
-      twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?').catch(() => {});
+      ws.__convo.awaitingAsk = 'NONE';
+      log('DEBUG', '[awaitingAsk set]', { awaitingAsk: ws.__convo.awaitingAsk });
+      twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?', 'NONE').catch(() => {});
       return;
     }
 
@@ -728,4 +773,3 @@ function handleASRFinal(ws, text) {
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
-
