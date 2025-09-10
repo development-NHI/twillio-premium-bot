@@ -1,5 +1,5 @@
 /**
- * server.js — Old Line Barbershop voice agent (FINAL)
+ * server.js — Old Line Barbershop voice agent (FINAL, patched)
  * - Twilio Media Streams WS
  * - Deepgram ASR (URL-config WS; μ-law → PCM16LE @ 8kHz)
  * - OpenAI for extraction + NLG (JSON contract)
@@ -31,9 +31,9 @@ const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
-const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || '';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE || '';
-const MAKE_FAQ_URL = process.env.MAKE_READ || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || 'Adam';
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || '';
+const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || '';
 
 // keep-alive agents
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
@@ -55,7 +55,7 @@ log('INFO', 'Startup env', {
   hasDG: !!DEEPGRAM_API_KEY,
   hasEleven: !!ELEVENLABS_API_KEY,
   hasMakeCreate: !!MAKE_CREATE_URL,
-  hasMakeRead: !!MAKE_FAQ_URL,
+  hasMakeFAQ: !!MAKE_FAQ_URL,
   node: process.version,
   fetchSource: 'global'
 });
@@ -228,8 +228,8 @@ function normalizeService(text) {
   if (!text) return '';
   const t = text.toLowerCase();
   if (/\b(both|combo|combo package|haircut\s*(?:&|and|\+)\s*beard|haircut\s*\+\s*beard)\b/.test(t)) return 'combo';
-  if (/\bbeard( trim|)\b/.test(t)) return 'beard trim';
-  if (/\bhair\s*cut|\bhaircut\b/.test(t)) return 'haircut';
+  if (/\bbeard(?:\s*trim)?\b/.test(t)) return 'beard trim';
+  if (/\bhair\s*cut\b|\bhaircut\b/.test(t)) return 'haircut';
   return '';
 }
 function computeEndISO(startISO) {
@@ -483,10 +483,15 @@ function ensureReplyOrAsk(parsed, utterance, convo) {
   const canCollect = parsed.intent === 'CREATE' || inBooking;
 
   const have = {
-    service: convo.slots.service || parsed.service || normalizeService(parsed.Event_Name),
+    service: (
+      convo.slots.service ||
+      parsed.service ||
+      normalizeService(parsed.Event_Name) ||
+      normalizeService(utterance) // <-- consider raw utterance like "The combo."
+    ),
     startISO: convo.slots.startISO || parsed.Start_Time,
-    name: convo.slots.name || parsed.Customer_Name,
-    phone: convo.slots.phone || parsed.Customer_Phone || convo.callerPhone
+    name:     convo.slots.name     || parsed.Customer_Name,
+    phone:    convo.slots.phone    || parsed.Customer_Phone || convo.callerPhone
   };
 
   if (canCollect) {
@@ -593,14 +598,23 @@ async function onUserUtterance(ws, utterance) {
 
   log('INFO', '[USER]', { text: utterance });
 
+  // *** PATCH 1: If we're collecting service, infer it directly from this utterance ***
+  if ((convo.awaitingAsk === 'SERVICE' || convo.phase === 'collect_service') && !convo.slots.service) {
+    const svcDirect = normalizeService(utterance);
+    if (svcDirect) setSlot(convo, 'service', svcDirect); // will advance awaitingAsk -> TIME
+  }
+
   // 1) Extract semantics
   let parsed = await openAIExtract(utterance, convo);
 
   // 2) MERGE SLOTS FIRST (from parsed AND local parse)
-  // Service
+  // Service (also infer from utterance if model didn't set it)
   if (parsed.service || parsed.Event_Name) {
     const svc = parsed.service || normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
+  } else if (!convo.slots.service) {
+    const svcDirect = normalizeService(utterance);
+    if (svcDirect) setSlot(convo, 'service', svcDirect);
   }
 
   // Times
@@ -844,6 +858,3 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
-
-
-
