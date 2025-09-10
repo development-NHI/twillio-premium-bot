@@ -1,5 +1,5 @@
 /**
- * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST, availability-aware, de-looped)
+ * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST, availability-aware, de-looped, robust time parsing)
  * (Twilio Media Streams WS + Deepgram ASR + OpenAI extract/NLG + ElevenLabs TTS + Make.com)
  *
  * Env:
@@ -28,7 +28,7 @@ const https = require('https');
 
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
+const DEEPGRAM_API_KEY = process.env.DEPPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY || '';
 const ELEVENLABS_API_KEY =
   process.env.ELEVEN_API_KEY ||
   process.env.ELEVENLABS_API_KEY ||
@@ -141,6 +141,7 @@ function newConvo(callSid, biz) {
     created: false,
     createInFlight: false,
     lastAskAt: {}, // throttle map by ask key
+    temp: { pendingDate: null, pendingTime: null },
     slots: {
       service: '',
       startISO: '',
@@ -303,8 +304,8 @@ function setSlot(convo, k, v) {
   if (k === 'phone' && convo.awaitingAsk === 'PHONE')    convo.awaitingAsk = 'NONE';
   ensureEndMatchesStart(convo);
 }
-function yesish(s) { return /\b(yes|yep|yeah|sure|correct|right|sounds good|that'?s (fine|right|correct)|confirm|book it|go ahead)\b/i.test(s); }
-function noish(s) { return /\b(no|nope|nah|not (quite|correct|right)|change|wrong|different|actually|don'?t|stop)\b/i.test(s); }
+function yesish(s) { return /\b(yes|yep|yeah|sure|correct|right|sounds good|that'?s (fine|right|correct)|confirm|book it|go ahead|please do)\b/i.test(s); }
+function noish(s) { return /\b(no|nope|nah|not (quite|correct|right)|change|wrong|different|actually|don'?t|stop|hold off)\b/i.test(s); }
 
 function fmtTime(dtISO) {
   try {
@@ -350,6 +351,88 @@ function maybeExtractPhone(utterance) {
   return '';
 }
 
+// ---- Local TIME parsing (single or split utterances) ----
+function parseDateFromUtterance(u, now = new Date()) {
+  if (!u) return null;
+  const t = u.toLowerCase();
+
+  // Tomorrow / today
+  if (/\btomorrow\b/.test(t)) {
+    const d = new Date(now.getTime() + 24*3600*1000);
+    return { y: d.getFullYear(), m: d.getMonth()+1, d: d.getDate() };
+  }
+  if (/\btoday\b/.test(t)) {
+    const d = new Date(now);
+    return { y: d.getFullYear(), m: d.getMonth()+1, d: d.getDate() };
+  }
+
+  // MM/DD/YYYY or M/D/YY
+  const m = u.match(/\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})\b/);
+  if (m) {
+    let [_, mm, dd, yy] = m;
+    mm = parseInt(mm,10); dd = parseInt(dd,10); yy = parseInt(yy,10);
+    if (yy < 100) yy += 2000;
+    if (mm>=1 && mm<=12 && dd>=1 && dd<=31) return { y: yy, m: mm, d: dd };
+  }
+
+  // Month name DD (assume current year)
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const m2 = u.toLowerCase().match(new RegExp(`\\b(${months.join('|')})\\s+(\\d{1,2})(?:,\\s*(\\d{4}))?\\b`));
+  if (m2) {
+    const mm = months.indexOf(m2[1]) + 1;
+    const dd = parseInt(m2[2],10);
+    const yy = m2[3] ? parseInt(m2[3],10) : (new Date()).getFullYear();
+    return { y: yy, m: mm, d: dd };
+  }
+
+  return null;
+}
+function parseTimeFromUtterance(u) {
+  if (!u) return null;
+  // at 10AM / 10 AM / 10:30 am / 14:00
+  const m = u.match(/\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  if (m) {
+    let hh = parseInt(m[1],10);
+    let mi = m[2] ? parseInt(m[2],10) : 0;
+    const ap = m[3] ? m[3].toLowerCase() : null;
+    if (ap === 'pm' && hh < 12) hh += 12;
+    if (ap === 'am' && hh === 12) hh = 0;
+    if (!ap && hh <= 7) hh += 12; // small bias: 1-7 as afternoon if no AM/PM
+    return { hh, mi };
+  }
+  return null;
+}
+function buildISOFromParts(datePart, timePart) {
+  if (!datePart || !timePart) return '';
+  const { y, m, d } = datePart;
+  const { hh, mi } = timePart;
+  const dt = new Date(y, m-1, d, hh, mi || 0, 0, 0);
+  return dt.toISOString();
+}
+function tryParseAndSetTime(convo, utterance) {
+  // Combined in one utterance?
+  const dp = parseDateFromUtterance(utterance);
+  const tp = parseTimeFromUtterance(utterance);
+  if (dp && tp) {
+    const iso = normalizeFutureStart(buildISOFromParts(dp, tp));
+    if (iso) { setSlot(convo, 'startISO', iso); return 'SET'; }
+  }
+
+  // Two-step capture
+  if (dp && !tp) { convo.temp.pendingDate = dp; }
+  if (tp && !dp) { convo.temp.pendingTime = tp; }
+  if (convo.temp.pendingDate && convo.temp.pendingTime) {
+    const iso = normalizeFutureStart(buildISOFromParts(convo.temp.pendingDate, convo.temp.pendingTime));
+    if (iso) {
+      setSlot(convo, 'startISO', iso);
+      convo.temp.pendingDate = null;
+      convo.temp.pendingTime = null;
+      return 'SET';
+    }
+  }
+  return 'NOSET';
+}
+
 // ---------------------- Make.com — availability & create ----------------------
 async function makeCheckAvailability(startISO, endISO) {
   if (!MAKE_READ_URL || !startISO) return { ok: false, available: true };
@@ -367,7 +450,6 @@ async function makeCheckAvailability(startISO, endISO) {
       return { ok: false, available: true };
     }
     const data = await r.json().catch(()=> ({}));
-    // expected shape: {available: boolean, nextOpenISO?: string}
     return { ok: true, available: !!data.available, nextOpenISO: data.nextOpenISO || '' };
   } catch (e) {
     log('ERROR', '[Make READ]', { error: e.message });
@@ -428,7 +510,7 @@ async function openAIExtract(utterance, convo) {
 
 Rules:
 - If caller asks about prices/hours/services/location, set intent="FAQ" and faq_topic. Provide a short reply.
-- If caller asks to book or asks about availability, set intent="CREATE" (booking) or "READ" (pure availability). Prefer CREATE if they imply they want to book.
+- If caller asks to book OR asks about availability, set intent="CREATE" (booking) or "READ" (pure availability). Prefer CREATE if they imply they want to book.
 - Recognize “both/combo/haircut + beard” as service = "combo".
 - If user gives a specific day/time, fill Start_Time (ISO if obvious; else empty).
 - Keep reply short; <= ~22 words; one question max. No greetings if forbidGreet=true.
@@ -653,24 +735,20 @@ async function onUserUtterance(ws, utterance) {
       await twilioSay(ws, 'Sure—what else can I help you with?');
       return;
     }
-    // Unknown — gentle nudge once
     await twilioSay(ws, 'Anything else you need today?');
     return;
   }
 
-  if (convo.phase === 'done') return; // hard stop if we already hung up
-
+  if (convo.phase === 'done') return;
   log('INFO', '[USER]', { text: utterance });
 
-  // ----- Fast path: if waiting for NAME/PHONE, parse locally first -----
+  // ----- Fast path: name/phone local parsing -----
   if (convo.awaitingAsk === 'NAME') {
     const nm = maybeExtractName(utterance);
     if (nm) {
       setSlot(convo, 'name', nm);
-      // Advance
       convo.phase = (convo.slots.phone || convo.callerPhone) ? 'confirm_booking' : 'collect_contact';
       convo.awaitingAsk = (convo.slots.phone || convo.callerPhone) ? 'CONFIRM' : 'PHONE';
-
       if (convo.awaitingAsk === 'PHONE') {
         await twilioSay(ws, `Thanks, ${nm}. What’s the best phone for confirmations?`);
       } else {
@@ -690,16 +768,28 @@ async function onUserUtterance(ws, utterance) {
     }
   }
 
+  // ----- Fast path: TIME local parsing (handles "09/11/2025 at 10AM" and split messages) -----
+  if (convo.awaitingAsk === 'TIME' || /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|tomorrow|today)\b/i.test(utterance)) {
+    const r = tryParseAndSetTime(convo, utterance);
+    if (r === 'SET') {
+      // Once we got a time, check availability or move forward
+      if (convo.phase === 'collect_time' || convo.awaitingAsk === 'NAME') {
+        await handleAvailabilityAnswer(ws, convo);
+        return;
+      }
+    }
+  }
+
   // 1) Extract semantics (LLM)
   let parsed = await openAIExtract(utterance, convo);
 
-  // 2) Merge slots (including time)
+  // 2) Merge slots (including any LLM time)
   if (parsed.Event_Name) {
     const svc = normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
   }
 
-  // Time handling
+  // Time from LLM if present or we’re in TIME phase
   const wantTime = (parsed.Start_Time && !convo.slots.startISO) || convo.awaitingAsk === 'TIME';
   if (wantTime) {
     const chosenStart = parsed.Start_Time || '';
@@ -707,18 +797,17 @@ async function onUserUtterance(ws, utterance) {
     if (parsed.End_Time && !convo.slots.endISO) setSlot(convo, 'endISO', parsed.End_Time);
   }
 
-  // Contact (from LLM if present)
+  // Contact from LLM if present
   if (parsed.Customer_Name) setSlot(convo, 'name', parsed.Customer_Name);
   if (parsed.Customer_Phone) setSlot(convo, 'phone', parsed.Customer_Phone);
   if (parsed.Customer_Email) setSlot(convo, 'email', parsed.Customer_Email);
 
   ensureEndMatchesStart(convo);
 
-  // 3) Phase determination (after merges)
+  // 3) Phase determination
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else if (parsed.intent === 'READ') {
-    // Pure availability questions: if they gave a time, check it and answer; else ask for time.
     if (convo.slots.startISO) {
       await handleAvailabilityAnswer(ws, convo);
       return;
@@ -735,10 +824,10 @@ async function onUserUtterance(ws, utterance) {
     else                               convo.phase = 'confirm_booking';
   }
 
-  // 4) Decide next reply (ensure ask/reply)
+  // 4) Decide next reply
   parsed = ensureReplyOrAsk(parsed, utterance, convo);
 
-  // If we have service+time but not name/phone, check availability BEFORE asking contact (confirmation-first)
+  // If we have service+time but not contact, check availability before asking contact
   if (convo.phase === 'collect_contact' && convo.slots.startISO) {
     const info = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
     if (!info.available) {
@@ -788,7 +877,6 @@ async function handleAvailabilityAnswer(ws, convo) {
   const info = await makeCheckAvailability(convo.slots.startISO, convo.slots.endISO);
   if (info.available) {
     const when = fmtTime(convo.slots.startISO);
-    // If no service yet, ask for it; else proceed to name
     if (!convo.slots.service) {
       convo.phase = 'collect_service';
       convo.awaitingAsk = 'SERVICE';
@@ -803,7 +891,6 @@ async function handleAvailabilityAnswer(ws, convo) {
       const alt = fmtTime(info.nextOpenISO);
       convo.slots.startISO = info.nextOpenISO;
       convo.slots.endISO = computeEndISO(info.nextOpenISO);
-      // Ask to accept the alternative
       convo.phase = 'confirm_booking';
       convo.awaitingAsk = 'CONFIRM';
       await twilioSay(ws, `That time’s taken. ${alt} is open. Should I book that?`);
