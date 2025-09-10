@@ -1,3 +1,4 @@
+
 /**
  * server.js — Old Line Barbershop voice agent (Twilio <-> Deepgram <-> OpenAI <-> ElevenLabs)
  * Ultra-logged build for demo hardening.
@@ -291,7 +292,6 @@ async function ttsToTwilio(ws, text, voiceId = ELEVEN_VOICE_ID) {
 function safeSend(ws, data) { try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch (e) { log('ERROR','[WS send]', { error: e.message }); } }
 
 // ---------- Orchestration ----------
-const REQUIRED_ORDER = ['service', 'startISO', 'name', 'phone']; // re-define to be safe in this scope (if hoisted earlier)
 function ensureReplyOrAsk(parsed, utterance, phase) {
   if (parsed.reply && parsed.reply.trim()) return parsed;
   const svcU = normalizeService(utterance);
@@ -503,3 +503,4 @@ wss.on('connection', (ws, req) => {
 
 // ---------- Start ----------
 server.listen(PORT, () => log('INFO', 'Server running', { PORT }));
+
