@@ -32,8 +32,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || 'Adam';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || '';
-const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || '';
+const MAKE_CREATE_URL = process.env.MAKE_CREATE || '';
+const MAKE_FAQ_URL = process.env.MAKE_READ || '';
 
 // keep-alive agents
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
@@ -858,3 +858,4 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
+
