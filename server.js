@@ -1,11 +1,17 @@
 /**
- * server.js — Old Line Barbershop voice agent (WS + DG + OpenAI + 11L + Make)
+ * server.js — Old Line Barbershop voice agent (FINAL)
+ * - Twilio Media Streams WS
+ * - Deepgram ASR (URL-config WS; μ-law → PCM16LE @ 8kHz)
+ * - OpenAI for extraction + NLG (JSON contract)
+ * - ElevenLabs TTS (ulaw_8000 streaming) — includes streamSid on frames
+ * - Make.com webhooks for FAQ log + CREATE booking
  *
- * Env (Render -> Environment):
+ * Env:
  *  PORT
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
  *  ELEVENLABS_API_KEY
+ *  ELEVENLABS_VOICE_ID (optional; defaults to Adam)
  *  MAKE_CREATE_URL
  *  MAKE_FAQ_URL
  *  AGENT_PROMPT (optional)
@@ -16,30 +22,34 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const https = require('https');
 const { URL } = require('url');
 const { randomUUID } = require('crypto');
+const https = require('https');
 
-// ---------- Config / Globals ----------
+// ---------------------- Config / Globals ----------------------
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const DEEPGRAM_API_KEY = process.env.DEPPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY || ''; // tolerate typo
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVEN_API_KEY || '';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || process.env.MAKE_CREATE || '';
-const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || process.env.MAKE_READ || '';
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || 'pNInz6obpgDQGcFmaJgB'; // Adam
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || '';
+const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || '';
 
+// keep-alive agents
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 
-// ---------- Logger ----------
-function log(level, msg, meta = {}) {
-  const safeMeta = (() => {
-    try { return Object.keys(meta).length ? ' | ' + JSON.stringify(meta) : ''; }
-    catch { return ''; }
-  })();
-  console.log(`${new Date().toISOString()} - [${level}] - ${msg}${safeMeta}`);
+// Node 22 has global fetch; bind to avoid “this” surprises
+const fetchFN = (...args) => globalThis.fetch(...args);
+
+// ---------------------- Logger ----------------------
+function log(level, msg, meta = undefined) {
+  if (meta && Object.keys(meta).length) {
+    console.log(`${new Date().toISOString()} - [${level}] - ${msg} | ${JSON.stringify(meta)}`);
+  } else {
+    console.log(`${new Date().toISOString()} - [${level}] - ${msg}`);
+  }
 }
 
-// Startup env snapshot
 log('INFO', 'Startup env', {
   hasOpenAI: !!OPENAI_API_KEY,
   hasDG: !!DEEPGRAM_API_KEY,
@@ -47,19 +57,25 @@ log('INFO', 'Startup env', {
   hasMakeCreate: !!MAKE_CREATE_URL,
   hasMakeRead: !!MAKE_FAQ_URL,
   node: process.version,
-  fetchSource: typeof fetch === 'function' ? 'global' : 'missing'
+  fetchSource: 'global'
 });
 
-// ---------- Express (health) ----------
+if (!OPENAI_API_KEY) log('WARN', 'OPENAI_API_KEY missing');
+if (!DEEPGRAM_API_KEY) log('WARN', 'DEEPGRAM_API_KEY missing (ASR will be disabled)');
+if (!ELEVENLABS_API_KEY) log('WARN', 'ELEVENLABS_API_KEY missing (no audio will be streamed)');
+if (!MAKE_CREATE_URL) log('WARN', 'MAKE_CREATE_URL missing (CREATE won’t be posted)');
+if (!MAKE_FAQ_URL) log('WARN', 'MAKE_FAQ_URL missing (FAQ logging disabled)');
+
+// ---------------------- Express HTTP ----------------------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_, res) => res.status(200).send('OK'));
 const server = http.createServer(app);
 
-// ---------- WS Server (Twilio Media Streams) ----------
+// ---------------------- WS Server (Twilio Media Streams) ----------------------
 const wss = new WebSocket.Server({ server });
 
-// ---------- Agent Prompt ----------
+// ---------------------- Agent Prompt ----------------------
 const DEFAULT_AGENT_PROMPT = `
 You are a friendly, human-sounding AI receptionist for Old Line Barbershop.
 Your job is to answer the phone, sound natural, and help customers with the same tasks a real receptionist would handle.
@@ -101,12 +117,12 @@ System Controls
 - If suggestedPhone is set and phone not yet collected, confirm using that number.
 - Keep replies conversational and natural. Never output JSON to the caller.
 `.trim();
+
 const AGENT_PROMPT = (process.env.AGENT_PROMPT || DEFAULT_AGENT_PROMPT);
 
-// ---------- Conversation State ----------
+// ---------------------- State ----------------------
 /** convoMap key = ws.__id */
 const convoMap = new Map();
-const REQUIRED_ORDER = ['service', 'startISO', 'name', 'phone'];
 
 function newConvo(callSid, biz) {
   return {
@@ -119,19 +135,27 @@ function newConvo(callSid, biz) {
     forbidGreet: false,
     phase: 'idle',
     callerPhone: '',
-    awaitingAsk: 'NONE', // tracks which slot question we’re waiting on
     asrText: '',
-    slots: { service: '', startISO: '', endISO: '', name: '', phone: '', email: '' }
+    awaitingAsk: 'NONE', // moves: SERVICE -> TIME -> NAME -> PHONE -> NONE
+    slots: {
+      service: '',
+      startISO: '',
+      endISO: '',
+      name: '',
+      phone: '',
+      email: ''
+    }
   };
 }
 
-// ---------- μ-law → PCM16LE (8k mono) with saturation ----------
+// ---------------------- μ-law → PCM16LE (8k mono) with clamping ----------------------
 function ulawByteToPcm16(u) {
+  // ITU-T G.711 μ-law decode with clamp
   u = ~u & 0xff;
   const sign = u & 0x80;
-  const exp = (u >> 4) & 0x07;
-  const mant = u & 0x0f;
-  let sample = (((mant << 3) + 0x84) << (exp + 2)) - 0x84 * 4;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
   if (sign) sample = -sample;
   if (sample > 32767) sample = 32767;
   if (sample < -32768) sample = -32768;
@@ -146,8 +170,10 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- Deepgram realtime ----------
+// ---------------------- Deepgram realtime (URL-config) ----------------------
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
+  if (!DEEPGRAM_API_KEY) return null;
+
   const url =
     'wss://api.deepgram.com/v1/listen'
     + '?encoding=linear16'
@@ -167,20 +193,29 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   let open = false;
   const q = [];
 
-  dg.on('open', () => { open = true; onOpen?.(); while (q.length) dg.send(q.shift()); });
+  dg.on('open', () => {
+    open = true;
+    log('INFO', '[ASR] Deepgram open');
+    onOpen?.();
+    while (q.length) dg.send(q.shift());
+  });
+
   dg.on('message', (data) => {
-    let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch { return; }
     onAnyMessage?.(ev);
     if (ev.type !== 'Results') return;
     const alt = ev.channel?.alternatives?.[0];
     if (!alt) return;
     const text = (alt.transcript || '').trim();
     if (!text) return;
-    if (ev.is_final === true || ev.speech_final === true) onFinal?.(text);
+    const isFinal = ev.is_final === true || ev.speech_final === true;
+    if (isFinal) onFinal?.(text);
     else onPartial?.(text);
   });
-  dg.on('error', (e) => onError?.(e));
-  dg.on('close', (c, r) => log('INFO', '[ASR] Deepgram closed', { code: c, reason: r || '' }));
+
+  dg.on('error', (e) => { log('ERROR', '[ASR] error', { error: e?.message || String(e) }); onError?.(e); });
+  dg.on('close', (c, r) => log('INFO', '[ASR] Deepgram closed', { code: c, reason: (r||'').toString?.() || '' }));
 
   return {
     sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
@@ -188,7 +223,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   };
 }
 
-// ---------- Utilities ----------
+// ---------------------- Utilities ----------------------
 function normalizeService(text) {
   if (!text) return '';
   const t = text.toLowerCase();
@@ -202,80 +237,120 @@ function computeEndISO(startISO) {
     if (!startISO) return '';
     const d = new Date(startISO);
     if (isNaN(d.getTime())) return '';
-    return new Date(d.getTime() + 30 * 60 * 1000).toISOString();
+    const end = new Date(d.getTime() + 30 * 60 * 1000);
+    return end.toISOString();
   } catch { return ''; }
 }
 function isReadyToCreate(slots) {
   return Boolean(slots.service && slots.startISO && (slots.endISO || computeEndISO(slots.startISO)) && slots.name && (slots.phone || '').trim());
 }
-function safeJSON(val, fallback = {}) { try { return JSON.parse(val); } catch { return fallback; } }
+function safeJSON(val, fallback = {}) {
+  try { return JSON.parse(val); } catch { return fallback; }
+}
 function debounceRepeat(convo, text, ms = 2500) {
   const now = Date.now();
   if (!text) return false;
   if (text === convo.lastTTS && (now - convo.lastTTSAt) < ms) return true;
-  convo.lastTTS = text; convo.lastTTSAt = now; return false;
+  convo.lastTTS = text;
+  convo.lastTTSAt = now;
+  return false;
 }
+function makeQuestionForAsk(ask, convo) {
+  if (ask === 'SERVICE') return 'What service would you like — a haircut, beard trim, or the combo?';
+  if (ask === 'TIME') return `What date and time would you like for your ${convo.slots.service || 'appointment'}?`;
+  if (ask === 'NAME') return 'Could I get your first name, please?';
+  if (ask === 'PHONE') return 'What phone number should I use for confirmations?';
+  return 'How can I help further?';
+}
+function normalizeFutureStart(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (isNaN(+dt)) return iso;
+  const now = new Date();
+  if (dt.getTime() < now.getTime()) {
+    // bump to a similar time in the near future (2–14 days)
+    const bumped = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
+    bumped.setHours(dt.getHours(), dt.getMinutes(), 0, 0);
+    log('WARN', '[time guardrail] bumped parsed Start_Time to future', { from: iso, to: bumped.toISOString() });
+    return bumped.toISOString();
+  }
+  return dt.toISOString();
+}
+function ensureEndMatchesStart(convo) {
+  if (convo.slots.startISO && !convo.slots.endISO) {
+    convo.slots.endISO = computeEndISO(convo.slots.startISO);
+  }
+}
+
+// Local date/time parser (fallback when LLM misses)
+function parseWhen(text, now = new Date()) {
+  if (!text) return { startISO: '', endISO: '' };
+  const s = text.trim();
+
+  const re1 = /\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?(?:\s+at\s+|\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i;
+  const m1 = s.match(re1);
+  if (m1) {
+    let [_, mm, dd, yyyy, hh, min, ampm] = m1;
+    const year = yyyy ? (yyyy.length === 2 ? 2000 + parseInt(yyyy,10) : parseInt(yyyy,10)) : now.getFullYear();
+    let hour = parseInt(hh, 10);
+    const minute = min ? parseInt(min, 10) : 0;
+    if (ampm) {
+      const a = ampm.toLowerCase();
+      if (a === 'pm' && hour < 12) hour += 12;
+      if (a === 'am' && hour === 12) hour = 0;
+    }
+    const dt = new Date(year, parseInt(mm,10)-1, parseInt(dd,10), hour, minute, 0);
+    if (!isNaN(+dt)) {
+      const end = new Date(dt.getTime() + 30*60*1000);
+      return { startISO: dt.toISOString(), endISO: end.toISOString() };
+    }
+  }
+
+  const reTime = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i;
+  const mt = s.match(reTime);
+  if (mt) {
+    let [__, hh, min, ampm] = mt;
+    let hour = parseInt(hh,10);
+    const minute = min ? parseInt(min,10) : 0;
+    const a = ampm.toLowerCase();
+    if (a === 'pm' && hour < 12) hour += 12;
+    if (a === 'am' && hour === 12) hour = 0;
+    let dt = new Date(now);
+    dt.setSeconds(0); dt.setMilliseconds(0);
+    dt.setHours(hour, minute, 0, 0);
+    if (dt.getTime() < now.getTime()) dt = new Date(dt.getTime() + 24*3600*1000);
+    const end = new Date(dt.getTime() + 30*60*1000);
+    return { startISO: dt.toISOString(), endISO: end.toISOString() };
+  }
+
+  const reDate = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/;
+  const md = s.match(reDate);
+  if (md) {
+    let [_, mm, dd, yyyy] = md;
+    const year = yyyy.length === 2 ? 2000 + parseInt(yyyy,10) : parseInt(yyyy,10);
+    const dt = new Date(year, parseInt(mm,10)-1, parseInt(dd,10), 10, 0, 0);
+    if (!isNaN(+dt)) {
+      const end = new Date(dt.getTime() + 30*60*1000);
+      return { startISO: dt.toISOString(), endISO: end.toISOString() };
+    }
+  }
+  return { startISO: '', endISO: '' };
+}
+
+// Slot setter that advances awaitingAsk
 function setSlot(convo, k, v) {
   if (typeof v === 'string') v = v.trim();
   convo.slots[k] = v;
   log('INFO', '[slot set]', { k, v });
-}
-function nextMissing(slots) {
-  for (const k of REQUIRED_ORDER) if (!slots[k]) return k;
-  return '';
-}
-function normalizeFutureStart(startISO) {
-  try {
-    if (!startISO) return startISO;
-    const s = new Date(startISO);
-    if (isNaN(s.getTime())) return startISO;
-    const now = Date.now();
-    if (s.getTime() < now) {
-      let bumped = new Date(s.getTime());
-      while (bumped.getTime() < now) bumped = new Date(bumped.getTime() + 7 * 24 * 3600 * 1000);
-      log('WARN', '[time guardrail] bumped parsed Start_Time to future', { from: startISO, to: bumped.toISOString() });
-      return bumped.toISOString();
-    }
-    return s.toISOString();
-  } catch { return startISO; }
-}
-function ensureEndMatchesStart(convo) {
-  if (!convo.slots.startISO) return;
-  const s = Date.parse(convo.slots.startISO);
-  const e = Date.parse(convo.slots.endISO || '');
-  if (!isNaN(s) && (isNaN(e) || e <= s)) {
-    convo.slots.endISO = computeEndISO(convo.slots.startISO);
-    log('INFO', '[end fix] aligning End_Time to Start_Time +30m', { start: convo.slots.startISO, end: convo.slots.endISO });
-  }
+
+  if (k === 'service' && convo.awaitingAsk === 'SERVICE') convo.awaitingAsk = 'TIME';
+  if (k === 'startISO' && convo.awaitingAsk === 'TIME')  convo.awaitingAsk = 'NAME';
+  if (k === 'name' && convo.awaitingAsk === 'NAME')      convo.awaitingAsk = 'PHONE';
+  if (k === 'phone' && convo.awaitingAsk === 'PHONE')    convo.awaitingAsk = 'NONE';
+  log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
 }
 
-// ---- Filler / short utterance detection
-const FILLER_RE = /^(hi|hello|hey|yes|yep|yeah|ok|okay|sure|mh+mm+|yo|what'?s up|howdy|good (?:morning|afternoon|evening))[\.\!\?]*$/i;
-function isFiller(text) {
-  if (!text) return false;
-  const trimmed = text.trim();
-  if (trimmed.length <= 3) return true;           // “ok”, “hi”, etc.
-  if (FILLER_RE.test(trimmed)) return true;
-  return false;
-}
-
-// ---- Crisp slot questions
-function makeQuestionForAsk(ask, convo) {
-  if (ask === 'TIME') {
-    const svc = convo.slots.service || 'appointment';
-    return `What date and time work for your ${svc}?`;
-  }
-  if (ask === 'NAME') return `What name should I put on the booking?`;
-  if (ask === 'PHONE') {
-    return convo.callerPhone
-      ? `Can I use ${convo.callerPhone} for confirmations?`
-      : `What phone number should I use for confirmations?`;
-  }
-  if (ask === 'SERVICE') return `What service would you like — a haircut, beard trim, or the combo?`;
-  return '';
-}
-
-// ---------- OpenAI: Extract ----------
+// ---------------------- OpenAI (extract) ----------------------
 async function openAIExtract(utterance, convo) {
   const sys = [
     `Return a strict JSON object with fields:
@@ -296,10 +371,8 @@ Rules:
 - If caller asks to book, set intent="CREATE". Do not set "ask" to NAME/PHONE until availability is confirmed.
 - Recognize “both/combo/haircut + beard” as service = "combo".
 - If user gives a specific day/time, fill Start_Time (ISO if obvious; else leave empty).
-- Keep reply short; conversational; single sentence; <= ~22 words; one question max.
-- If forbidGreet=true, do not greet in reply.
-- If suggestedPhone present and phone not yet collected, propose confirming that number with a short yes/no question.
-`,
+- Keep reply short; <= ~22 words; one question max. No greetings if forbidGreet=true.
+- If suggestedPhone present and phone not yet collected, propose confirming that number with a short yes/no question.`,
     `Context:
 phase=${convo.phase}
 forbidGreet=${convo.forbidGreet}
@@ -308,40 +381,46 @@ startISO=${convo.slots.startISO}
 endISO=${convo.slots.endISO}
 name=${convo.slots.name}
 phone=${convo.slots.phone}
-callerPhone=${convo.callerPhone}
-`,
+callerPhone=${convo.callerPhone}`,
     `AGENT PROMPT:
 ${AGENT_PROMPT}`
   ].join('\n\n');
 
   const user = `Caller: ${utterance}`;
-  log('DEBUG', '[OpenAI extract ->]', { sysFirst120: sys.slice(0,120), utterance });
 
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    agent: keepAliveHttpsAgent,
-    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
-      response_format: { type: 'json_object' }
-    })
-  }).catch(e => { throw new Error(e.message || 'fetch failed'); });
+  try {
+    log('DEBUG', '[OpenAI extract ->]', { sysFirst120: sys.slice(0,120), utterance });
+    const resp = await fetchFN('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      agent: keepAliveHttpsAgent,
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user }
+        ],
+        response_format: { type: 'json_object' }
+      })
+    });
 
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`OpenAI extract error ${resp.status}: ${txt}`);
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => '');
+      throw new Error(`${resp.status} ${txt}`);
+    }
+    const data = await resp.json();
+    const raw = data.choices?.[0]?.message?.content || '{}';
+    const parsed = safeJSON(raw, { intent: 'UNKNOWN', faq_topic: '', ask: 'NONE', reply: '' });
+    log('DEBUG', '[OpenAI extract <-]', parsed);
+    return parsed;
+  } catch (e) {
+    log('ERROR', '[extract]', { error: e.message });
+    return { intent: 'UNKNOWN', faq_topic: '', ask: 'NONE', reply: '' };
   }
-
-  const data = await resp.json();
-  const raw = data.choices?.[0]?.message?.content || '{}';
-  const parsed = safeJSON(raw, { intent: 'UNKNOWN', faq_topic: '', ask: 'NONE', reply: '' });
-  log('DEBUG', '[OpenAI extract <-]', parsed);
-  return parsed;
 }
 
-// ---------- OpenAI: NLG (fallback/confirm) ----------
+// ---------------------- NLG ----------------------
 async function openAINLG(convo, promptHints = '') {
   const sys = `
 You are a warm front-desk receptionist.
@@ -365,30 +444,82 @@ AGENT PROMPT:
 ${AGENT_PROMPT}
 `.trim();
 
-  const user = `Compose the next thing to say to the caller.${promptHints ? ' Hint: ' + promptHints : ''}`;
+  const user = `
+Compose the next thing to say to the caller.
+${promptHints ? 'Hint: ' + promptHints : ''}
+`.trim();
 
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    agent: keepAliveHttpsAgent,
-    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.3,
-      messages: [{ role: 'system', content: sys }, { role: 'system', content: ctx }, { role: 'user', content: user }]
-    })
-  }).catch(e => { throw new Error(e.message || 'fetch failed'); });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`OpenAI nlg error ${resp.status}: ${txt}`);
+  try {
+    const resp = await fetchFN('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      agent: keepAliveHttpsAgent,
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'system', content: ctx },
+          { role: 'user', content: user }
+        ]
+      })
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      throw new Error(`${resp.status} ${t}`);
+    }
+    const data = await resp.json();
+    const text = (data.choices?.[0]?.message?.content || '').trim();
+    return text || 'Okay.';
+  } catch (e) {
+    log('ERROR', '[nlg]', { error: e.message });
+    return 'Okay.';
   }
-  const data = await resp.json();
-  const text = (data.choices?.[0]?.message?.content || '').trim();
-  return text || 'Okay.';
 }
 
-// ---------- TTS (ElevenLabs) -> Twilio media frames ----------
-async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
+// ---------------------- ensureReplyOrAsk (uses *merged* slots) ----------------------
+function ensureReplyOrAsk(parsed, utterance, convo) {
+  const inBooking = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
+  const canCollect = parsed.intent === 'CREATE' || inBooking;
+
+  const have = {
+    service: convo.slots.service || parsed.service || normalizeService(parsed.Event_Name),
+    startISO: convo.slots.startISO || parsed.Start_Time,
+    name: convo.slots.name || parsed.Customer_Name,
+    phone: convo.slots.phone || parsed.Customer_Phone || convo.callerPhone
+  };
+
+  if (canCollect) {
+    const askNeeded =
+      (!have.service && 'SERVICE') ||
+      (!have.startISO && 'TIME') ||
+      (!have.name && 'NAME') ||
+      (!have.phone && 'PHONE') ||
+      'NONE';
+
+    if (askNeeded !== 'NONE') {
+      parsed.ask = askNeeded;
+      parsed.reply = makeQuestionForAsk(askNeeded, convo);
+      return parsed;
+    }
+  }
+
+  // If there's already a reply, keep it
+  if (parsed.reply && parsed.reply.trim()) return parsed;
+
+  // Fallback: keep moving towards booking
+  if (have.service && !have.startISO) {
+    parsed.ask = 'TIME';
+    parsed.reply = makeQuestionForAsk('TIME', convo);
+    return parsed;
+  }
+  parsed.ask = 'NONE';
+  parsed.reply = 'Got it. How can I help further?';
+  return parsed;
+}
+
+// ---------------------- TTS (ElevenLabs) -> Twilio media ----------------------
+async function ttsToTwilio(ws, text, voiceId = ELEVENLABS_VOICE_ID) {
   if (!text) return;
 
   const convo = ws.__convo;
@@ -398,210 +529,146 @@ async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
   }
 
   const streamSid = ws.__streamSid;
-  if (!streamSid) { log('WARN', '[TTS] missing streamSid; cannot send audio'); return; }
-  if (!ELEVENLABS_API_KEY) { log('WARN', '[TTS] ELEVENLABS_API_KEY missing; skipping audio'); return; }
-
-  log('INFO', '[TTS ->]', { text });
-
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-  const resp = await fetch(url, {
-    method: 'POST',
-    agent: keepAliveHttpsAgent,
-    headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Accept': 'audio/wav', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice_settings: { stability: 0.5, similarity_boost: 0.8 }, generation_config: { chunk_length_schedule: [120,160,200,240] } })
-  }).catch(e => { log('ERROR', '[TTS fetch]', { error: e.message }); return null; });
-
-  if (!resp || !resp.ok) {
-    if (resp) log('ERROR', '[TTS HTTP]', { status: resp.status, txt: await resp.text().catch(()=> '') });
+  if (!streamSid) {
+    log('WARN', '[TTS] missing streamSid; cannot send audio');
+    return;
+  }
+  if (!ELEVENLABS_API_KEY) {
+    log('WARN', '[TTS] ELEVENLABS_API_KEY missing; skipping audio');
     return;
   }
 
-  const reader = resp.body.getReader();
-  let total = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    total += value.length;
-    const b64 = Buffer.from(value).toString('base64');
-    safeSend(ws, JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+
+  try {
+    log('INFO', '[TTS ->]', { text });
+    const resp = await fetchFN(url, {
+      method: 'POST',
+      agent: keepAliveHttpsAgent,
+      headers: {
+        'xi-api-key': ELEVENLABS_API_KEY,
+        'Accept': 'audio/wav',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        text,
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+        generation_config: { chunk_length_schedule: [120, 160, 200, 240] }
+      })
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      log('ERROR', '[TTS fetch]', { error: `${resp.status} ${t}` });
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    let total = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.length;
+      const b64 = Buffer.from(value).toString('base64');
+      const frame = { event: 'media', streamSid, media: { payload: b64 } };
+      safeSend(ws, JSON.stringify(frame));
+    }
+    safeSend(ws, JSON.stringify({ event: 'mark', streamSid, mark: { name: 'eos' } }));
+    log('INFO', '[TTS end]', { bytes: total });
+  } catch (e) {
+    log('ERROR', '[TTS fetch]', { error: e.message });
   }
-  safeSend(ws, JSON.stringify({ event: 'mark', streamSid, mark: { name: 'eos' } }));
-  log('INFO', '[TTS end]', { bytes: total });
 }
 
-// ---------- Twilio helpers ----------
 function safeSend(ws, data) {
-  try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch (e) { log('ERROR', '[WS send]', { error: e.message }); }
-}
-function twilioSay(ws, text, askType = 'NONE') {
-  ws.__convo.awaitingAsk = askType || 'NONE';
-  log('DEBUG', '[awaitingAsk set]', { awaitingAsk: ws.__convo.awaitingAsk });
-  return ttsToTwilio(ws, text);
+  try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch {}
 }
 
-// ---------- ensureReplyOrAsk (GATED slot collection) ----------
-function ensureReplyOrAsk(parsed, utterance, convo) {
-  const inBookingPhase = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
-  const canCollect = parsed.intent === 'CREATE' || inBookingPhase;
+function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
 
-  // Promote asks if we already have a slot (only when allowed to collect)
-  if (canCollect) {
-    if (parsed.ask === 'SERVICE' && convo.slots.service) parsed.ask = 'TIME';
-    if (parsed.ask === 'TIME' && convo.slots.startISO) parsed.ask = 'NAME';
-  }
-
-  // If we’re missing a specific slot and we ARE allowed to collect, force a crisp question
-  if (canCollect) {
-    const askNeeded =
-      (!convo.slots.service && 'SERVICE') ||
-      (!convo.slots.startISO && 'TIME') ||
-      (!convo.slots.name && 'NAME') ||
-      (!convo.slots.phone && 'PHONE') || 'NONE';
-
-    if (askNeeded !== 'NONE') {
-      parsed.ask = askNeeded;
-      parsed.reply = makeQuestionForAsk(askNeeded, convo);
-      return parsed;
-    }
-  }
-
-  // If not collecting, keep it lightweight
-  if (!canCollect) {
-    if (parsed.intent === 'FAQ' && parsed.faq_topic) {
-      parsed.ask = 'NONE';
-      parsed.reply = parsed.reply || 'Anything else I can help with?';
-      return parsed;
-    }
-    parsed.ask = 'NONE';
-    parsed.reply = parsed.reply || 'How can I help you today?';
-    return parsed;
-  }
-
-  // Confirm phase
-  if (convo.phase === 'confirm_booking') {
-    parsed.ask = 'CONFIRM';
-    parsed.reply = `Just to confirm: ${convo.slots.service} at ${convo.slots.startISO} for ${convo.slots.name}. Is that right?`;
-    return parsed;
-  }
-
-  // Fallback within collection
-  const svcU = normalizeService(utterance);
-  if ((parsed.intent === 'CREATE' || convo.phase === 'collect_time')) {
-    const svc = parsed.service || normalizeService(parsed.Event_Name) || svcU || convo.slots.service;
-    if (svc && convo.phase !== 'confirm_booking') {
-      parsed.ask = 'TIME';
-      parsed.reply = `Got it — ${svc}. What date and time work for you?`;
-      return parsed;
-    }
-  }
-
-  parsed.ask = 'NONE';
-  parsed.reply = parsed.reply || 'Got it. How can I help further?';
-  return parsed;
-}
-
-// ---------- Flow Orchestration ----------
+// ---------------------- Flow Orchestration ----------------------
 async function onUserUtterance(ws, utterance) {
   const convo = ws.__convo;
   if (!convo) return;
 
   log('INFO', '[USER]', { text: utterance });
 
-  // Filler guard: if we are NOT awaiting a specific slot question, drop/soft-prompt
-  if (isFiller(utterance) && (!convo.awaitingAsk || convo.awaitingAsk === 'NONE')) {
-    log('DEBUG', '[filler ignored]', { utterance });
-    // Soft nudge once after greeting
-    if (!convo.turns) {
-      convo.turns += 1;
-      convo.forbidGreet = true;
-      return twilioSay(ws, 'How can I help you today?', 'NONE');
-    }
-    return; // do nothing further
-  }
+  // 1) Extract semantics
+  let parsed = await openAIExtract(utterance, convo);
 
-  // Extract semantics
-  let parsed;
-  try {
-    parsed = await openAIExtract(utterance, convo);
-  } catch (e) {
-    log('ERROR', '[extract]', { error: e.message });
-    parsed = { intent: 'UNKNOWN', ask: 'NONE', reply: '' };
-  }
-
-  // Normalize/ensure reply
-  parsed = ensureReplyOrAsk(parsed, utterance, convo);
-
-  // Merge slots
+  // 2) MERGE SLOTS FIRST (from parsed AND local parse)
+  // Service
   if (parsed.service || parsed.Event_Name) {
     const svc = parsed.service || normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
   }
 
-  if (parsed.Start_Time) {
-    const normStart = normalizeFutureStart(parsed.Start_Time);
-    setSlot(convo, 'startISO', normStart);
+  // Times
+  const wantTime = (parsed.Start_Time && !convo.slots.startISO) || convo.awaitingAsk === 'TIME';
+  if (wantTime) {
+    const local = parseWhen(utterance);
+    const chosenStart = parsed.Start_Time || local.startISO;
+    const chosenEnd   = parsed.End_Time   || local.endISO;
+    if (chosenStart) setSlot(convo, 'startISO', normalizeFutureStart(chosenStart));
+    if (chosenEnd && !convo.slots.endISO) setSlot(convo, 'endISO', chosenEnd);
   }
-  if (!convo.slots.endISO && parsed.End_Time) setSlot(convo, 'endISO', parsed.End_Time);
-  if (!convo.slots.endISO && convo.slots.startISO) setSlot(convo, 'endISO', computeEndISO(convo.slots.startISO));
-  ensureEndMatchesStart(convo);
-
+  // Contact
   if (parsed.Customer_Name) setSlot(convo, 'name', parsed.Customer_Name);
   if (parsed.Customer_Phone) setSlot(convo, 'phone', parsed.Customer_Phone);
   if (parsed.Customer_Email) setSlot(convo, 'email', parsed.Customer_Email);
+  ensureEndMatchesStart(convo);
 
-  // Phase transitions
+  // 3) Phase determination (after slots merged)
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else if (parsed.intent === 'CREATE' || ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase)) {
-    if (!convo.slots.service) convo.phase = 'collect_service';
-    else if (!convo.slots.startISO) convo.phase = 'collect_time';
+    if (!convo.slots.service)          convo.phase = 'collect_service';
+    else if (!convo.slots.startISO)    convo.phase = 'collect_time';
     else if (!convo.slots.name || !(convo.slots.phone || convo.callerPhone)) convo.phase = 'collect_contact';
-    else convo.phase = 'confirm_booking';
-  }
-  log('DEBUG', '[phase]', { phase: convo.phase, missing: nextMissing(convo.slots) || 'none' });
+    else                               convo.phase = 'confirm_booking';
+  } // else leave as-is
 
-  // Log FAQ to Make (non-blocking)
+  log('DEBUG', '[phase]', { phase: convo.phase, missing:
+    (!convo.slots.service && 'service') ||
+    (!convo.slots.startISO && 'startISO') ||
+    (!convo.slots.name && 'name') ||
+    (!(convo.slots.phone||convo.callerPhone) && 'phone') || 'none'
+  });
+
+  // 4) FAQ fire-and-forget log
   if (parsed.intent === 'FAQ' && MAKE_FAQ_URL) {
-    postToMakeFAQ(parsed.faq_topic || '').catch(() => {});
+    postToMakeFAQ(parsed.faq_topic).catch(() => {});
   }
 
-  // Create if ready
+  // 5) If ready, finalize booking
   if (convo.phase === 'confirm_booking' && isReadyToCreate(convo.slots)) {
     await finalizeCreate(ws, convo);
     return;
   }
 
-  // Decide what to say
-  let line = (parsed.reply || '').trim();
-  let askType = parsed.ask || 'NONE';
+  // 6) Decide what to say (AFTER merge)
+  parsed = ensureReplyOrAsk(parsed, utterance, convo);
 
-  // If we’re allowed to collect, ensure crisp slot question
-  const inBookingPhase = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
-  if (inBookingPhase && ['SERVICE','TIME','NAME','PHONE'].includes(askType)) {
-    line = makeQuestionForAsk(askType, convo) || line;
+  // Track awaitingAsk based on parsed.ask
+  if (parsed.ask && parsed.ask !== 'NONE') {
+    convo.awaitingAsk = parsed.ask;
+    log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
   }
 
-  if (!line) {
-    const missing = nextMissing(convo.slots);
-    askType =
-      missing === 'service' ? 'SERVICE' :
-      missing === 'startISO' ? 'TIME' :
-      missing === 'name' ? 'NAME' :
-      missing === 'phone' ? 'PHONE' : 'NONE';
-    line = makeQuestionForAsk(askType, convo) || await openAINLG({ ...convo, forbidGreet:true }).catch(()=> 'Okay.');
-  }
-
+  // 7) Speak
+  const line = (parsed.reply || '').trim() || await openAINLG({ ...convo, forbidGreet: true });
   convo.turns += 1;
   convo.forbidGreet = true;
-  await twilioSay(ws, line, askType);
+  await twilioSay(ws, line);
 }
 
 async function finalizeCreate(ws, convo) {
-  // End time safety
-  if (!convo.slots.endISO && convo.slots.startISO) setSlot(convo, 'endISO', computeEndISO(convo.slots.startISO));
-  ensureEndMatchesStart(convo);
-  // Phone fallback from caller
-  if (!convo.slots.phone && convo.callerPhone) setSlot(convo, 'phone', convo.callerPhone);
+  if (!convo.slots.endISO && convo.slots.startISO) {
+    convo.slots.endISO = computeEndISO(convo.slots.startISO);
+  }
+  if (!convo.slots.phone && convo.callerPhone) {
+    convo.slots.phone = convo.callerPhone;
+  }
 
   const payload = {
     Event_Name: convo.slots.service || 'Appointment',
@@ -613,52 +680,56 @@ async function finalizeCreate(ws, convo) {
     Notes: `Booked by phone agent. CallSid=${convo.callSid || ''}`
   };
 
-  try {
-    if (MAKE_CREATE_URL) {
-      const r = await fetch(MAKE_CREATE_URL, {
+  if (MAKE_CREATE_URL) {
+    try {
+      const r = await fetchFN(MAKE_CREATE_URL, {
         method: 'POST',
         agent: keepAliveHttpsAgent,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (!r.ok) log('WARN', '[Make CREATE] non-200', { status: r.status, txt: await r.text().catch(()=> '') });
+      if (!r.ok) log('WARN', '[Make CREATE] non-200', { status: r.status, body: await r.text().catch(()=> '') });
       else log('INFO', '[Make CREATE] ok');
-    } else {
-      log('WARN', '[Make CREATE] skipped (no MAKE_CREATE_URL)');
+    } catch (e) {
+      log('ERROR', '[Make CREATE]', { error: e.message });
     }
-  } catch (e) {
-    log('ERROR', '[Make CREATE] error', { error: e.message });
+  } else {
+    log('WARN', '[Make CREATE] skipped; MAKE_CREATE_URL missing', payload);
   }
 
   const confirmLine = await openAINLG(
     { ...convo, forbidGreet: true, phase: 'done' },
     `Confirm booking and say goodbye. Service=${convo.slots.service}, start=${convo.slots.startISO}, name=${convo.slots.name}`
-  ).catch(()=> 'Your appointment is confirmed. Thanks for calling!');
-  convo.awaitingAsk = 'NONE';
-  log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
-  await twilioSay(ws, confirmLine, 'NONE');
+  );
+  await twilioSay(ws, confirmLine);
 }
 
 async function postToMakeFAQ(topic) {
   try {
-    await fetch(MAKE_FAQ_URL, {
+    await fetchFN(MAKE_FAQ_URL, {
       method: 'POST',
       agent: keepAliveHttpsAgent,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intent: 'FAQ', topic })
+      body: JSON.stringify({ intent: 'FAQ', topic: topic || '' })
     });
   } catch (e) {
-    log('WARN', '[Make FAQ] error', { error: e.message });
+    log('ERROR', '[Make FAQ]', { error: e.message });
   }
 }
 
-// ---------- WS Handlers ----------
-wss.on('connection', (ws, req) => {
-  // Parse Twilio params
-  let params = {};
-  try { params = new URL(req.url, `http://${req.headers.host}`).searchParams; } catch {}
-  const biz = params.get?.('biz') || 'acme-001';
+// ---------------------- ASR final hook ----------------------
+function handleASRFinal(ws, text) {
+  const convo = ws.__convo;
+  if (!convo) return;
+  convo.asrText = text;
+  onUserUtterance(ws, text).catch(err => log('ERROR', '[onUserUtterance]', { error: err.message }));
+}
 
+// ---------------------- WS Handlers ----------------------
+wss.on('connection', (ws, req) => {
+  // Twilio sends querystring; parse it
+  const params = new URL(req.url, `http://${req.headers.host}`).searchParams;
+  const biz = params.get('biz') || 'acme-001';
   const id = randomUUID();
   ws.__id = id;
 
@@ -670,9 +741,12 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('message', async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { log('DEBUG', '[WS raw non-JSON]', { raw: raw.toString().slice(0,120) }); return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch {
+      log('DEBUG', '[WS event ignored]', { evt: 'non-json' }); return;
+    }
+
     const evt = msg.event;
+    if (!evt) { log('DEBUG', '[WS event ignored]', msg); return; }
 
     if (evt === 'connected') { log('DEBUG', '[WS event ignored]', { evt }); return; }
 
@@ -680,96 +754,93 @@ wss.on('connection', (ws, req) => {
       const callSid = msg?.start?.callSid || '';
       const from = msg?.start?.customParameters?.from || msg?.start?.from || '';
       const streamSid = msg?.start?.streamSid || '';
-      const path = params.get?.('path') || '/twilio';
-
       const convo = newConvo(callSid, biz);
       ws.__convo = convo;
       ws.__streamSid = streamSid;
       convo.callerPhone = from || '';
       convoMap.set(ws.__id, convo);
+      log('INFO', 'WS CONNECTED', { path: req.url, callSid, streamSid, biz });
+      log('INFO', '[agent prompt 120]', { text: AGENT_PROMPT.slice(0, 120) });
 
-      log('INFO', 'WS CONNECTED', { path, callSid, streamSid, biz });
-      log('INFO', '[agent prompt 120]', { text: AGENT_PROMPT.slice(0,120) });
+      // Start Deepgram
+      let dgOpened = false;
+      ws.__dg = startDeepgramLinear16({
+        onOpen: () => {},
+        onPartial: (t) => { if (!dgOpened) { dgOpened = true; } log('DEBUG', '[ASR partial]', { t }); },
+        onFinal:   (t) => { log('INFO', '[ASR final]', { t }); handleASRFinal(ws, t); },
+        onError:   (e) => {},
+        onAnyMessage: (ev) => { if (ev.type && ev.type !== 'Results') log('DEBUG', '[ASR event]', { type: ev.type }); }
+      });
 
-      // Start Deepgram pipe
-      if (DEEPGRAM_API_KEY) {
-        ws.__dg = startDeepgramLinear16({
-          onOpen: () => log('INFO', '[ASR] Deepgram open'),
-          onPartial: (t) => log('DEBUG', '[ASR partial]', { t }),
-          onFinal: (t) => { log('INFO', '[ASR final]', { t }); handleASRFinal(ws, t); },
-          onError: (e) => log('ERROR', '[ASR] Deepgram error', { error: e?.message || String(e) }),
-          onAnyMessage: (ev) => { if (ev.type && ev.type !== 'Results') log('DEBUG', '[ASR msg]', { type: ev.type }); }
-        });
-      } else {
-        log('WARN', 'No DEEPGRAM_API_KEY — ASR disabled');
-      }
+      // init ask state
+      convo.awaitingAsk = 'NONE';
+      log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
 
       // Greeting
-      ws.__convo.turns = 0;
-      ws.__convo.forbidGreet = false;
-      ws.__convo.awaitingAsk = 'NONE';
-      log('DEBUG', '[awaitingAsk set]', { awaitingAsk: ws.__convo.awaitingAsk });
-      twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?', 'NONE').catch(() => {});
+      convo.turns = 0;
+      convo.forbidGreet = false;
+      twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?').catch(() => {});
       return;
     }
 
     if (evt === 'media') {
-      ws.__frameCount = (ws.__frameCount || 0) + 1;
-      if (!(ws.__frameCount % 50)) log('DEBUG', '[media] frames', { frameCount: ws.__frameCount });
+      // Collect μ-law frames and stream to DG in small batches
+      if (!ws.__frameCount) ws.__frameCount = 0;
+      ws.__frameCount++;
+      log('DEBUG', '[media] frames', { frameCount: ws.__frameCount });
+
       const b64 = msg.media?.payload || '';
       if (!b64) return;
-      if (ws.__dg) {
+
+      if (!ws.__ulawBatch) ws.__ulawBatch = [];
+      ws.__ulawBatch.push(Buffer.from(b64, 'base64'));
+
+      const BATCH_FRAMES = 5; // ~100ms
+      if (ws.__ulawBatch.length >= BATCH_FRAMES && ws.__dg) {
         try {
-          ws.__pendingULaw = ws.__pendingULaw || [];
-          ws.__pendingULaw.push(Buffer.from(b64, 'base64'));
-          const BATCH_FRAMES = 5; // ≈100ms
-          if (ws.__pendingULaw.length >= BATCH_FRAMES) {
-            const ulawChunk = Buffer.concat(ws.__pendingULaw);
-            ws.__pendingULaw = [];
-            const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-            ws.__dg.sendPCM16LE(pcm16le);
-          }
+          const ulawChunk = Buffer.concat(ws.__ulawBatch);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          ws.__dg.sendPCM16LE(pcm16le);
         } catch (e) {
-          log('ERROR', '[media→DG] send error', { error: e.message });
+          log('ERROR', '[media→DG] send error', { error: e?.message || String(e) });
         }
+        ws.__ulawBatch = [];
       }
       return;
     }
 
-    if (evt === 'mark') { log('DEBUG', '[mark]', { name: msg?.mark?.name }); return; }
+    if (evt === 'mark') {
+      log('DEBUG', '[mark]', { name: msg?.mark?.name });
+      return;
+    }
 
     if (evt === 'stop') {
       log('INFO', 'Twilio stream STOP');
-      try {
-        if (ws.__pendingULaw?.length && ws.__dg) {
-          const ulawChunk = Buffer.concat(ws.__pendingULaw);
+      if (ws.__ulawBatch?.length && ws.__dg) {
+        try {
+          const ulawChunk = Buffer.concat(ws.__ulawBatch);
           const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
           ws.__dg.sendPCM16LE(pcm16le);
-        }
-      } catch {}
+        } catch {}
+        ws.__ulawBatch = [];
+      }
       try { ws.__dg?.close(); } catch {}
       try { ws.close(); } catch {}
       return;
     }
 
-    // Optional synthetic "asr" passthrough event pattern
+    // Optional synthetic "asr" event passthrough
     if (evt === 'asr') {
       const final = msg?.text || '';
       if (final) handleASRFinal(ws, final);
       return;
     }
+
+    log('DEBUG', '[WS event ignored]', msg);
   });
 });
 
-// ---------- ASR final hook ----------
-function handleASRFinal(ws, text) {
-  const convo = ws.__convo;
-  if (!convo) return;
-  convo.asrText = text;
-  onUserUtterance(ws, text).catch(err => log('ERROR', '[onUserUtterance]', { error: err.message }));
-}
-
-// ---------- Start server ----------
+// ---------------------- Start server ----------------------
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
