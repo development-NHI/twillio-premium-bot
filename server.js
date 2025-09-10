@@ -1,16 +1,16 @@
 /**
- * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST)
- * (Twilio Media Streams WS + Deepgram ASR + OpenAI extract/NLG + ElevenLabs TTS + Make.com)
+ * server.js — Old Line Barbershop voice agent (CONFIRM-FIRST + contact heuristics)
+ * Twilio Media Streams WS + Deepgram ASR + OpenAI extract/NLG + ElevenLabs TTS + Make.com
  *
  * Env:
  *  PORT
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
- *  ELEVENLABS_API_KEY
- *  ELEVENLABS_VOICE_ID (optional; defaults to Adam)
- *  MAKE_CREATE_URL
- *  MAKE_FAQ_URL
- *  AGENT_PROMPT (optional)
+ *  ELEVENLABS_API_KEY  (or ELEVEN_API_KEY)
+ *  ELEVENLABS_VOICE_ID (or ELEVEN_VOICE_ID) — optional; defaults to Adam
+ *  MAKE_CREATE_URL     (or MAKE_CREATE)
+ *  MAKE_FAQ_URL        (or MAKE_READ)
+ *  AGENT_PROMPT        (optional)
  */
 
 'use strict';
@@ -22,13 +22,18 @@ const { URL } = require('url');
 const { randomUUID } = require('crypto');
 const https = require('https');
 
+// ---------------------- Config / Globals ----------------------
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY   || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
-const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
-const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || '';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE || '';
-const MAKE_FAQ_URL = process.env.MAKE_READ || '';
+
+// accept either ELEVENLABS_* or ELEVEN_*
+const ELEVENLABS_API_KEY  = process.env.ELEVENLABS_API_KEY || process.env.ELEVEN_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || process.env.ELEVEN_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'; // Adam
+
+// accept either explicit *_URL or MAKE_* short names
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || process.env.MAKE_CREATE || '';
+const MAKE_FAQ_URL    = process.env.MAKE_FAQ_URL    || process.env.MAKE_READ   || '';
 
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
 const fetchFN = (...args) => globalThis.fetch(...args);
@@ -52,11 +57,11 @@ log('INFO', 'Startup env', {
   fetchSource: 'global'
 });
 
-if (!OPENAI_API_KEY) log('WARN', 'OPENAI_API_KEY missing');
+if (!OPENAI_API_KEY)   log('WARN', 'OPENAI_API_KEY missing');
 if (!DEEPGRAM_API_KEY) log('WARN', 'DEEPGRAM_API_KEY missing (ASR will be disabled)');
-if (!ELEVENLABS_API_KEY) log('WARN', 'ELEVENLABS_API_KEY missing (no audio will be streamed)');
-if (!MAKE_CREATE_URL) log('WARN', 'MAKE_CREATE_URL missing (CREATE won’t be posted)');
-if (!MAKE_FAQ_URL) log('WARN', 'MAKE_FAQ_URL missing (FAQ logging disabled)');
+if (!ELEVENLABS_API_KEY) log('WARN', 'ELEVENLABS_API_KEY/ELEVEN_API_KEY missing (no audio will be streamed)');
+if (!MAKE_CREATE_URL)  log('WARN', 'MAKE_CREATE_URL/MAKE_CREATE missing (CREATE won’t be posted)');
+if (!MAKE_FAQ_URL)     log('WARN', 'MAKE_FAQ_URL/MAKE_READ missing (FAQ logging disabled)');
 
 // ---------------------- Express HTTP ----------------------
 const app = express();
@@ -134,7 +139,7 @@ function newConvo(callSid, biz) {
   };
 }
 
-// ---------------------- Audio utils ----------------------
+// ---------------------- μ-law → PCM16LE (8k mono) ----------------------
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -155,7 +160,7 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------------------- Deepgram realtime ----------------------
+// ---------------------- Deepgram realtime (URL-config) ----------------------
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   if (!DEEPGRAM_API_KEY) return null;
 
@@ -298,6 +303,31 @@ function readbackLine(convo) {
     phone ? `at ${phone}` : ''
   ].filter(Boolean).join(', ');
   return bits ? `I have you for ${bits}.` : 'Let me confirm the details.';
+}
+
+// ---- NEW: Contact heuristics (prevents NAME/PHONE loops) ----
+function maybeName(s) {
+  if (!s) return '';
+  const t = s.trim();
+
+  // “This is Cameron”, “Name’s Cameron”, “I’m Cameron …”
+  const m2 = t.match(/\b(?:this is|name'?s|i am|i'm)\s+([A-Za-z][A-Za-z.'\-]{1,24})(?:\s+([A-Za-z][A-Za-z.'\-]{1,24}))?/i);
+  if (m2) return (m2[1] + (m2[2] ? ' ' + m2[2] : '')).trim();
+
+  // Plain “Cameron.” or “Cameron Diaz.”
+  const m3 = t.match(/^\s*([A-Za-z][A-Za-z.'\-]{1,24})(?:\s+([A-Za-z][A-Za-z.'\-]{1,24}))?\.?\s*$/);
+  if (m3) return (m3[1] + (m3[2] ? ' ' + m3[2] : '')).trim();
+
+  return '';
+}
+function normalizePhone(s) {
+  if (!s) return '';
+  const digits = String(s).replace(/[^\d]/g, '');
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    return `(${last10.slice(0,3)}) ${last10.slice(3,6)}-${last10.slice(6)}`;
+  }
+  return '';
 }
 
 // ---------------------- OpenAI (extract) ----------------------
@@ -528,11 +558,11 @@ function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
 async function onUserUtterance(ws, utterance) {
   const convo = ws.__convo;
   if (!convo) return;
-  if (convo.phase === 'done') return; // hard stop after completion
+  if (convo.phase === 'done') return;
 
   log('INFO', '[USER]', { text: utterance });
 
-  // Confirmation shortcut: if awaiting confirmation, catch yes/no locally
+  // If awaiting confirmation, allow quick yes/no path
   if (convo.awaitingAsk === 'CONFIRM') {
     if (yesish(utterance)) {
       await finalizeCreate(ws, convo);
@@ -549,8 +579,8 @@ async function onUserUtterance(ws, utterance) {
   // 1) Extract semantics
   let parsed = await openAIExtract(utterance, convo);
 
-  // 2) Merge slots (including local parsing of time)
-  // Service (also from raw utterance fallback inside ensureReplyOrAsk)
+  // 2) Merge slots
+  // Service
   if (parsed.Event_Name) {
     const svc = normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
@@ -564,14 +594,25 @@ async function onUserUtterance(ws, utterance) {
     if (parsed.End_Time && !convo.slots.endISO) setSlot(convo, 'endISO', parsed.End_Time);
   }
 
-  // Contact
-  if (parsed.Customer_Name) setSlot(convo, 'name', parsed.Customer_Name);
+  // Contact from extractor
+  if (parsed.Customer_Name)  setSlot(convo, 'name',  parsed.Customer_Name);
   if (parsed.Customer_Phone) setSlot(convo, 'phone', parsed.Customer_Phone);
   if (parsed.Customer_Email) setSlot(convo, 'email', parsed.Customer_Email);
 
   ensureEndMatchesStart(convo);
 
-  // 3) Phase determination (after slots merged)
+  // ---- NEW: local fallbacks while asking for NAME/PHONE ----
+  if (convo.awaitingAsk === 'NAME' && !convo.slots.name) {
+    const n = maybeName(utterance);
+    if (n) setSlot(convo, 'name', n);
+  }
+  if (convo.awaitingAsk === 'PHONE' && !convo.slots.phone) {
+    const p = normalizePhone(utterance);
+    if (p) setSlot(convo, 'phone', p);
+  }
+  // ---------------------------------------------------------
+
+  // 3) Phase determination
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else if (parsed.intent === 'CREATE' || ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase)) {
@@ -586,7 +627,7 @@ async function onUserUtterance(ws, utterance) {
     postToMakeFAQ(parsed.faq_topic).catch(() => {});
   }
 
-  // 5) Decide what to say (AFTER merge)
+  // 5) Decide what to say
   parsed = ensureReplyOrAsk(parsed, utterance, convo);
 
   // Track awaitingAsk
@@ -697,8 +738,8 @@ wss.on('connection', (ws, req) => {
     if (evt === 'connected') { log('DEBUG', '[WS event ignored]', { evt }); return; }
 
     if (evt === 'start') {
-      const callSid = msg?.start?.callSid || '';
-      const from = msg?.start?.customParameters?.from || msg?.start?.from || '';
+      const callSid  = msg?.start?.callSid || '';
+      const from     = msg?.start?.customParameters?.from || msg?.start?.from || '';
       const streamSid = msg?.start?.streamSid || '';
       const convo = newConvo(callSid, biz);
       ws.__convo = convo;
