@@ -1,21 +1,19 @@
 /**
- * server.js — Old Line Barbershop voice agent (State-Machine + Fast Captures)
+ * server.js — Old Line Barbershop voice agent (WORKING PIPE + fixes)
  * - Twilio Media Streams WS
  * - Deepgram ASR (URL-config WS; μ-law → PCM16LE @ 8kHz mono)
- * - OpenAI for FAQ intent + NLG (JSON contract)
+ * - OpenAI for extraction + NLG (JSON contract)
  * - ElevenLabs TTS (ulaw_8000 streaming) — includes streamSid on frames
  * - Make.com webhooks for FAQ log + CREATE booking
  *
- * Env (match Render):
+ * Env (Render):
  *  PORT
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
- *  ELEVEN_API_KEY
- *  ELEVEN_VOICE_ID             (optional; default provided)
- *  MAKE_CREATE                 (Make create hook)
- *  MAKE_READ                   (Make FAQ log hook)
- *  AGENT_PROMPT                (optional)
- *  TZ_NAME                     (e.g., "America/New_York"; default Eastern)
+ *  ELEVEN_API_KEY           <-- (matches your Render var)
+ *  MAKE_CREATE              <-- (matches your Render var)
+ *  MAKE_READ                <-- (matches your Render var)
+ *  AGENT_PROMPT (optional)
  */
 
 'use strict';
@@ -32,47 +30,81 @@ const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
 const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || 'pNInz6obpgDQGcFmaJgB';
 const MAKE_CREATE_URL = process.env.MAKE_CREATE || 'https://hook.us2.make.com/7hd4nxdrgytwukxw57cwyykhotv6hxrm';
 const MAKE_FAQ_URL = process.env.MAKE_READ || 'https://hook.us2.make.com/6hmur673mpqw4xgy2bhzx4be4o32ziax';
-const TZ_NAME = process.env.TZ_NAME || 'America/New_York'; // used only for “next weekday” math
 
+// HTTP keep-alive agents to shave latency
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
+
+// Minimal logger
 const log = (...args) => console.log(new Date().toISOString(), '-', ...args);
 
-if (!OPENAI_API_KEY) log('(!) OPENAI_API_KEY missing');
-if (!DEEPGRAM_API_KEY) log('(!) DEEPGRAM_API_KEY missing');
-if (!ELEVENLABS_API_KEY) log('(!) ELEVEN_API_KEY missing');
+// Quick env sanity
+if (!OPENAI_API_KEY) log('[WARN] - OPENAI_API_KEY missing');
+if (!DEEPGRAM_API_KEY) log('[WARN] - DEEPGRAM_API_KEY missing');
+if (!ELEVENLABS_API_KEY) log('[WARN] - ELEVEN_API_KEY (ElevenLabs) missing');
 
-// ---------- Express ----------
+// ---------- Express HTTP (health) ----------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_, res) => res.status(200).send('OK'));
 const server = http.createServer(app);
 
-// ---------- WS ----------
+// ---------- WS Server (Twilio Media Streams) ----------
 const wss = new WebSocket.Server({ server });
 
 // ---------- Agent Prompt ----------
 const DEFAULT_AGENT_PROMPT = `
 You are a friendly, human-sounding AI receptionist for Old Line Barbershop.
+Your job is to answer the phone, sound natural, and help customers with the same tasks a real receptionist would handle.
+
+Core Responsibilities
+- Greet callers warmly and always say the business name right away.
+- Answer common questions clearly and directly (hours, pricing, services, location, etc.).
+- Handle scheduling: booking, rescheduling, and cancellations.
 
 Booking Order (strict):
-1) Service (haircut, beard trim, or combo).
-2) Preferred date & time.
+1) Ask what service they want (haircut, beard trim, or combo = haircut + beard trim).
+2) Ask for the preferred date and time.
 3) Confirm availability.
-4) Then ask for name & phone (confirm caller’s if present).
-5) Finalize and confirm details clearly.
+4) After confirming availability, ask for name and phone number (prefer the caller’s number if provided; confirm with them).
+5) Finalize the booking.
 
-Style:
-- Short, natural sentences (< ~22 words).
-- Contractions, micro-acks.
-- One question at a time.
-- No repeats; don’t re-ask details already provided.
-- After confirming, say goodbye and hang up.
+Always confirm appointment details before finalizing (service, date, time, customer name, and phone number).
+
+Hours rule: Only book during business hours: Monday–Friday, 9 AM–5 PM (closed weekends).
+Never double-book. If a requested time is unavailable, politely suggest the nearest open slot.
+
+Conversation Style
+- Speak in short, natural sentences; one short sentence at a time (< ~22 words).
+- Use contractions and micro acknowledgements.
+- Ask only one question at a time.
+- Avoid repeating the same wording; vary phrasing.
+- If answering FAQs, give the fact, then optionally ask if they’d like to book.
+- Do not start booking unless they explicitly ask to book/reschedule/cancel.
+- If you don’t know, say you’ll transfer them and politely end.
+- Listen; don’t re-ask details already provided.
+- Keep caller informed: (“Let me check…”, “That time is available…”, “Your appointment is confirmed.”)
+- When saying goodbye, hang up immediately.
+
+**Services vocabulary:** Treat “both”, “combo”, “haircut and beard trim”, “haircut + beard” as the combo service.
+**If caller says “both/combo” and wants to book, keep the chosen service and move on to ask for date/time without re-asking service.**
+
+System Controls
+- If forbidGreet=true, don’t greet again.
+- If suggestedPhone is set and phone not yet collected, confirm using that number.
+- Keep replies conversational and natural. Never output JSON to the caller.
 `.trim();
 
 const AGENT_PROMPT = (process.env.AGENT_PROMPT || DEFAULT_AGENT_PROMPT);
+
+// ---------- Static FAQ text (clean, short) ----------
+const STATIC_FAQ = {
+  PRICES: "Haircut is $30. Beard trim is $15. Combo haircut and beard trim is $40.",
+  HOURS: "We’re open Monday through Friday, nine to five. We’re closed on weekends.",
+  SERVICES: "We offer haircuts, beard trims, and a combo of both.",
+  LOCATION: "We’re on Main Street in Ellicott City, next to the coffee shop."
+};
 
 // ---------- State ----------
 /** convoMap key = ws.id */
@@ -88,10 +120,12 @@ function newConvo(callSid, biz) {
     lastTTSAt: 0,
     forbidGreet: false,
     phase: 'idle',
-    lastAsk: 'NONE', // 'SERVICE' | 'TIME' | 'NAME' | 'PHONE' | 'CONFIRM' | 'NONE'
     callerPhone: '',
     asrText: '',
-    metrics: { ulawBytes: 0, pcmBytes: 0, batchesTx: 0 },
+    lastUserFinal: '',      // NEW: dedupe repeated ASR finals
+    lastAsk: 'NONE',        // NEW: track last asked slot
+    lastAskAt: 0,           // NEW: cooldown on repeating same ask
+    // slots
     slots: {
       service: '',
       startISO: '',
@@ -104,32 +138,27 @@ function newConvo(callSid, biz) {
 }
 
 // ---------- μ-law → PCM16LE (8k mono) ----------
-let MU_LAW_LUT = null;
-function buildMuLawLUT() {
-  const lut = new Int16Array(256);
-  for (let i = 0; i < 256; i++) {
-    let u = ~i & 0xff;
-    const sign = u & 0x80;
-    const exponent = (u >> 4) & 0x07;
-    const mantissa = u & 0x0f;
-    let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
-    if (sign) sample = -sample;
-    if (sample > 32767) sample = 32767;
-    else if (sample < -32768) sample = -32768;
-    lut[i] = sample;
-  }
-  return lut;
+function ulawByteToPcm16(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
+  if (sign) sample = -sample;
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+  return sample;
 }
 function ulawBufferToPCM16LEBuffer(ulawBuf) {
-  if (!MU_LAW_LUT) MU_LAW_LUT = buildMuLawLUT();
-  const out = Buffer.allocUnsafe(ulawBuf.length * 2);
+  const out = Buffer.alloc(ulawBuf.length * 2);
   for (let i = 0; i < ulawBuf.length; i++) {
-    out.writeInt16LE(MU_LAW_LUT[ulawBuf[i]], i * 2);
+    const s = ulawByteToPcm16(ulawBuf[i]);
+    out.writeInt16LE(s, i * 2);
   }
   return out;
 }
 
-// ---------- Deepgram realtime ----------
+// ---------- Deepgram realtime (URL-config) ----------
 function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessage }) {
   const url =
     'wss://api.deepgram.com/v1/listen'
@@ -171,7 +200,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   });
 
   dg.on('error', (e) => onError?.(e));
-  dg.on('close', (c, r) => log('[Deepgram] closed', c, (r || '').toString?.() || ''));
+  dg.on('close', (c, r) => log('[INFO] - [Deepgram] closed', c, (r||'').toString?.() || ''));
 
   return {
     sendPCM16LE(buf) { if (open) dg.send(buf); else q.push(buf); },
@@ -179,7 +208,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   };
 }
 
-// ---------- Utils: capture + time parsing ----------
+// ---------- Utilities ----------
 function normalizeService(text) {
   if (!text) return '';
   const t = text.toLowerCase();
@@ -188,47 +217,6 @@ function normalizeService(text) {
   if (/\bhair\s*cut|\bhaircut\b/.test(t)) return 'haircut';
   return '';
 }
-
-// very small helper for American-style “Friday at 1 PM”, “tomorrow 3”, “1:30 pm Friday”
-const WEEKDAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
-function nextWeekdayIndex(fromIdx, targetIdx) {
-  let diff = targetIdx - fromIdx;
-  if (diff <= 0) diff += 7;
-  return diff;
-}
-function parseDayTimeToISO(utterance) {
-  if (!utterance) return '';
-  const txt = utterance.toLowerCase().trim();
-
-  // quick “tomorrow” or “today” checks
-  const now = new Date();
-  let base = new Date(now);
-  if (/\btomorrow\b/.test(txt)) base = new Date(now.getTime() + 24*60*60*1000);
-
-  // weekday detection
-  let target = new Date(base);
-  const wd = WEEKDAYS.findIndex(d => txt.includes(d));
-  if (wd >= 0) {
-    const fromIdx = base.getDay();
-    const addDays = nextWeekdayIndex(fromIdx, wd);
-    target = new Date(base.getFullYear(), base.getMonth(), base.getDate() + addDays);
-  }
-
-  // time: “1 pm”, “1:30 pm”, “13:00”, “1pm”
-  const m = txt.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-  if (!m) return '';
-  let hh = parseInt(m[1], 10);
-  let mm = parseInt(m[2] || '0', 10);
-  const ap = (m[3] || '').toLowerCase();
-  if (ap === 'pm' && hh < 12) hh += 12;
-  if (ap === 'am' && hh === 12) hh = 0;
-  if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-    target.setHours(hh, mm, 0, 0);
-    return target.toISOString();
-  }
-  return '';
-}
-
 function computeEndISO(startISO) {
   try {
     if (!startISO) return '';
@@ -238,7 +226,6 @@ function computeEndISO(startISO) {
     return end.toISOString();
   } catch { return ''; }
 }
-
 function isReadyToCreate(slots) {
   return Boolean(
     slots.service &&
@@ -248,12 +235,10 @@ function isReadyToCreate(slots) {
     (slots.phone || '').trim()
   );
 }
-
 function safeJSON(val, fallback = {}) {
   try { return JSON.parse(val); } catch { return fallback; }
 }
-
-function debounceRepeat(convo, text, ms = 2000) {
+function debounceRepeat(convo, text, ms = 2500) {
   const now = Date.now();
   if (!text) return false;
   if (text === convo.lastTTS && (now - convo.lastTTSAt) < ms) return true;
@@ -262,27 +247,30 @@ function debounceRepeat(convo, text, ms = 2000) {
   return false;
 }
 
-// Small captures
+// Liberal name capture
 function captureNameMaybe(utterance) {
-  // if user says just “Nate” or “It’s Nate”
   if (!utterance) return '';
   const t = utterance.trim();
-  if (/^\s*(it'?s|this is)\s+([A-Za-z][A-Za-z\-']{1,30})\s*$/i.test(t)) {
-    return t.replace(/^\s*(it'?s|this is)\s+/i, '').trim();
+
+  // “my name is …”, “this is …”, “it's …”, “I'm …”
+  const pat = /\b(?:my name is|this is|it'?s|i am|i'm)\s+([A-Za-z][A-Za-z\-']{1,30})(?:\s+([A-Za-z][A-Za-z\-']{1,30}))?/i;
+  const m = t.match(pat);
+  if (m) return (m[1] + (m[2] ? ' ' + m[2] : '')).trim();
+
+  // Bare (one or two words) if not day/time noise
+  if (/^[A-Za-z][A-Za-z\-']{1,30}(?:\s+[A-Za-z][A-Za-z\-']{1,30})?\s*$/.test(t)) {
+    const bad = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|am|pm)\b/i;
+    if (!bad.test(t)) return t;
   }
-  if (/^[A-Za-z][A-Za-z\-']{1,30}\s*$/.test(t)) return t.trim();
-  return '';
-}
-function capturePhoneMaybe(utterance) {
-  if (!utterance) return '';
-  const digits = utterance.replace(/[^\d]/g, '');
-  // accept 10 or 11 (leading 1)
-  if (digits.length === 10) return digits;
-  if (digits.length === 11 && digits.startsWith('1')) return digits.slice(1);
+
+  // “first name … Zack”
+  const m2 = t.match(/\bfirst name\b.*?\b([A-Z][a-zA-Z\-']{1,30})\b/);
+  if (m2) return m2[1];
+
   return '';
 }
 
-// ---------- OpenAI (for FAQ intent + natural lines) ----------
+// ---------- OpenAI (extract) ----------
 async function openAIExtract(utterance, convo) {
   const sys = [
     `Return a strict JSON object with fields:
@@ -301,15 +289,20 @@ async function openAIExtract(utterance, convo) {
 }
 
 Rules:
-- Classify FAQ only if caller ASKED about hours/prices/services/location.
-- If caller asks to book, set intent="CREATE". Don’t ask for NAME/PHONE until after time is set.
-- Keep reply short; single sentence; <= ~22 words; one question max.
-- Never repeat a question that was just asked (the app controls that).
+- If caller asks about prices/hours/services/location, set intent="FAQ" and faq_topic accordingly. Provide a short reply.
+- If caller asks to book, set intent="CREATE". Do not set "ask" to NAME/PHONE until availability is confirmed.
+- Recognize “both/combo/haircut + beard” as service = "combo".
+- If user gives a specific day/time, fill Start_Time (ISO if obvious; else leave empty).
+- Keep reply short; conversational; single sentence; <= ~22 words; one question max.
+- If forbidGreet=true, do not greet in reply.
+- If suggestedPhone present and phone not yet collected, propose confirming that number with a short yes/no question.
 `,
     `Context:
 phase=${convo.phase}
+forbidGreet=${convo.forbidGreet}
 service=${convo.slots.service}
 startISO=${convo.slots.startISO}
+endISO=${convo.slots.endISO}
 name=${convo.slots.name}
 phone=${convo.slots.phone}
 callerPhone=${convo.callerPhone}
@@ -354,17 +347,46 @@ ${AGENT_PROMPT}`
   return parsed;
 }
 
-async function openAINLG(convo, hint = '') {
+function ensureReplyOrAsk(parsed, utterance, phase) {
+  const svcU = normalizeService(utterance);
+  if (svcU && !parsed.service && !parsed.Event_Name) {
+    parsed.service = svcU;
+    parsed.Event_Name = svcU;
+  }
+  if (parsed.reply && parsed.reply.trim()) return parsed;
+
+  if ((parsed.intent === 'CREATE' || phase === 'collect_time')) {
+    const svc = parsed.service || normalizeService(parsed.Event_Name) || svcU;
+    if (svc && phase !== 'confirm_booking') {
+      parsed.reply = `Got it—${svc}. What date and time work for you?`;
+      parsed.ask = 'TIME';
+      return parsed;
+    }
+  }
+  if (parsed.intent === 'FAQ' && parsed.faq_topic) {
+    parsed.reply = 'We’re set; anything else I can answer?';
+    parsed.ask = 'NONE';
+    return parsed;
+  }
+  parsed.reply = 'Got it. How can I help further?';
+  parsed.ask = 'NONE';
+  return parsed;
+}
+
+// ---------- NLG ----------
+async function openAINLG(convo, promptHints = '') {
   const sys = `
 You are a warm front-desk receptionist.
 Write ONE short, conversational sentence next.
-Use contractions and micro-acks. One question max. <22 words.
-No greetings if forbidGreet=true. Avoid repeating.
+Use contractions and micro-acks. Ask only ONE question next (if any).
+No greetings if forbidGreet=true. Avoid repeating the same wording.
+Keep < 22 words. Keep it natural and specific to the current state.
 `.trim();
 
   const ctx = `
 State:
 phase=${convo.phase}
+forbidGreet=${convo.forbidGreet}
 service=${convo.slots.service}
 startISO=${convo.slots.startISO}
 endISO=${convo.slots.endISO}
@@ -377,7 +399,7 @@ ${AGENT_PROMPT}
 
   const user = `
 Compose the next thing to say to the caller.
-${hint ? 'Hint: ' + hint : ''}
+${promptHints ? 'Hint: ' + promptHints : ''}
 `.trim();
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -403,20 +425,32 @@ ${hint ? 'Hint: ' + hint : ''}
     throw new Error(`OpenAI nlg error ${resp.status}: ${txt}`);
   }
   const data = await resp.json();
-  return (data.choices?.[0]?.message?.content || 'Okay.').trim();
+  const text = (data.choices?.[0]?.message?.content || '').trim();
+  return text || 'Okay.';
 }
 
-// ---------- TTS ----------
-async function ttsToTwilio(ws, text, voiceId = ELEVEN_VOICE_ID) {
+// ---------- TTS (ElevenLabs) -> Twilio WS media frames ----------
+async function ttsToTwilio(ws, text, voiceId = 'pNInz6obpgDQGcFmaJgB') {
   if (!text) return;
+
   const convo = ws.__convo;
-  if (debounceRepeat(convo, text)) return;
+  if (debounceRepeat(convo, text)) {
+    log('[DEBUG] - [debounce] suppress repeat:', text);
+    return;
+  }
 
   const streamSid = ws.__streamSid;
-  if (!streamSid) { log('[TTS] missing streamSid'); return; }
-  if (!ELEVENLABS_API_KEY) { log('[TTS] ELEVEN_API_KEY missing; skipping'); return; }
+  if (!streamSid) {
+    log('[WARN] - [TTS] missing streamSid; cannot send audio');
+    return;
+  }
+  if (!ELEVENLABS_API_KEY) {
+    log('[WARN] - [TTS] ELEVEN_API_KEY missing; skipping audio');
+    return;
+  }
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+
   const resp = await fetch(url, {
     method: 'POST',
     agent: keepAliveHttpsAgent,
@@ -432,129 +466,140 @@ async function ttsToTwilio(ws, text, voiceId = ELEVEN_VOICE_ID) {
     })
   });
 
-  if (!resp.ok) { log('[TTS] HTTP', resp.status, await resp.text().catch(()=>'')); return; }
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => '');
+    log('[ERROR] - [TTS] HTTP error', resp.status, t);
+    return;
+  }
 
   const reader = resp.body.getReader();
+  let total = 0;
+  log('[INFO] - [TTS ->]', text);
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
+    total += value.length;
     const b64 = Buffer.from(value).toString('base64');
     safeSend(ws, JSON.stringify({ event: 'media', streamSid, media: { payload: b64 } }));
   }
+
   safeSend(ws, JSON.stringify({ event: 'mark', streamSid, mark: { name: 'eos' } }));
+  log('[INFO] - [TTS] end bytes:', total);
 }
 
-// ---------- Orchestration ----------
-function safeSend(ws, data) { try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch {} }
-function twilioSay(ws, text) { log('[SAY]', text); return ttsToTwilio(ws, text); }
+// ---------- ASR final hook (dedupe) ----------
+function handleASRFinal(ws, text) {
+  const convo = ws.__convo;
+  if (!convo) return;
+  const norm = (text || '').trim();
+  if (!norm) return;
+  if (norm === convo.lastUserFinal) return; // dedupe repeated finals
+  convo.lastUserFinal = norm;
 
-function decideNext(convo) {
-  // Never re-ask the same thing twice consecutively
-  const avoid = (q) => (convo.lastAsk === q ? 'NONE' : q);
-
-  if (!convo.slots.service) return avoid('SERVICE');
-  if (!convo.slots.startISO) return avoid('TIME');
-  if (!convo.slots.name) return avoid('NAME');
-  if (!convo.slots.phone && !convo.callerPhone) return avoid('PHONE');
-  return 'CONFIRM';
+  log('[INFO] - [ASR final]', norm);
+  convo.asrText = norm;
+  onUserUtterance(ws, norm).catch(err => log('[ERROR] - [onUserUtterance]', err.message));
 }
 
+// ---------- Twilio helpers ----------
+function safeSend(ws, data) {
+  try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch {}
+}
+function twilioSay(ws, text) { return ttsToTwilio(ws, text); }
+
+// ---------- Flow Orchestration ----------
 async function onUserUtterance(ws, utterance) {
   const convo = ws.__convo;
   if (!convo) return;
 
-  // 1) Deterministic captures
-  // service
-  if (!convo.slots.service) {
-    const svc = normalizeService(utterance);
-    if (svc) convo.slots.service = svc;
-  }
-  // time
-  if (!convo.slots.startISO) {
-    const iso = parseDayTimeToISO(utterance);
-    if (iso) {
-      convo.slots.startISO = iso;
-      convo.slots.endISO = computeEndISO(iso);
-    }
-  }
-  // name / phone (only if we’re in contact phase or just asked for it)
-  if (!convo.slots.name && (convo.lastAsk === 'NAME' || convo.phase === 'collect_contact')) {
-    const n = captureNameMaybe(utterance);
-    if (n) convo.slots.name = n;
-  }
-  if (!convo.slots.phone && (convo.lastAsk === 'PHONE' || convo.phase === 'collect_contact')) {
-    const p = capturePhoneMaybe(utterance);
-    if (p) convo.slots.phone = p;
-  }
-
-  // 2) OpenAI for FAQ-only classification (don’t let it drive slots)
   let parsed = {};
   try {
     parsed = await openAIExtract(utterance, convo);
   } catch (e) {
-    parsed = { intent: 'UNKNOWN', faq_topic: '', ask: 'NONE', reply: '' };
+    log('[ERROR] - [OpenAI extract]', e.message);
+    parsed = { intent: 'UNKNOWN', ask: 'NONE', reply: '' };
   }
 
-  // Log FAQ
-  if (parsed.intent === 'FAQ' && parsed.faq_topic) {
-    postToMakeFAQ(parsed.faq_topic).catch(()=>{});
+  parsed = ensureReplyOrAsk(parsed, utterance, convo.phase);
+
+  // Merge slots
+  if (parsed.service || parsed.Event_Name) {
+    const svc = parsed.service || normalizeService(parsed.Event_Name);
+    if (svc) convo.slots.service = svc;
+  }
+  if (parsed.Start_Time) convo.slots.startISO = parsed.Start_Time;
+  if (!convo.slots.endISO && parsed.End_Time) convo.slots.endISO = parsed.End_Time;
+  if (!convo.slots.endISO && convo.slots.startISO) {
+    convo.slots.endISO = computeEndISO(convo.slots.startISO);
+  }
+  if (parsed.Customer_Name) convo.slots.name = parsed.Customer_Name;
+  if (parsed.Customer_Phone) convo.slots.phone = parsed.Customer_Phone;
+  if (parsed.Customer_Email) convo.slots.email = parsed.Customer_Email;
+
+  // Opportunistic name capture once we’re in contact phase or we already have service+time
+  if (!convo.slots.name && (parsed.ask === 'NAME' || convo.phase === 'collect_contact' || (convo.slots.service && convo.slots.startISO))) {
+    const maybeName = captureNameMaybe(utterance);
+    if (maybeName) convo.slots.name = maybeName;
   }
 
-  // 3) Phase machine
-  let next = decideNext(convo);
-  if (next === 'NONE') {
-    // If we just asked for something, and user didn't provide it, pivot wording with NLG
-    next = convo.lastAsk || 'SERVICE';
+  // Phase
+  const ask = parsed.ask || 'NONE';
+  if (parsed.intent === 'FAQ') {
+    convo.phase = 'faq';
+  } else if (parsed.intent === 'CREATE') {
+    if (!convo.slots.service) convo.phase = 'collect_service';
+    else if (!convo.slots.startISO) convo.phase = 'collect_time';
+    else if (!convo.slots.name || !(convo.slots.phone || convo.callerPhone)) convo.phase = 'collect_contact';
+    else convo.phase = 'confirm_booking';
   }
 
-  // Move phase
-  if (next === 'SERVICE') convo.phase = 'collect_service';
-  else if (next === 'TIME') convo.phase = 'collect_time';
-  else if (next === 'NAME' || next === 'PHONE') convo.phase = 'collect_contact';
-  else if (next === 'CONFIRM') convo.phase = 'confirm_booking';
+  // Log FAQ to Make (non-blocking)
+  if (parsed.intent === 'FAQ') postToMakeFAQ(parsed.faq_topic).catch(() => {});
 
-  // If ready, confirm and create
+  // Create if ready
   if (convo.phase === 'confirm_booking' && isReadyToCreate(convo.slots)) {
-    const humanTime = new Date(convo.slots.startISO).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
-    const confirmLine = await openAINLG(
-      { ...convo, forbidGreet: true },
-      `Confirm: ${convo.slots.service} at ${humanTime}. Name ${convo.slots.name}, phone ${convo.slots.phone || convo.callerPhone}. Then say you’ll book it now.`
-    );
-    await twilioSay(ws, confirmLine);
     await finalizeCreate(ws, convo);
     return;
   }
 
-  // Otherwise craft ONE short line depending on next
+  // Choose line to speak
   let line = '';
-  if (parsed.intent === 'FAQ' && parsed.reply) {
-    // Keep FAQ short and optionally nudge booking
-    line = parsed.reply;
-    if (convo.slots.service || /book|appointment|schedule/i.test(utterance)) {
-      line += ' Want to book something?';
-    }
-  } else {
-    if (next === 'SERVICE') {
-      line = await openAINLG({ ...convo, forbidGreet: true }, 'Ask which service they want: haircut, beard trim, or combo.');
-    } else if (next === 'TIME') {
-      const svc = convo.slots.service || 'that';
-      line = await openAINLG({ ...convo, forbidGreet: true }, `Ask for a date and time for ${svc}.`);
-    } else if (next === 'NAME') {
-      line = await openAINLG({ ...convo, forbidGreet: true }, 'Ask for their first name.');
-    } else if (next === 'PHONE') {
-      if (convo.callerPhone) {
-        line = await openAINLG({ ...convo, forbidGreet: true }, `Offer to use this phone number: ${convo.callerPhone}. Ask to confirm yes/no.`);
-      } else {
-        line = await openAINLG({ ...convo, forbidGreet: true }, 'Ask for a phone number to confirm the booking.');
+
+  // Clean static FAQ response if applicable
+  if (parsed.intent === 'FAQ' && parsed.faq_topic) {
+    const topic = String(parsed.faq_topic || '').toUpperCase();
+    if (STATIC_FAQ[topic]) {
+      line = STATIC_FAQ[topic];
+      if (topic === 'PRICES' || /book|appointment|schedule/i.test(utterance)) {
+        line += ' Would you like to book an appointment?';
       }
+    }
+  }
+
+  // Caller phone confirm if needed
+  if (!line) {
+    if (!convo.slots.phone && convo.callerPhone && (ask === 'PHONE' || convo.phase === 'collect_contact')) {
+      line = await openAINLG({ ...convo, forbidGreet: true }, `Confirm this phone number is okay to use: ${convo.callerPhone}`);
     } else {
-      line = await openAINLG({ ...convo, forbidGreet: true }, 'Acknowledge and ask one precise next question.');
+      line = (parsed.reply || '').trim();
+      if (!line) line = await openAINLG({ ...convo, forbidGreet: true });
+    }
+  }
+
+  // Gentle cooldown to avoid asking the same thing twice in a row immediately
+  const now = Date.now();
+  if (ask && ask !== 'NONE') {
+    if (ask === convo.lastAsk && (now - convo.lastAskAt) < 3000) {
+      // rephrase instead of verbatim repeat
+      line = await openAINLG({ ...convo, forbidGreet: true }, 'Prompt again without repeating the same words.');
+    } else {
+      convo.lastAsk = ask;
+      convo.lastAskAt = now;
     }
   }
 
   convo.turns += 1;
   convo.forbidGreet = true;
-  convo.lastAsk = next;
   await twilioSay(ws, line);
 }
 
@@ -583,21 +628,19 @@ async function finalizeCreate(ws, convo) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!r.ok) log('[Make CREATE] non-200', r.status, await r.text().catch(() => ''));
-    else log('[Make CREATE] ok');
+    if (!r.ok) log('[WARN] - [Make CREATE] non-200', r.status, await r.text().catch(() => ''));
+    else log('[INFO] - [Make CREATE] ok');
   } catch (e) {
-    log('[Make CREATE] error', e.message);
+    log('[ERROR] - [Make CREATE]', e.message);
   }
 
-  const humanTime = new Date(convo.slots.startISO).toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'short' });
-  const done = await openAINLG(
+  const confirmLine = await openAINLG(
     { ...convo, forbidGreet: true, phase: 'done' },
-    `Say the ${convo.slots.service} on ${humanTime} is confirmed under ${convo.slots.name}. Thank them and say goodbye.`
+    `Confirm booking with details and say goodbye. Service=${convo.slots.service}, start=${convo.slots.startISO}`
   );
-  await twilioSay(ws, done);
+  await twilioSay(ws, confirmLine);
 }
 
-// ---------- Make (FAQ) ----------
 async function postToMakeFAQ(topic) {
   try {
     await fetch(MAKE_FAQ_URL, {
@@ -616,17 +659,18 @@ wss.on('connection', (ws, req) => {
   const id = randomUUID();
   ws.__id = id;
 
+  // Deepgram pipe state
   let dg = null;
   let dgOpened = false;
   let frameCount = 0;
-  const BATCH_FRAMES = 5; // ~100ms
+  const BATCH_FRAMES = 5;     // 5 * 20ms = ~100ms batches
   let pendingULaw = [];
 
-  ws.on('error', (err) => log('[ERR] WS error', err.message));
+  ws.on('error', (err) => log('[ERROR] - WS error', err.message));
   ws.on('close', () => {
     try { dg?.close(); } catch {}
     convoMap.delete(ws.__id);
-    log('[INFO] WS closed');
+    log('[INFO] - WS closed');
   });
 
   ws.on('message', async (raw) => {
@@ -640,54 +684,49 @@ wss.on('connection', (ws, req) => {
       const convo = newConvo(callSid, biz);
       ws.__convo = convo;
       ws.__streamSid = streamSid;
-      convo.callerPhone = (from || '').replace(/[^\d]/g, '').replace(/^1/, '') || '';
+      convo.callerPhone = from || '';
       convoMap.set(ws.__id, convo);
-      log('[INFO] WS CONNECTED | CallSid:', callSid, '| streamSid:', streamSid, '| biz:', biz);
-      log('[INFO] [agent] Using AGENT_PROMPT (first 120 chars):', (AGENT_PROMPT || '').slice(0, 120), '…');
+      log('[INFO] - WS CONNECTED | CallSid:', callSid, '| streamSid:', streamSid, '| biz:', biz);
+      log('[INFO] - [agent] Using AGENT_PROMPT (first 120 chars):', (AGENT_PROMPT || '').slice(0, 120), '…');
 
+      // Start Deepgram if key present
       if (DEEPGRAM_API_KEY) {
         dg = startDeepgramLinear16({
-          onOpen: () => { log('[INFO] [ASR] Deepgram open'); log('[INFO] [ASR] ready'); },
-          onPartial: () => { if (!dgOpened) { dgOpened = true; log('[INFO] [ASR] receiving transcripts'); } },
-          onFinal:   (t) => { if (!dgOpened) { dgOpened = true; log('[INFO] [ASR] receiving transcripts'); } handleASRFinal(ws, t); },
-          onError:   (e) => log('[ERR] [ASR] error', e?.message || e),
-          onAnyMessage: () => {}
+          onOpen: () => { dgOpened = true; log('[INFO] - [ASR] Deepgram open'); },
+          onPartial: (t) => { /* you can log partials if needed */ },
+          onFinal:   (t) => handleASRFinal(ws, t),
+          onError:   (e) => log('[ERROR] - [Deepgram]', e?.message || e),
+          onAnyMessage: (ev) => { if (ev.type && ev.type !== 'Results') log('[DEBUG] - [Deepgram msg]', ev.type); }
         });
-        setTimeout(() => { if (!dgOpened) log('[WARN] Deepgram connected but no transcripts yet'); }, 4000);
+        setTimeout(() => {
+          if (!dgOpened) log('[WARN] - (!) Deepgram connected but no transcripts yet');
+        }, 4000);
       } else {
-        log('[WARN] No DEEPGRAM_API_KEY — ASR disabled');
+        log('[WARN] - No DEEPGRAM_API_KEY — ASR disabled');
       }
 
       // Greeting
-      const greet = 'Hi, thanks for calling Old Line Barbershop. How can I help you today?';
       ws.__convo.turns = 0;
       ws.__convo.forbidGreet = false;
-      log('[SAY]', greet);
-      twilioSay(ws, greet).catch(()=>{});
+      twilioSay(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?').catch(() => {});
       return;
     }
 
     if (evt === 'media') {
       frameCount++;
-      if (frameCount % 50 === 1) log('[DEBUG] [media] frames:', frameCount);
+      if (frameCount % 50 === 1) log('[DEBUG] - [media] frames:', frameCount);
       const b64 = msg.media?.payload || '';
       if (!b64) return;
 
+      // Collect μ-law frames and batch to ~100ms
       if (dg) {
         const ulaw = Buffer.from(b64, 'base64');
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH_FRAMES) {
           const ulawChunk = Buffer.concat(pendingULaw);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          try { dg.sendPCM16LE(pcm16le); } catch (e) { log('[ERROR] - [media→DG] send:', e?.message || e); }
           pendingULaw = [];
-          try {
-            const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-            ws.__convo.metrics.pcmBytes += pcm16le.length;
-            ws.__convo.metrics.ulawBytes += ulawChunk.length;
-            ws.__convo.metrics.batchesTx++;
-            dg.sendPCM16LE(pcm16le);
-          } catch (e) {
-            log('[WARN] [media→DG] μ-law decode/send failed:', e.message);
-          }
         }
       }
       return;
@@ -696,15 +735,14 @@ wss.on('connection', (ws, req) => {
     if (evt === 'mark') return;
 
     if (evt === 'stop') {
-      log('[INFO] Twilio stream STOP');
+      log('[INFO] - Twilio stream STOP');
+      // flush any remaining audio to DG
       if (pendingULaw.length && dg) {
         try {
           const ulawChunk = Buffer.concat(pendingULaw);
           const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
           dg.sendPCM16LE(pcm16le);
-        } catch (e) {
-          log('[WARN] [media→DG] final flush failed:', e.message);
-        }
+        } catch {}
         pendingULaw = [];
       }
       try { dg?.close(); } catch {}
@@ -712,6 +750,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // Optional synthetic "asr" event passthrough (if your infra pipes DG back)
     if (evt === 'asr') {
       const final = msg?.text || '';
       if (final) handleASRFinal(ws, final);
@@ -720,16 +759,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ---------- ASR final hook ----------
-function handleASRFinal(ws, text) {
-  const convo = ws.__convo;
-  if (!convo) return;
-  log('[ASR final]', text);
-  convo.asrText = text;
-  onUserUtterance(ws, text).catch(err => log('[onUserUtterance] error', err.message));
-}
-
 // ---------- Start server ----------
 server.listen(PORT, () => {
-  log('Server running on', PORT);
+  log('[INFO] - Server running on', PORT);
 });
