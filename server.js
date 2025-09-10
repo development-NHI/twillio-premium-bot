@@ -7,10 +7,10 @@
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
  *  ELEVEN_API_KEY
- *  ELEVEN_VOICE_ID            (optional; default below)
- *  MAKE_CREATE                (Create webhook)
- *  MAKE_READ                  (FAQ log webhook)
- *  AGENT_PROMPT               (optional)
+ *  ELEVEN_VOICE_ID
+ *  MAKE_CREATE
+ *  MAKE_READ
+ *  AGENT_PROMPT
  */
 
 'use strict';
@@ -21,7 +21,11 @@ const WebSocket = require('ws');
 const { URL } = require('url');
 const { randomUUID } = require('crypto');
 const https = require('https');
-const fetch = require('node-fetch'); // node-fetch@2, CommonJS compatible
+
+// ---------- fetch (fix) ----------
+const fetch = (typeof global.fetch === 'function')
+  ? global.fetch
+  : (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 // ---------- Config / Globals ----------
 const PORT              = process.env.PORT || 10000;
@@ -39,9 +43,15 @@ const log = (lvl, msg, meta={}) => {
 };
 
 // quick env sanity
-if (!OPENAI_API_KEY)   log('WARN', 'OPENAI_API_KEY missing');
-if (!DEEPGRAM_API_KEY) log('WARN', 'DEEPGRAM_API_KEY missing (no ASR)');
-if (!ELEVEN_API_KEY)   log('WARN', 'ELEVEN_API_KEY missing (no TTS)');
+log('INFO', 'Startup env', {
+  hasOpenAI: !!OPENAI_API_KEY,
+  hasDG: !!DEEPGRAM_API_KEY,
+  hasEleven: !!ELEVEN_API_KEY,
+  hasMakeCreate: !!MAKE_CREATE_URL,
+  hasMakeRead: !!MAKE_FAQ_URL,
+  node: process.version,
+  fetchSource: (typeof global.fetch === 'function') ? 'global' : 'node-fetch(dynamic)'
+});
 
 // ---------- HTTP (health) ----------
 const app = express();
@@ -114,7 +124,7 @@ function startDeepgramLinear16({ onOpen, onPartial, onFinal, onError, onAnyMessa
   const url = 'wss://api.deepgram.com/v1/listen'
     + '?encoding=linear16&sample_rate=8000&channels=1'
     + '&model=nova-2-phonecall&interim_results=true&smart_format=true&language=en-US&endpointing=250';
-  const dg = new WebSocket(url, { headers: { Authorization: `token ${DEEPGRAM_API_KEY}` }, perMessageDeflate: false });
+  const dg = new WebSocket(url, { headers: { Authorization: `token ${process.env.DEEPGRAM_API_KEY}` }, perMessageDeflate: false });
   let open = false; const q = [];
   dg.on('open', () => { open = true; log('INFO','[ASR] Deepgram open'); onOpen?.(); while (q.length) dg.send(q.shift()); });
   dg.on('message', (data)=>{
@@ -157,17 +167,23 @@ ${AGENT_PROMPT}`
   ].join('\n\n');
 
   log('DEBUG','[OpenAI extract ->]', { sysFirst120: sys.slice(0,120) + '…', utterance });
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    agent: keepAliveHttpsAgent,
-    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.15,
-      messages: [{ role:'system', content: sys }, { role:'user', content:`Caller: ${utterance}` }],
-      response_format: { type:'json_object' }
-    })
-  });
+  let resp;
+  try {
+    resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      agent: keepAliveHttpsAgent,
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.15,
+        messages: [{ role:'system', content: sys }, { role:'user', content:`Caller: ${utterance}` }],
+        response_format: { type:'json_object' }
+      })
+    });
+  } catch (e) {
+    log('ERROR','[OpenAI extract fetch]', { error: e.message });
+    return { intent:'UNKNOWN', ask:'NONE', reply:'' };
+  }
   if (!resp.ok) {
     const t = await resp.text().catch(()=> '');
     log('ERROR','[OpenAI extract HTTP]', { status: resp.status, body: t });
@@ -194,20 +210,26 @@ callerPhone=${convo.callerPhone}
 AGENT PROMPT:
 ${AGENT_PROMPT}`.trim();
 
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    agent: keepAliveHttpsAgent,
-    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.25,
-      messages: [
-        { role:'system', content: sys },
-        { role:'system', content: ctx },
-        { role:'user', content: `Compose the next sentence. ${hint?('Hint: '+hint):''}` }
-      ]
-    })
-  });
+  let resp;
+  try {
+    resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      agent: keepAliveHttpsAgent,
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.25,
+        messages: [
+          { role:'system', content: sys },
+          { role:'system', content: ctx },
+          { role:'user', content: `Compose the next sentence. ${hint?('Hint: '+hint):''}` }
+        ]
+      })
+    });
+  } catch (e) {
+    log('ERROR','[OpenAI NLG fetch]', { error: e.message });
+    return 'Okay.';
+  }
   if (!resp.ok) {
     const t = await resp.text().catch(()=> '');
     log('ERROR','[OpenAI NLG HTTP]', { status: resp.status, body: t });
@@ -222,7 +244,6 @@ ${AGENT_PROMPT}`.trim();
 // ---------- TTS (ElevenLabs -> Twilio) ----------
 async function ttsToTwilio(ws, text, voiceId = ELEVEN_VOICE_ID) {
   if (!text) return;
-  const convo = ws.__convo || {};
   const streamSid = ws.__streamSid;
   if (!ELEVEN_API_KEY || !streamSid) {
     log('WARN','[TTS] missing ELEVEN_API_KEY or streamSid', { hasKey: !!ELEVEN_API_KEY, streamSid });
@@ -270,6 +291,7 @@ async function ttsToTwilio(ws, text, voiceId = ELEVEN_VOICE_ID) {
 function safeSend(ws, data) { try { if (ws.readyState === WebSocket.OPEN) ws.send(data); } catch (e) { log('ERROR','[WS send]', { error: e.message }); } }
 
 // ---------- Orchestration ----------
+const REQUIRED_ORDER = ['service', 'startISO', 'name', 'phone']; // re-define to be safe in this scope (if hoisted earlier)
 function ensureReplyOrAsk(parsed, utterance, phase) {
   if (parsed.reply && parsed.reply.trim()) return parsed;
   const svcU = normalizeService(utterance);
@@ -299,7 +321,6 @@ async function onUserUtterance(ws, utterance) {
 
   parsed = ensureReplyOrAsk(parsed, raw, convo.phase);
 
-  // merge slots
   const svc = parsed.service || normalizeService(parsed.Event_Name) || normalizeService(raw);
   if (svc) setSlot(convo, 'service', svc);
 
@@ -309,7 +330,6 @@ async function onUserUtterance(ws, utterance) {
 
   if (parsed.Customer_Name) setSlot(convo, 'name', parsed.Customer_Name);
 
-  // phone: digits or “this number”
   if (parsed.Customer_Phone) setSlot(convo, 'phone', digitsOnly(parsed.Customer_Phone));
   if (!convo.slots.phone && /\b(this number|same number|use my number)\b/i.test(raw) && convo.callerPhone) {
     setSlot(convo, 'phone', digitsOnly(convo.callerPhone).slice(-10));
@@ -317,8 +337,7 @@ async function onUserUtterance(ws, utterance) {
 
   if (parsed.Customer_Email) setSlot(convo, 'email', parsed.Customer_Email);
 
-  // phase advancement
-  const missing = nextMissing(convo.slots);
+  const missing = (() => { for (const k of REQUIRED_ORDER) if (!convo.slots[k]) return k; return ''; })();
   if (parsed.intent === 'FAQ') {
     convo.phase = 'faq';
   } else {
@@ -330,13 +349,11 @@ async function onUserUtterance(ws, utterance) {
   }
   log('DEBUG','[phase]', { phase: convo.phase, missing });
 
-  // finalize?
   if (convo.phase === 'confirm_booking' && convo.slots.service && convo.slots.startISO && (convo.slots.name) && (convo.slots.phone)) {
     await finalizeCreate(ws, convo);
     return;
   }
 
-  // craft next line
   let line = (parsed.reply || '').trim();
   if (!line) {
     if (missing === 'service')       line = 'What service would you like — a haircut, beard trim, or the combo?';
@@ -436,7 +453,6 @@ wss.on('connection', (ws, req) => {
         log('WARN','No DEEPGRAM_API_KEY — ASR disabled');
       }
 
-      // Greet
       if (ELEVEN_API_KEY) {
         await ttsToTwilio(ws, 'Hi, thanks for calling Old Line Barbershop. How can I help you today?');
       } else {
@@ -475,7 +491,6 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // Optional: if your infra forwards ASR as synthetic messages
     if (evt === 'asr') {
       const t = msg?.text || '';
       if (t) { log('INFO','[ASR final*]', { t }); onUserUtterance(ws, t).catch(e=>log('ERROR','[onUserUtterance*]',{error:e.message})); }
