@@ -1,5 +1,5 @@
 /**
- * server.js — Old Line Barbershop voice agent (FINAL, patched)
+ * server.js — Old Line Barbershop voice agent (FINAL + patches)
  * - Twilio Media Streams WS
  * - Deepgram ASR (URL-config WS; μ-law → PCM16LE @ 8kHz)
  * - OpenAI for extraction + NLG (JSON contract)
@@ -10,10 +10,10 @@
  *  PORT
  *  OPENAI_API_KEY
  *  DEEPGRAM_API_KEY
- *  ELEVENLABS_API_KEY
- *  ELEVENLABS_VOICE_ID (optional; defaults to Adam)
- *  MAKE_CREATE_URL
- *  MAKE_FAQ_URL
+ *  ELEVENLABS_API_KEY (or ELEVEN_API_KEY)
+ *  ELEVENLABS_VOICE_ID (or ELEVEN_VOICE_ID; optional; defaults to Adam server-side)
+ *  MAKE_CREATE_URL (or MAKE_CREATE)
+ *  MAKE_FAQ_URL (or MAKE_READ)
  *  AGENT_PROMPT (optional)
  */
 
@@ -30,10 +30,11 @@ const https = require('https');
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || '';
-const ELEVENLABS_API_KEY = process.env.ELEVEN_API_KEY || '';
-const ELEVENLABS_VOICE_ID = process.env.ELEVEN_VOICE_ID || 'Adam';
-const MAKE_CREATE_URL = process.env.MAKE_CREATE || '';
-const MAKE_FAQ_URL = process.env.MAKE_READ || '';
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVEN_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || process.env.ELEVEN_VOICE_ID || '';
+// NEW: accept both new and old env names for Make hooks
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || process.env.MAKE_CREATE || '';
+const MAKE_FAQ_URL    = process.env.MAKE_FAQ_URL    || process.env.MAKE_READ   || '';
 
 // keep-alive agents
 const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
@@ -55,7 +56,7 @@ log('INFO', 'Startup env', {
   hasDG: !!DEEPGRAM_API_KEY,
   hasEleven: !!ELEVENLABS_API_KEY,
   hasMakeCreate: !!MAKE_CREATE_URL,
-  hasMakeFAQ: !!MAKE_FAQ_URL,
+  hasMakeRead: !!MAKE_FAQ_URL,
   node: process.version,
   fetchSource: 'global'
 });
@@ -228,8 +229,8 @@ function normalizeService(text) {
   if (!text) return '';
   const t = text.toLowerCase();
   if (/\b(both|combo|combo package|haircut\s*(?:&|and|\+)\s*beard|haircut\s*\+\s*beard)\b/.test(t)) return 'combo';
-  if (/\bbeard(?:\s*trim)?\b/.test(t)) return 'beard trim';
-  if (/\bhair\s*cut\b|\bhaircut\b/.test(t)) return 'haircut';
+  if (/\bbeard( trim|)\b/.test(t)) return 'beard trim';
+  if (/\bhair\s*cut|\bhaircut\b/.test(t)) return 'haircut';
   return '';
 }
 function computeEndISO(startISO) {
@@ -262,13 +263,13 @@ function makeQuestionForAsk(ask, convo) {
   if (ask === 'PHONE') return 'What phone number should I use for confirmations?';
   return 'How can I help further?';
 }
+// PATCH: gentler time guardrail (only bump if >30 days in past)
 function normalizeFutureStart(iso) {
   if (!iso) return '';
   const dt = new Date(iso);
   if (isNaN(+dt)) return iso;
   const now = new Date();
-  if (dt.getTime() < now.getTime()) {
-    // bump to a similar time in the near future (2–14 days)
+  if ((now - dt) > 30*24*3600*1000) {
     const bumped = new Date(now.getTime() + 7 * 24 * 3600 * 1000);
     bumped.setHours(dt.getHours(), dt.getMinutes(), 0, 0);
     log('WARN', '[time guardrail] bumped parsed Start_Time to future', { from: iso, to: bumped.toISOString() });
@@ -348,6 +349,23 @@ function setSlot(convo, k, v) {
   if (k === 'name' && convo.awaitingAsk === 'NAME')      convo.awaitingAsk = 'PHONE';
   if (k === 'phone' && convo.awaitingAsk === 'PHONE')    convo.awaitingAsk = 'NONE';
   log('DEBUG', '[awaitingAsk set]', { awaitingAsk: convo.awaitingAsk });
+}
+
+// -------- PATCH: contact fallbacks (NAME/PHONE) --------
+function normalizeName(s='') {
+  const cleaned = s.replace(/[^A-Za-z' -]/g, ' ').trim();
+  if (!cleaned) return '';
+  const first = cleaned.split(/\s+/)[0];
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+function extractPhoneDigits(s='') {
+  return (s.match(/\d/g) || []).join('');
+}
+function formatUSPhone(digits) {
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  if (digits.length >= 12 && !digits.startsWith('0')) return `+${digits}`; // crude intl accept
+  return '';
 }
 
 // ---------------------- OpenAI (extract) ----------------------
@@ -482,16 +500,26 @@ function ensureReplyOrAsk(parsed, utterance, convo) {
   const inBooking = ['collect_service','collect_time','collect_contact','confirm_booking'].includes(convo.phase);
   const canCollect = parsed.intent === 'CREATE' || inBooking;
 
+  // PATCH: expand "have" to consider utterance fallbacks too
   const have = {
     service: (
       convo.slots.service ||
       parsed.service ||
       normalizeService(parsed.Event_Name) ||
-      normalizeService(utterance) // <-- consider raw utterance like "The combo."
+      normalizeService(utterance)
     ),
     startISO: convo.slots.startISO || parsed.Start_Time,
-    name:     convo.slots.name     || parsed.Customer_Name,
-    phone:    convo.slots.phone    || parsed.Customer_Phone || convo.callerPhone
+    name: (
+      convo.slots.name ||
+      parsed.Customer_Name ||
+      normalizeName(utterance)
+    ),
+    phone: (
+      convo.slots.phone ||
+      parsed.Customer_Phone ||
+      (formatUSPhone(extractPhoneDigits(utterance)) || '') ||
+      convo.callerPhone
+    )
   };
 
   if (canCollect) {
@@ -598,23 +626,37 @@ async function onUserUtterance(ws, utterance) {
 
   log('INFO', '[USER]', { text: utterance });
 
-  // *** PATCH 1: If we're collecting service, infer it directly from this utterance ***
-  if ((convo.awaitingAsk === 'SERVICE' || convo.phase === 'collect_service') && !convo.slots.service) {
-    const svcDirect = normalizeService(utterance);
-    if (svcDirect) setSlot(convo, 'service', svcDirect); // will advance awaitingAsk -> TIME
+  // 0) PATCH: capture SERVICE/NAME/PHONE from raw speech when we're asking for them
+  if ((convo.awaitingAsk === 'SERVICE' || (convo.phase === 'collect_service' && !convo.slots.service))) {
+    const svcFromUtterance = normalizeService(utterance);
+    if (svcFromUtterance) setSlot(convo, 'service', svcFromUtterance);
+  }
+  if ((convo.awaitingAsk === 'NAME' || (convo.phase === 'collect_contact' && !convo.slots.name))) {
+    const maybeName = normalizeName(utterance);
+    if (maybeName && maybeName.length >= 2 && maybeName.length <= 30) {
+      setSlot(convo, 'name', maybeName); // advances NAME -> PHONE
+    }
+  }
+  if ((convo.awaitingAsk === 'PHONE' || (convo.phase === 'collect_contact' && convo.slots.name && !convo.slots.phone))) {
+    const digits = extractPhoneDigits(utterance);
+    const formatted = formatUSPhone(digits);
+    if (formatted) {
+      setSlot(convo, 'phone', formatted); // advances PHONE -> NONE
+    }
   }
 
   // 1) Extract semantics
   let parsed = await openAIExtract(utterance, convo);
 
   // 2) MERGE SLOTS FIRST (from parsed AND local parse)
-  // Service (also infer from utterance if model didn't set it)
+  // Service
   if (parsed.service || parsed.Event_Name) {
     const svc = parsed.service || normalizeService(parsed.Event_Name);
     if (svc) setSlot(convo, 'service', svc);
-  } else if (!convo.slots.service) {
-    const svcDirect = normalizeService(utterance);
-    if (svcDirect) setSlot(convo, 'service', svcDirect);
+  } else {
+    // also try the raw utterance for service
+    const svcFromUtterance = normalizeService(utterance);
+    if (svcFromUtterance) setSlot(convo, 'service', svcFromUtterance);
   }
 
   // Times
@@ -663,6 +705,15 @@ async function onUserUtterance(ws, utterance) {
   // 6) Decide what to say (AFTER merge)
   parsed = ensureReplyOrAsk(parsed, utterance, convo);
 
+  // PATCH: if we're on PHONE and they said digits but invalid length, nudge clearly
+  if (convo.awaitingAsk === 'PHONE' && !convo.slots.phone) {
+    const digits = extractPhoneDigits(utterance);
+    if (digits && !formatUSPhone(digits)) {
+      parsed.ask = 'PHONE';
+      parsed.reply = "Got it. What's the best 10-digit number for confirmations?";
+    }
+  }
+
   // Track awaitingAsk based on parsed.ask
   if (parsed.ask && parsed.ask !== 'NONE') {
     convo.awaitingAsk = parsed.ask;
@@ -684,12 +735,21 @@ async function finalizeCreate(ws, convo) {
     convo.slots.phone = convo.callerPhone;
   }
 
+  const safePhone = convo.slots.phone || convo.callerPhone || '';
+  if (!safePhone) {
+    // PATCH: do not crash—gracefully ask again
+    await twilioSay(ws, "I didn't catch a phone number. Could you repeat it with all ten digits?");
+    convo.awaitingAsk = 'PHONE';
+    convo.phase = 'collect_contact';
+    return;
+  }
+
   const payload = {
     Event_Name: convo.slots.service || 'Appointment',
     Start_Time: convo.slots.startISO || '',
     End_Time: convo.slots.endISO || computeEndISO(convo.slots.startISO || ''),
     Customer_Name: convo.slots.name || '',
-    Customer_Phone: convo.slots.phone || '',
+    Customer_Phone: safePhone,
     Customer_Email: convo.slots.email || '',
     Notes: `Booked by phone agent. CallSid=${convo.callSid || ''}`
   };
@@ -858,4 +918,3 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   log('INFO', 'Server running', { PORT: String(PORT) });
 });
-
