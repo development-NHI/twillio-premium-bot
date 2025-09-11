@@ -80,11 +80,21 @@ wss.on("connection", (ws) => {
         }
 
         if (jsonAction && jsonAction.action) {
-          console.log("➡️ Sending action to Make.com:", jsonAction);
-          await axios.post(process.env.MAKE_WEBHOOK, {
-            secret: process.env.MAKE_SECRET,
-            ...jsonAction,
-          });
+          console.log("➡️ Action detected:", jsonAction.action);
+
+          let url = null;
+          if (jsonAction.action === "create_booking") url = process.env.MAKE_CREATE;
+          else if (jsonAction.action === "cancel_booking") url = process.env.MAKE_DELETE;
+          else if (jsonAction.action === "reschedule_booking") url = process.env.MAKE_READ;
+          else url = process.env.MAKE_WEBHOOK; // fallback
+
+          if (url) {
+            await axios.post(url, {
+              secret: process.env.MAKE_SECRET,
+              ...jsonAction,
+            });
+            console.log(`📡 Sent to Make.com scenario: ${url}`);
+          }
         }
 
         const tts = await axios.post(
