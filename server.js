@@ -1,151 +1,127 @@
-// server.js — Tiny voice bot with ElevenLabs voice (no websockets)
-// Env: PORT, OPENAI_API_KEY, ELEVEN_API_KEY, ELEVEN_VOICE_ID, GREETING, SYSTEM_PROMPT
-// Run: node server.js  (Node 18+)
+// --- add envs at the top ---
+const MAKE_READ_URL = process.env.MAKE_READ_URL || "";
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || "";
 
-import express from "express";
-import fs from "fs";
-import path from "path";
-import { randomUUID } from "crypto";
-
-const app = express();
-app.use(express.urlencoded({ extended: true })); // Twilio posts form-encoded
-app.use(express.json());
-
-const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY || process.env.ELEVENLABS_API_KEY || "";
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM"; // Adam
-const GREETING = process.env.GREETING || "Hi, thanks for calling. How can I help you today?";
-const SYSTEM_PROMPT =
-  process.env.AGENT_PROMPT ||
-  "You are a friendly receptionist. Reply in ONE short sentence (<22 words). If useful, end with ONE question.";
-
-if (!OPENAI_API_KEY) console.warn("WARN: OPENAI_API_KEY missing");
-if (!ELEVEN_API_KEY) console.warn("WARN: ELEVEN_API_KEY missing");
-
-// ---- simple audio store
-const AUDIO_DIR = path.join(process.cwd(), "audio");
-if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
-
-// serve generated audio files
-app.use("/audio", express.static(AUDIO_DIR, { maxAge: 0 }));
-
-// small helper: TwiML that plays a file, then listens again
-function playAndListen(audioUrl, actionUrl) {
-  const xml = `
-<Response>
-  <Play>${audioUrl}</Play>
-  <Gather input="speech" speechTimeout="auto" action="${actionUrl}" language="en-US">
-    <Pause length="1"/>
-  </Gather>
-</Response>`.trim();
-  return xml;
-}
-
-// TwiML say+gather (first greeting)
-function sayAndListen(text, actionUrl) {
-  const xml = `
-<Response>
-  <Say>${text}</Say>
-  <Gather input="speech" speechTimeout="auto" action="${actionUrl}" language="en-US">
-    <Pause length="1"/>
-  </Gather>
-</Response>`.trim();
-  return xml;
-}
-
-// ---------- OpenAI: get next line ----------
-async function aiReply(userText) {
-  try {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
+// --- tool schema GPT sees ---
+const TOOLS = [
+  {
+    type: "function",
+    name: "check_availability",
+    description: "Return if a time window is free",
+    parameters: {
+      type: "object",
+      properties: {
+        startISO: { type: "string", description: "Start time in ISO 8601" },
+        endISO:   { type: "string", description: "End time in ISO 8601 (optional)" }
       },
+      required: ["startISO"]
+    }
+  },
+  {
+    type: "function",
+    name: "create_booking",
+    description: "Create an appointment in the calendar",
+    parameters: {
+      type: "object",
+      properties: {
+        service: { type: "string", description: "haircut | beard trim | combo" },
+        startISO: { type: "string" },
+        endISO:   { type: "string" },
+        name:     { type: "string" },
+        phone:    { type: "string" },
+        email:    { type: "string" }
+      },
+      required: ["service","startISO","name","phone"]
+    }
+  }
+];
+
+// --- tiny helper to execute a tool via your Make URL ---
+async function runTool(name, args, callMeta = {}) {
+  if (name === "check_availability") {
+    if (!MAKE_READ_URL) return { ok:false, reason:"no MAKE_READ_URL" };
+    const r = await fetch(MAKE_READ_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intent:"READ", ...args, meta: callMeta }),
+    });
+    return await r.json().catch(() => ({}));
+  }
+
+  if (name === "create_booking") {
+    if (!MAKE_CREATE_URL) return { ok:false, reason:"no MAKE_CREATE_URL" };
+    const r = await fetch(MAKE_CREATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ intent:"CREATE", ...args, meta: callMeta }),
+    });
+    return await r.json().catch(() => ({}));
+  }
+
+  return { ok:false, reason:"unknown_tool" };
+}
+
+// --- new AI reply that supports tool-calls ---
+async function aiReplyWithTools(userText, callMeta = {}) {
+  // System prompt tells GPT to do all the flow and only call tools when ready
+  const SYSTEM_PROMPT =
+    (process.env.SYSTEM_PROMPT ||
+    "You are a friendly receptionist. Keep replies under 22 words, one question max. " +
+    "Ask for service → time → name → phone; then call tools to check availability and create the booking. " +
+    "Only call create_booking after the caller confirms. If info is missing, ask for it. ") +
+    "Use check_availability before offering times if the user provided a time.";
+
+  // 1) First request: let model think + possibly call a tool
+  const first = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type":"application/json", Authorization:`Bearer ${OPENAI_API_KEY}` },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      tools: TOOLS,
+      tool_choice: "auto",
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: `Caller: ${userText}` }
+      ]
+    })
+  }).then(r => r.json());
+
+  let msg = first?.choices?.[0]?.message;
+  if (!msg) return "Okay. What else can I help with?";
+
+  // 2) If the model called any tools, execute them and send results back
+  if (msg.tool_calls && msg.tool_calls.length) {
+    const toolResults = [];
+    for (const tc of msg.tool_calls.slice(0, 3)) { // keep it simple: up to 3
+      const name = tc.function?.name;
+      const args = JSON.parse(tc.function?.arguments || "{}");
+      const result = await runTool(name, args, callMeta);
+      toolResults.push(
+        { role: "tool", tool_call_id: tc.id, name, content: JSON.stringify(result) }
+      );
+    }
+
+    // 3) Ask the model to finish the sentence using the tool results
+    const second = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type":"application/json", Authorization:`Bearer ${OPENAI_API_KEY}` },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.2,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: `Caller: ${userText}` },
-        ],
-      }),
-    });
-    const data = await r.json();
-    return (data?.choices?.[0]?.message?.content || "Okay. What else can I help you with?").trim();
-  } catch {
-    return "Okay. What else can I help you with?";
+          msg,
+          ...toolResults
+        ]
+      })
+    }).then(r => r.json());
+
+    const finalText = second?.choices?.[0]?.message?.content?.trim();
+    return finalText || "All set. Anything else?";
   }
+
+  // No tools: just speak the assistant’s text
+  return (msg.content || "Okay. What else can I help with?").trim();
 }
-
-// ---------- ElevenLabs: synthesize MP3 ----------
-async function elevenSayToFile(text) {
-  const id = randomUUID();
-  const file = path.join(AUDIO_DIR, `${id}.mp3`);
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg", // mp3
-    },
-    body: JSON.stringify({
-      text,
-      // keep defaults simple; you can tweak later
-      model_id: "eleven_multilingual_v2",
-      voice_settings: { stability: 0.5, similarity_boost: 0.8 },
-    }),
-  });
-
-  if (!r.ok) {
-    const errTxt = await r.text().catch(() => "");
-    throw new Error(`ElevenLabs ${r.status}: ${errTxt}`);
-  }
-
-  const buf = Buffer.from(await r.arrayBuffer());
-  fs.writeFileSync(file, buf);
-  return `/audio/${path.basename(file)}`;
-}
-
-// --------- Clean up old audio files every ~5 mins ----------
-setInterval(() => {
-  const now = Date.now();
-  for (const f of fs.readdirSync(AUDIO_DIR)) {
-    const full = path.join(AUDIO_DIR, f);
-    try {
-      const age = now - fs.statSync(full).mtimeMs;
-      if (age > 5 * 60 * 1000) fs.unlinkSync(full);
-    } catch {}
-  }
-}, 60 * 1000);
-
-// ---------- Routes ----------
-app.get("/", (_, res) => res.status(200).send("OK"));
-
-// First turn: greet using <Say>, then listen
-app.all("/voice", (req, res) => {
-  const actionUrl = `/handle${req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""}`;
-  res.type("text/xml").send(sayAndListen(GREETING, actionUrl));
-});
-
-// Each turn: take transcript -> OpenAI -> Eleven MP3 -> <Play> it -> Gather again
-app.post("/handle", async (req, res) => {
-  const speech = (req.body.SpeechResult || "").trim();
-  const actionUrl = req.originalUrl; // preserve ?client_id=... if present
-
-  const text = speech || "Please say that again.";
-  let reply = await aiReply(text);
-
-  try {
-    const audioUrl = await elevenSayToFile(reply);
-    res.type("text/xml").send(playAndListen(audioUrl, actionUrl));
-  } catch {
-    // fallback to <Say> if Eleven fails
-    res.type("text/xml").send(sayAndListen(reply, actionUrl));
-  }
-});
-
-app.listen(PORT, () => console.log(`Server running on :${PORT}`));
