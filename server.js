@@ -16,6 +16,19 @@ const server = app.listen(PORT, () =>
 );
 const wss = new WebSocketServer({ server });
 
+// ===== Twilio entry point (for voice calls) =====
+app.post("/voice", (req, res) => {
+  res.type("text/xml");
+  res.send(`
+    <Response>
+      <Connect>
+        <Stream url="wss://${process.env.RENDER_URL}" />
+      </Connect>
+    </Response>
+  `);
+});
+
+// ===== WebSocket handling =====
 wss.on("connection", (ws) => {
   const callSid = uuidv4();
   conversations[callSid] = { transcript: [] };
@@ -86,7 +99,7 @@ wss.on("connection", (ws) => {
           if (jsonAction.action === "create_booking") url = process.env.MAKE_CREATE;
           else if (jsonAction.action === "cancel_booking") url = process.env.MAKE_DELETE;
           else if (jsonAction.action === "reschedule_booking") url = process.env.MAKE_READ;
-          else url = process.env.MAKE_WEBHOOK; // fallback
+          else url = process.env.MAKE_WEBHOOK;
 
           if (url) {
             await axios.post(url, {
