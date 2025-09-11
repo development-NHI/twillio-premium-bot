@@ -3,7 +3,6 @@ import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
-import FormData from "form-data";
 
 dotenv.config();
 const app = express();
@@ -39,30 +38,15 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(msg.toString());
 
-      if (data.event === "media") {
-        const audioBuffer = Buffer.from(data.media.payload, "base64");
-
-        const formData = new FormData();
-        formData.append("file", audioBuffer, { filename: "audio.wav" });
-        formData.append("model", "whisper-1");
-
-        const sttRes = await axios.post(
-          "https://api.openai.com/v1/audio/transcriptions",
-          formData,
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              ...formData.getHeaders(),
-            },
-          }
-        );
-
-        const transcript = sttRes.data.text;
+      // Handle transcription events from Twilio STT
+      if (data.event === "transcription") {
+        const transcript = data.transcription.text;
         if (!transcript) return;
 
         conversations[callSid].transcript.push({ role: "user", content: transcript });
         console.log("👤 Caller:", transcript);
 
+        // GPT
         const gptRes = await axios.post(
           "https://api.openai.com/v1/chat/completions",
           {
@@ -84,11 +68,12 @@ wss.on("connection", (ws) => {
         conversations[callSid].transcript.push({ role: "assistant", content: aiReply });
         console.log("🤖 AI:", aiReply);
 
+        // Check for JSON action
         let jsonAction = null;
         try {
           const match = aiReply.match(/\{[\s\S]*\}/);
           if (match) jsonAction = JSON.parse(match[0]);
-        } catch (err) {
+        } catch {
           console.log("⚠️ No valid JSON found in reply");
         }
 
@@ -110,6 +95,7 @@ wss.on("connection", (ws) => {
           }
         }
 
+        // ElevenLabs TTS
         const tts = await axios.post(
           `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`,
           { text: aiReply },
