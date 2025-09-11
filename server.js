@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
@@ -10,7 +9,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// store transcripts per call
 let conversations = {};
 
 const server = app.listen(PORT, () =>
@@ -28,11 +26,9 @@ wss.on("connection", (ws) => {
     try {
       const data = JSON.parse(msg.toString());
 
-      // Incoming audio from Twilio
       if (data.event === "media") {
         const audioBuffer = Buffer.from(data.media.payload, "base64");
 
-        // Whisper STT
         const formData = new FormData();
         formData.append("file", audioBuffer, { filename: "audio.wav" });
         formData.append("model", "whisper-1");
@@ -54,13 +50,12 @@ wss.on("connection", (ws) => {
         conversations[callSid].transcript.push({ role: "user", content: transcript });
         console.log("👤 Caller:", transcript);
 
-        // GPT
         const gptRes = await axios.post(
           "https://api.openai.com/v1/chat/completions",
           {
             model: "gpt-4o-mini",
             messages: [
-              { role: "system", content: process.env.BASE_PROMPT },
+              { role: "system", content: process.env.AGENT_PROMPT },
               ...conversations[callSid].transcript,
             ],
           },
@@ -76,7 +71,6 @@ wss.on("connection", (ws) => {
         conversations[callSid].transcript.push({ role: "assistant", content: aiReply });
         console.log("🤖 AI:", aiReply);
 
-        // Check for JSON action
         let jsonAction = null;
         try {
           const match = aiReply.match(/\{[\s\S]*\}/);
@@ -85,7 +79,6 @@ wss.on("connection", (ws) => {
           console.log("⚠️ No valid JSON found in reply");
         }
 
-        // Call Make.com if action present
         if (jsonAction && jsonAction.action) {
           console.log("➡️ Sending action to Make.com:", jsonAction);
           await axios.post(process.env.MAKE_WEBHOOK, {
@@ -94,7 +87,6 @@ wss.on("connection", (ws) => {
           });
         }
 
-        // ElevenLabs TTS
         const tts = await axios.post(
           `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`,
           { text: aiReply },
