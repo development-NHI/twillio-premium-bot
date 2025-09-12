@@ -45,7 +45,9 @@ async function phraseWithGPT(instruction) {
         messages: [
           {
             role: "system",
-            content: process.env.AGENT_PROMPT || "You are a receptionist. Make this instruction sound natural."
+            content:
+              process.env.AGENT_PROMPT ||
+              "You are a receptionist. Make this instruction sound natural."
           },
           { role: "user", content: instruction }
         ],
