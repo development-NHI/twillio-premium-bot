@@ -1,56 +1,27 @@
 // server.js
 import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
-import fetch from "node-fetch";
+import bodyParser from "body-parser";
 import dotenv from "dotenv";
+import WebSocket, { WebSocketServer } from "ws";
+import fetch from "node-fetch";
 import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
-
+const app = express();
 const PORT = process.env.PORT || 10000;
+
+// ---------- ENV VARS ----------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "pNInz6obpgDQGcFmaJgB";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
-// ---------- Logging ----------
-function log(level, msg, extra = {}) {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...extra }));
+// ---------- LOG ----------
+function log(level, msg, meta = {}) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta }));
 }
 
-// ---------- Express ----------
-const app = express();
-app.use(express.json());
-
-// TwiML route (MUST reply text/xml for Twilio)
-app.all("/twiml", (req, res) => {
-  log("INFO", "TwiML requested");
-  res.type("text/xml");
-  res.send(`
-    <Response>
-      <Connect>
-        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || "twillio-premium-bot.onrender.com"}"/>
-      </Connect>
-    </Response>
-  `.trim());
-});
-
-// Health check
-app.get("/", (_, res) => res.send("✅ Old Line Barbershop AI receptionist running"));
-
-// ---------- HTTP server + WS ----------
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-// ---------- Deepgram ----------
-function startDeepgram({ onFinal }) {
-  const url =
-    "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=false";
-  const dg = new WebSocketServer({ noServer: true });
-}
-
-// μ-law decode
+// ---------- ULaw → PCM16 ----------
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -71,42 +42,100 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- OpenAI ----------
-async function classifyUtterance(utterance) {
-  const sys = `
-Classify the caller utterance into JSON:
-{ "intent": "FAQ"|"BOOK"|"CANCEL"|"RESCHEDULE"|"SMALLTALK"|"UNKNOWN",
-  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"|"",
-  "service": "",
-  "date": "",
-  "time": "",
-  "name": "",
-  "phone": ""
+// ---------- Deepgram Client ----------
+function startDeepgram({ onFinal }) {
+  const url =
+    "wss://api.deepgram.com/v1/listen" +
+    "?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true";
+
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+  });
+
+  dg.on("open", () => log("INFO", "[Deepgram] ws open"));
+  dg.on("message", (data) => {
+    let ev;
+    try {
+      ev = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+    if (ev.type === "Results") {
+      const alt = ev.channel?.alternatives?.[0];
+      const txt = (alt?.transcript || "").trim();
+      if (txt && ev.is_final) {
+        log("ASR_FINAL", txt);
+        onFinal?.(txt);
+      }
+    }
+  });
+  dg.on("close", () => log("INFO", "[Deepgram] ws closed"));
+
+  return {
+    send(buf) {
+      try {
+        dg.send(buf);
+      } catch (e) {
+        log("ERROR", "[DG send]", { error: e.message });
+      }
+    },
+    close() {
+      try {
+        dg.close();
+      } catch {}
+    },
+  };
 }
-Rules:
-- If asking about hours, prices, services, or location => FAQ.
-- If wants appointment => BOOK.
-- Always keep it short JSON.
-`;
+
+// ---------- GPT ----------
+async function classifyAndReply(transcript) {
+  const sysPrompt = `
+You are a helpful AI receptionist for Old Line Barbershop.
+Classify the intent and also generate a short human-sounding reply.
+Return strict JSON:
+{
+ "intent": "FAQ"|"BOOK"|"SMALLTALK"|"UNKNOWN",
+ "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"|"",
+ "service": "",
+ "date": "",
+ "time": "",
+ "name": "",
+ "phone": "",
+ "reply": "short natural response"
+}`;
+
   const body = {
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: sys },
-      { role: "user", content: utterance }
+      { role: "system", content: sysPrompt },
+      { role: "user", content: transcript },
     ],
-    temperature: 0,
-    response_format: { type: "json_object" }
+    temperature: 0.4,
+    max_tokens: 120,
+    response_format: { type: "json_object" },
   };
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
-  const data = await resp.json();
-  return JSON.parse(data.choices[0].message.content);
+
+  const json = await res.json();
+  let parsed = {};
+  try {
+    parsed = JSON.parse(json.choices[0].message.content);
+  } catch {
+    parsed = { intent: "UNKNOWN", reply: "Sorry, I didn’t catch that." };
+  }
+  log("GPT_CLASSIFY", transcript, { parsed });
+  return parsed;
 }
 
-// ---------- ElevenLabs TTS ----------
+// ---------- TTS (ElevenLabs) ----------
 async function speak(ws, streamSid, text) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
     log("WARN", "No ElevenLabs credentials, skipping TTS");
@@ -120,80 +149,100 @@ async function speak(ws, streamSid, text) {
     method: "POST",
     headers: {
       "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text }),
   });
 
   if (!resp.ok) {
-    log("ERROR", "TTS failed", { status: resp.status });
+    log("ERROR", "[TTS] ElevenLabs failed", { status: resp.status });
     return;
   }
 
-  for await (const chunk of resp.body) {
-    const b64 = Buffer.from(chunk).toString("base64");
+  const reader = resp.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const b64 = Buffer.from(value).toString("base64");
     ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
   }
-
   ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }));
 }
 
-// ---------- Conversation State ----------
-const conversations = new Map();
+// ---------- TwiML ----------
+app.get("/twiml", (req, res) => {
+  log("INFO", "TwiML requested");
+  res.type("text/xml");
+  res.send(`
+<Response>
+  <Connect>
+    <Stream url="wss://${req.headers.host}/media"/>
+  </Connect>
+</Response>`);
+});
 
-// ---------- WebSocket handling ----------
+// ---------- WS (Twilio Media Stream) ----------
+const wss = new WebSocketServer({ noServer: true });
+const convos = {};
+
 wss.on("connection", (ws) => {
   const convoId = uuidv4();
-  conversations.set(convoId, { id: convoId });
-  log("CALL_START", "", { convoId });
-
+  convos[convoId] = {};
+  let dg = null;
   let streamSid = null;
 
-  ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+  log("CALL_START", "", { convoId });
 
-    if (msg.event === "start") {
-      streamSid = msg.start.streamSid;
+  ws.on("message", async (msg) => {
+    let data;
+    try {
+      data = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    if (data.event === "start") {
+      streamSid = data.start.streamSid;
       log("INFO", "Stream started", { streamSid });
-      await speak(ws, streamSid, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
-    }
-
-    if (msg.event === "media") {
-      // decode ulaw and forward to Deepgram if needed
-    }
-
-    if (msg.event === "stop") {
-      log("INFO", "Twilio stream STOP");
-      ws.close();
-    }
-
-    if (msg.event === "asr_final") {
-      const transcript = msg.text;
-      log("ASR_FINAL", transcript);
-
-      const parsed = await classifyUtterance(transcript);
-      log("GPT_CLASSIFY", "", { transcript, parsed });
-
-      if (parsed.intent === "FAQ" && parsed.faq_topic === "PRICES") {
-        await speak(ws, streamSid, "Haircut $30, beard trim $15, combo $40.");
-      } else if (parsed.intent === "FAQ" && parsed.faq_topic === "HOURS") {
-        await speak(ws, streamSid, "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.");
-      } else if (parsed.intent === "BOOK") {
-        await speak(ws, streamSid, "Got it, let’s get you booked. What service would you like?");
-      } else {
-        await speak(ws, streamSid, "I’m not sure about that, let me transfer you to the owner.");
+      // Greeting
+      speak(ws, streamSid, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
+      if (DEEPGRAM_API_KEY) {
+        dg = startDeepgram({
+          onFinal: async (text) => {
+            const parsed = await classifyAndReply(text);
+            await speak(ws, streamSid, parsed.reply);
+          },
+        });
       }
+    }
+
+    if (data.event === "media" && dg) {
+      const ulaw = Buffer.from(data.media.payload, "base64");
+      const pcm = ulawBufferToPCM16LEBuffer(ulaw);
+      dg.send(pcm);
+    }
+
+    if (data.event === "stop") {
+      log("INFO", "Twilio stream STOP");
+      try {
+        dg?.close();
+      } catch {}
+      try {
+        ws.close();
+      } catch {}
     }
   });
 
   ws.on("close", () => {
-    conversations.delete(convoId);
     log("INFO", "WS closed", { convoId });
   });
 });
 
-// ---------- Start ----------
-server.listen(PORT, () => {
-  log("INFO", `🚀 Server running on ${PORT}`);
+const server = app.listen(PORT, () => log("INFO", `🚀 Server running on ${PORT}`));
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/media") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
 });
