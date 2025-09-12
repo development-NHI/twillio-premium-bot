@@ -11,7 +11,7 @@ dotenv.config();
 
 const PORT = process.env.PORT || 5000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRA M_API_KEY || process.env.DEEPGRAM_API_KEY; // tolerate both
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY; // tolerate both
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
@@ -391,3 +391,4 @@ Return JSON like:
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
+
