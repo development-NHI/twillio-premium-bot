@@ -257,9 +257,7 @@ function newState() {
     slots: { service: "", date: "", time: "", name: "", phone: "" },
     lastConfirmSnapshot: "",
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
-    bookingLock: false, // reserved; keep to match your last working base
-    lastAskKey: "",       // prevent repeating same ask back-to-back
-    lastAskAt: 0
+    bookingLock: false, // prevents two parallel flows
   };
 }
 
@@ -309,36 +307,13 @@ async function askForMissing(ws, state) {
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
-  // avoid repeating exact same ask within 1.2s
-  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
-  const now = Date.now();
-  if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
-  state.lastAskKey = key;
-  state.lastAskAt = now;
-
-  if (missing === "service")
-    return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
-
-  if (missing === "datetime") {
-    if (s.date && !s.time) return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-    if (!s.date && s.time) return say(ws, `What day works best for your ${s.service} at ${to12h(s.time)}?`);
-    return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
-  }
-
-  if (missing === "date")
-    return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
-
-  if (missing === "time")
-    return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-
-  if (missing === "name")
-    return say(ws, "Can I get your first name?");
-
-  if (missing === "phone")
-    return say(ws, "What phone number should I use for confirmations?");
-
-  if (missing === "done")
-    return triggerConfirm(ws, state);
+  if (missing === "service") return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+  if (missing === "datetime") return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
+  if (missing === "date") return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
+  if (missing === "time") return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+  if (missing === "name") return say(ws, "Can I get your first name?");
+  if (missing === "phone") return say(ws, "What phone number should I use for confirmations?");
+  if (missing === "done") return triggerConfirm(ws, state);
 }
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
@@ -356,23 +331,42 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   state.phase = "confirmed";
   state.lastConfirmSnapshot = snap;
 
-  const phoneFmt = s.phone ? `(${s.phone.slice(0,3)}) ${s.phone.slice(3,6)}-${s.phone.slice(6)}` : "";
+  const fmtPhone = `(${s.phone.slice(0,3)}) ${s.phone.slice(3,6)}-${s.phone.slice(6)}`;
   const line = updated
-    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`
-    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`;
+    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${fmtPhone}. You’re all set. Anything else I can help with?`
+    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${fmtPhone}. You’re all set. Anything else I can help with?`;
 
   await say(ws, line);
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
+function saysUseThisNumber(text) {
+  // Expanded detection for using caller ID phrases
+  const t = (text || "").toLowerCase();
+  return (
+    /\b(this|my)\s+(number|phone)\b/.test(t) ||
+    /\bthe\s+number\s+i['’]?\s?m\s+calling\s+from\b/.test(t) ||
+    /\b(number|phone)\s+i['’]?\s?m\s+calling\s+from\b/.test(t) ||
+    /\buse\s+(this|my)\s+(number|phone)\b/.test(t) ||
+    /\bthe\s+one\s+i['’]?\s?m\s+calling\s+from\b/.test(t) ||
+    /\bthis\s+phone\b/.test(t)
+  );
+}
+
 async function classifyAndHandle(ws, state, transcript) {
-  // Special-case: “this number / my number” for phone, use caller number if available
-  if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
-    const filled = normalizePhone(ws.__callerFrom);
-    if (filled) {
+  // --- Fix #1: Robust "this number" handling using caller ID ---
+  if (saysUseThisNumber(transcript) && ws.__callerFrom) {
+    const directFrom = normalizePhone(ws.__callerFrom);
+    if (directFrom) {
       const before = { ...state.slots };
-      state.slots.phone = filled;
+      state.slots.phone = directFrom;
       console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "callerFrom" }));
+      // If we are in booking, proceed immediately (avoid loops)
+      if (state.phase === "booking" || nextMissing(state) !== "done") {
+        const missing = nextMissing(state);
+        if (missing === "done") return triggerConfirm(ws, state);
+        return askForMissing(ws, state);
+      }
     }
   }
 
@@ -404,6 +398,16 @@ Rules:
   const beforeMissing = nextMissing(state);
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
+  // If phone digits were spoken, and booking is active or info is complete → confirm immediately
+  if (changed && changedKeys.includes("phone")) {
+    if (state.phase === "booking" || nextMissing(state) === "done") {
+      const missing = nextMissing(state);
+      if (missing === "done") {
+        return triggerConfirm(ws, state);
+      }
+    }
+  }
+
   // If info changed after confirmation, re-confirm or resume asking
   if (state.phase === "confirmed" && changed) {
     const missing = nextMissing(state);
@@ -415,7 +419,7 @@ Rules:
     }
   }
 
-  // FAQs
+  // Handle intents
   if (parsed.intent === "FAQ") {
     let answer = "";
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
@@ -424,9 +428,12 @@ Rules:
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
     if (!answer) answer = "Happy to help. What else can I answer?";
 
+    // --- Fix #2: After confirmation, do NOT re-invite to book ---
     if (state.phase === "booking") {
       await say(ws, answer);
       return askForMissing(ws, state);
+    } else if (state.phase === "confirmed") {
+      return say(ws, `${answer}`);
     } else {
       return say(ws, `${answer} Would you like to book an appointment?`);
     }
@@ -438,7 +445,7 @@ Rules:
     return;
   }
 
-  // BOOK or mid-booking (single-threaded flow)
+  // BOOK or we are mid-booking
   if (parsed.intent === "BOOK" || state.phase === "booking" || beforeMissing !== "done") {
     state.phase = "booking";
 
@@ -452,8 +459,12 @@ Rules:
       return askForMissing(ws, state);
     }
 
-    // Smalltalk/Unknown bridge during booking: ONE short line + the precise ask
+    // Smalltalk bridge if needed, then resume targeted ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+      const bridgePrompt = `
+You are a friendly receptionist. Reply with ONE short natural sentence (<= 15 words) acknowledging the user's remark.
+Do NOT ask open-ended questions. Example: "Totally! What time works on Monday?"
+`.trim();
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or the combo?",
         "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
@@ -463,27 +474,25 @@ Rules:
         "phone": "What phone number should I use for confirmations?"
       }[missing];
 
-      const bridgePrompt = `
-You are a receptionist. Reply with one short, natural sentence (<=12 words) acknowledging the remark.
-Do NOT ask open-ended questions. Then we will append a targeted booking question separately.
-Examples: "Totally!" , "Got it!" , "No worries!" , "Sounds good!"
-`.trim();
-
-      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure!";
-      return say(ws, `${bridge} ${targetAsk}`);
+      const bridge = await askGPT(bridgePrompt, transcript) || "Sure!";
+      await say(ws, `${bridge} ${targetAsk}`);
+      return;
     }
 
     // Normal path
     return askForMissing(ws, state);
   }
 
-  // SMALLTALK outside booking — short, no follow-up
+  // SMALLTALK outside booking
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
     const fallbackPrompt = `
-You are a receptionist. Reply with one short, casual sentence (<=12 words).
-No follow-up questions.
+You are a friendly receptionist. Reply with ONE short, conversational sentence (<= 14 words). No follow-up questions.
 `.trim();
     const nlg = await askGPT(fallbackPrompt, transcript);
+    // --- Fix #2: after confirmed, do not invite booking again ---
+    if (state.phase === "confirmed") {
+      return say(ws, nlg || "You're all set — anything else I can help with?");
+    }
     return say(ws, nlg || "Sure—how can I help?");
   }
 }
