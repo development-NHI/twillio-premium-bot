@@ -11,7 +11,7 @@ dotenv.config();
 
 const PORT = process.env.PORT || 5000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const DEEPGRAM_API_KEY = process.env.DEEPGRA M_API_KEY || process.env.DEEPGRAM_API_KEY; // tolerate both
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
@@ -23,7 +23,9 @@ if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
 
 const app = express();
 app.use(bodyParser.json());
+
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
+
 app.post("/twiml", (_, res) => {
   res.set("Content-Type", "text/xml");
   res.send(`
@@ -34,11 +36,55 @@ app.post("/twiml", (_, res) => {
     </Response>
   `);
 });
-const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 
+const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 const wss = new WebSocketServer({ server });
 
-// ---------- Deepgram WebSocket ----------
+/* ----------------- Helpers ----------------- */
+const SERVICES = ["haircut", "beard trim", "combo"];
+function normalizeService(t = "") {
+  const s = t.toLowerCase();
+  if (/\b(combo|both|haircut\s*(\+|and|&)\s*beard)\b/.test(s)) return "combo";
+  if (/\bbeard/.test(s)) return "beard trim";
+  if (/\bhair ?cut\b/.test(s)) return "haircut";
+  return "";
+}
+function normalizePhone(num) {
+  if (!num) return "";
+  const d = num.replace(/\D/g, "");
+  if (d.length >= 10) return d.slice(-10);
+  return "";
+}
+function fmtPhone10(d) {
+  if (d.length !== 10) return d;
+  return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
+}
+function tomorrowISO() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function computeEndFrom(dateISO, time24) {
+  try {
+    if (!dateISO || !time24) return "";
+    const [hh, mm] = time24.split(":").map(x => parseInt(x, 10));
+    const dt = new Date(`${dateISO}T${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:00Z`);
+    const end = new Date(dt.getTime() + 30 * 60 * 1000);
+    return end.toISOString();
+  } catch { return ""; }
+}
+function missingSlot(slots) {
+  if (!slots.service) return "service";
+  if (!slots.date || !slots.time) return "datetime";
+  if (!slots.name) return "name";
+  if (!slots.phone) return "phone";
+  return "";
+}
+
+/* ----------------- Deepgram WebSocket ----------------- */
 function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -79,7 +125,7 @@ function startDeepgram({ onFinal }) {
   };
 }
 
-// μ-law decode
+// μ-law -> PCM16LE
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -91,14 +137,11 @@ function ulawByteToPcm16(u) {
 }
 function ulawBufferToPCM16LEBuffer(ulawBuf) {
   const out = Buffer.alloc(ulawBuf.length * 2);
-  for (let i = 0; i < ulawBuf.length; i++) {
-    const s = ulawByteToPcm16(ulawBuf[i]);
-    out.writeInt16LE(s, i * 2);
-  }
+  for (let i = 0; i < ulawBuf.length; i++) out.writeInt16LE(ulawByteToPcm16(ulawBuf[i]), i * 2);
   return out;
 }
 
-// ---------- GPT ----------
+/* ----------------- GPT ----------------- */
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
     const resp = await axios.post(
@@ -121,7 +164,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   }
 }
 
-// ---------- TTS ----------
+/* ----------------- TTS ----------------- */
 async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
@@ -153,26 +196,95 @@ async function say(ws, text) {
   }
 }
 
-// ---------- SLOT FILLING ----------
-function initSlots() {
-  return { service: "", date: "", time: "", name: "", phone: "" };
+/* ----------------- Booking utils (NEW) ----------------- */
+function ensureBookingMode(ws) {
+  if (!ws.__slots) ws.__slots = { service: "", date: "", time: "", name: "", phone: "" };
+  if (!ws.__booking) ws.__booking = false;
 }
-function missingSlot(slots) {
-  if (!slots.service) return "service";
-  if (!slots.date || !slots.time) return "datetime";
-  if (!slots.name) return "name";
-  if (!slots.phone) return "phone";
-  return null;
+function mergeSlots(ws, info, transcript) {
+  ensureBookingMode(ws);
+
+  // Service corrections (“actually I want combo”)
+  const svcInTranscript = normalizeService(transcript);
+  const svcParsed = normalizeService(info.service || "");
+  const svcPick = svcParsed || svcInTranscript;
+  if (svcPick) ws.__slots.service = svcPick;
+
+  // Date/time quick normalize for "tomorrow"
+  const dateRaw = (info.date || "").toLowerCase();
+  if (dateRaw === "tomorrow") ws.__slots.date = tomorrowISO();
+  else if (info.date) ws.__slots.date = info.date;
+
+  if (info.time) ws.__slots.time = info.time;
+
+  // Name & phone (pull even if intent flips to SMALLTALK)
+  if (info.name) ws.__slots.name = info.name.trim();
+  const phoneFromJSON = normalizePhone(info.phone || "");
+  const phoneFromWords = normalizePhone(transcript);
+  if (phoneFromJSON) ws.__slots.phone = phoneFromJSON;
+  else if (phoneFromWords && phoneFromWords.length === 10) ws.__slots.phone = phoneFromWords;
+
+  // If any booking slot is present, lock booking mode
+  if (Object.values(ws.__slots).some(Boolean)) ws.__booking = true;
+
+  console.log(JSON.stringify({ event: "SLOTS", slots: ws.__slots, missing: missingSlot(ws.__slots) || "none" }));
 }
 
-// ---------- WS ----------
+async function driveBooking(ws) {
+  ensureBookingMode(ws);
+  const m = missingSlot(ws.__slots);
+
+  if (m === "service") {
+    await say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+    return true;
+  }
+  if (m === "datetime") {
+    await say(ws, `What date and time would you like for your ${ws.__slots.service || "appointment"}?`);
+    return true;
+  }
+  if (m === "name") {
+    await say(ws, "Can I get your first name?");
+    return true;
+  }
+  if (m === "phone") {
+    await say(ws, "What phone number should I use for confirmations?");
+    return true;
+  }
+
+  // All set → finalize
+  const { service, date, time, name, phone } = ws.__slots;
+  const startISO = date && time ? new Date(`${date}T${time}:00Z`).toISOString() : "";
+  const endISO = computeEndFrom(date, time);
+
+  // Send to Make (best-effort)
+  if (MAKE_CREATE_URL) {
+    try {
+      await axios.post(MAKE_CREATE_URL, {
+        Event_Name: service || "Appointment",
+        Start_Time: startISO,
+        End_Time: endISO,
+        Customer_Name: name || "",
+        Customer_Phone: phone || "",
+        Customer_Email: "",
+        Notes: `Booked by voice agent.`
+      }, { timeout: 8000 });
+      console.log(JSON.stringify({ event: "MAKE_CREATE_OK" }));
+    } catch (e) {
+      console.error("[Make CREATE] error", e.message);
+    }
+  }
+
+  await say(ws, `Great, ${name}. I’ve booked a ${service} on ${date} at ${time}. I have your number as ${fmtPhone10(phone)}. You’re all set. Anything else I can help with?`);
+
+  // Keep ws.__booking true so user can adjust; if they say "actually", the next utterance can correct slots and we can reconfirm.
+  return true;
+}
+
+/* ----------------- WS ----------------- */
 wss.on("connection", (ws) => {
   let dg = null;
   let pendingULaw = [];
   const BATCH_FRAMES = 5;
-
-  const convoId = uuidv4();
-  const slots = initSlots();
 
   ws.on("message", async (raw) => {
     let msg;
@@ -180,12 +292,14 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "start") {
       ws.__streamSid = msg.start.streamSid;
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId }));
+      ws.__convoId = uuidv4();
+      ws.__booking = false;
+      ws.__slots = { service: "", date: "", time: "", name: "", phone: "" };
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
       // Start Deepgram
       dg = startDeepgram({
         onFinal: async (text) => {
-          // classify
           const systemPrompt = `
 Return JSON like:
 {
@@ -196,82 +310,54 @@ Return JSON like:
  "time": "",
  "name": "",
  "phone": ""
-}`;
-          const parsed = await askGPT(systemPrompt, text, "json");
+}
+- Always extract any slot values you can, even for SMALLTALK.
+- For "tomorrow", put "tomorrow" in date (the app will convert).
+- Prefer 24h time like "15:00".
+- Services: "haircut", "beard trim", or "combo".
+`;
+          const parsedJson = await askGPT(systemPrompt, text, "json");
           let info = {};
-          try { info = JSON.parse(parsed); } catch {}
+          try { info = JSON.parse(parsedJson || "{}"); } catch {}
           console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript: text, parsed: info }));
 
-          // handle FAQ
-          if (info.intent === "FAQ") {
+          // Always merge slots (even if intent wobbles)
+          mergeSlots(ws, info, text);
+
+          // FAQ outside booking mode
+          if (!ws.__booking && info.intent === "FAQ") {
             let answer = "";
             if (info.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
             if (info.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
-            if (info.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and combo packages.";
+            if (info.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo package.";
             if (info.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
-            await say(ws, answer);
+            if (MAKE_FAQ_URL && info.faq_topic) {
+              try { await axios.post(MAKE_FAQ_URL, { intent: "FAQ", topic: info.faq_topic }, { timeout: 4000 }); } catch {}
+            }
+            await say(ws, answer || "Happy to help. Anything else?");
             return;
           }
 
-          if (info.intent === "TRANSFER") {
+          // Transfer outside booking mode
+          if (!ws.__booking && info.intent === "TRANSFER") {
             await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
             try { ws.close(); } catch {}
             return;
           }
 
-          if (info.intent === "BOOK") {
-            // update slots dynamically
-            if (info.service) slots.service = info.service;
-            if (info.date) slots.date = info.date;
-            if (info.time) slots.time = info.time;
-            if (info.name) slots.name = info.name;
-            if (info.phone) slots.phone = info.phone;
-
-            const missing = missingSlot(slots);
-            console.log(JSON.stringify({ event: "SLOTS", slots, missing }));
-
-            if (missing === "service") {
-              await say(ws, "What service would you like? Haircut, beard trim, or combo?");
-              return;
-            }
-            if (missing === "datetime") {
-              await say(ws, `What date and time would you like for your ${slots.service}?`);
-              return;
-            }
-            if (missing === "name") {
-              await say(ws, "Can I get your first name?");
-              return;
-            }
-            if (missing === "phone") {
-              await say(ws, "What phone number should I use for confirmations?");
-              return;
-            }
-
-            // All slots filled → confirm + send to Make
-            const startTime = `${slots.date} ${slots.time}`;
-            const payload = {
-              Event_Name: `${slots.service} – ${slots.name}`,
-              Start_Time: startTime,
-              End_Time: startTime, // TODO: add +30min if needed
-              Customer_Name: slots.name,
-              Customer_Phone: slots.phone,
-              Notes: `Booked by AI agent, convoId=${convoId}`
-            };
-
-            try {
-              await axios.post(MAKE_CREATE_URL, payload);
-              console.log(JSON.stringify({ event: "MAKE_CREATE", payload }));
-            } catch (e) {
-              console.error("[MAKE ERROR]", e.message);
-            }
-
-            await say(ws, `Great, I’ve booked a ${slots.service} for ${slots.name} on ${slots.date} at ${slots.time}. You’ll get a confirmation at ${slots.phone}.`);
+          // If user says “book”, or we already have any slots, drive booking
+          if (info.intent === "BOOK" || ws.__booking) {
+            ws.__booking = true;
+            await driveBooking(ws);
             return;
           }
 
-          // fallback smalltalk
-          const phrased = await askGPT(process.env.AGENT_PROMPT || "You are a friendly receptionist.", text);
-          await say(ws, phrased);
+          // Otherwise smalltalk fallback
+          const phrased = await askGPT(
+            "You are a helpful, concise, friendly receptionist. One short sentence. If user seems ready to book, gently ask what service they want.",
+            text
+          );
+          await say(ws, phrased || "How can I help you further?");
         }
       });
 
@@ -287,7 +373,7 @@ Return JSON like:
       if (pendingULaw.length >= BATCH_FRAMES) {
         const ulawChunk = Buffer.concat(pendingULaw);
         const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-        dg.sendPCM16LE(pcm16le);
+        try { dg.sendPCM16LE(pcm16le); } catch {}
         pendingULaw = [];
       }
       return;
@@ -302,6 +388,6 @@ Return JSON like:
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
-    console.log("[INFO] WS closed", { convoId });
+    console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
