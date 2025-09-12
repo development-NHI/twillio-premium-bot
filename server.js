@@ -35,7 +35,7 @@ function computeEndTime(start) {
   }
 }
 
-// GPT for phrasing
+// GPT phrasing
 async function phraseWithGPT(instruction) {
   try {
     const resp = await axios.post(
@@ -243,12 +243,12 @@ wss.on("connection", (ws) => {
 });
 
 // =============================
-// TWILIO ROUTE for 11200 FIX
+// TWILIO ROUTE (GET + POST)
 // =============================
-app.post("/twiml", (req, res) => {
+app.all("/twiml", (req, res) => {
   const response = new twilio.twiml.VoiceResponse();
   response.connect().stream({
-    url: `wss://${req.headers.host}/`
+    url: `wss://twillio-premium-bot.onrender.com/` // 👈 replace with your Render domain
   });
   res.type("text/xml");
   res.send(response.toString());
