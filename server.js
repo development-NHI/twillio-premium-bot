@@ -38,11 +38,41 @@ const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PO
 
 const wss = new WebSocketServer({ server });
 
-// ---------- Utilities (tiny, safe) ----------
+/* ---------------------------------------
+   Utilities
+----------------------------------------*/
+const MONTHS = [
+  "January","February","March","April","May","June",
+  "July","August","September","October","November","December"
+];
+function ordinal(n) {
+  const s = ["th","st","nd","rd"], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+function formatDateHuman(iso) {
+  // iso: YYYY-MM-DD
+  if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso || "";
+  const [y,m,d] = iso.split("-").map(n => parseInt(n,10));
+  const dt = new Date(y, m-1, d);
+  const dow = dt.toLocaleDateString("en-US", { weekday: "long" });
+  return `${dow}, ${MONTHS[m-1]} ${ordinal(d)}, ${y}`;
+}
+function formatTimeHuman(t) {
+  // allow "3 PM" passthrough, or "15:00" -> "3 PM"
+  if (!t) return "";
+  const s = t.trim().toUpperCase();
+  if (/\bAM\b|\bPM\b/.test(s)) return s.replace(/\s+/g, " ");
+  // "HH:MM"
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s);
+  if (!m) return s;
+  let hh = parseInt(m[1],10);
+  const mm = m[2];
+  const ampm = hh >= 12 ? "PM" : "AM";
+  hh = hh % 12 || 12;
+  return `${hh}:${mm} ${ampm}`;
+}
 const nowNY = () => {
-  // America/New_York naive handling (sufficient for "today/tomorrow" slot)
   const d = new Date();
-  // quick-string YYYY-MM-DD
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
@@ -76,8 +106,13 @@ function normalizePhone(num) {
   const d = num.replace(/\D/g, "");
   return d.length >= 10 ? d : "";
 }
+function isAffirmative(s) {
+  return /\b(yes|yeah|yep|sure|ok|okay|please|that works|sounds good|yup)\b/i.test(s || "");
+}
 
-// ---------- Deepgram WebSocket ----------
+/* ---------------------------------------
+   Deepgram WS
+----------------------------------------*/
 function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -137,7 +172,9 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- GPT ----------
+/* ---------------------------------------
+   OpenAI
+----------------------------------------*/
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
     const resp = await axios.post(
@@ -160,7 +197,9 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   }
 }
 
-// ---------- TTS ----------
+/* ---------------------------------------
+   TTS
+----------------------------------------*/
 async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
@@ -192,10 +231,13 @@ async function say(ws, text) {
   }
 }
 
-// ---------- Slot state helpers (minimal) ----------
+/* ---------------------------------------
+   Slot state helpers
+----------------------------------------*/
 function newState() {
   return {
-    phase: "idle", // 'idle' | 'booking'
+    phase: "idle",              // 'idle' | 'booking'
+    lastAsk: "",                // 'cta_book' | 'ask_service' | 'ask_datetime' | 'ask_name' | 'ask_phone' | ''
     slots: { service: "", date: "", time: "", name: "", phone: "" }
   };
 }
@@ -236,11 +278,29 @@ function nextMissing(state) {
 async function askForMissing(ws, state) {
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: state.slots, missing }));
-  if (missing === "service") return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
-  if (missing === "datetime") return say(ws, `What date and time would you like for your ${state.slots.service || "appointment"}?`);
-  if (missing === "name") return say(ws, "Can I get your first name?");
-  if (missing === "phone") return say(ws, "What phone number should I use for confirmations?");
-  if (missing === "done") return say(ws, `Great — I have a ${state.slots.service} on ${state.slots.date} at ${state.slots.time} for ${state.slots.name}. I’ll text the confirmation to ${state.slots.phone}. Anything else I can help with?`);
+
+  if (missing === "service") {
+    state.lastAsk = "ask_service";
+    return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+  }
+  if (missing === "datetime") {
+    state.lastAsk = "ask_datetime";
+    return say(ws, `What date and time would you like for your ${state.slots.service || "appointment"}?`);
+  }
+  if (missing === "name") {
+    state.lastAsk = "ask_name";
+    return say(ws, "Can I get your first name?");
+  }
+  if (missing === "phone") {
+    state.lastAsk = "ask_phone";
+    return say(ws, "What phone number should I use for confirmations?");
+  }
+  if (missing === "done") {
+    state.lastAsk = "";
+    const dateStr = formatDateHuman(state.slots.date);
+    const timeStr = formatTimeHuman(state.slots.time);
+    return say(ws, `Great — I have a ${state.slots.service} on ${dateStr} at ${timeStr} for ${state.slots.name}. I’ll text the confirmation to ${state.slots.phone}. Anything else I can help with?`);
+  }
 }
 async function maybeResume(ws, state) {
   if (state.phase === "booking") {
@@ -253,24 +313,33 @@ async function maybeResume(ws, state) {
   return false;
 }
 
-// ---------- Classify + handle (tight fallbacks) ----------
+/* ---------------------------------------
+   Classify + handle (with flow control)
+----------------------------------------*/
 async function classifyAndHandle(ws, state, transcript) {
+  // Heuristic: If we just asked "Would you like to book?" and user says "yes", jump into booking
+  if (state.phase === "idle" && state.lastAsk === "cta_book" && isAffirmative(transcript)) {
+    state.phase = "booking";
+    await askForMissing(ws, state);
+    return;
+  }
+
   const systemPrompt = `
 Return STRICT JSON:
 {
  "intent": "FAQ" | "BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",  // "haircut" | "beard trim" | "combo" or phrase
- "date": "",     // "today" | "tomorrow" | "YYYY-MM-DD" | weekday phrase
- "time": "",     // e.g., "3 PM" or "15:00"
+ "service": "",
+ "date": "",
+ "time": "",
  "name": "",
  "phone": ""
 }
 
 Rules:
-- Detect booking requests even if mixed with questions.
-- If user changes their mind about service, update "service".
-- For FAQs, do NOT start booking unless they ask to book.
+- Detect booking even if mixed with other phrasing.
+- If user changes their mind about service/date/time/phone, update values.
+- For FAQs, do NOT auto-start booking unless they ask to book.
 - Keep values short; leave blank if unsure.
   `.trim();
 
@@ -281,10 +350,10 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // Normalize & merge slots (never lose context)
+  // Always merge any slots we can glean
   mergeSlots(state, parsed);
 
-  // Branches
+  // FAQ branch
   if (parsed.intent === "FAQ") {
     let answer = "";
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
@@ -293,45 +362,53 @@ Rules:
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
     if (!answer) answer = "Happy to help. What else can I answer?";
 
-    // One short line. If in booking, answer then resume; otherwise add a soft CTA.
     if (state.phase === "booking") {
       await say(ws, answer);
       await maybeResume(ws, state);
     } else {
+      state.lastAsk = "cta_book";
       await say(ws, `${answer} Would you like to book an appointment?`);
     }
     return;
   }
 
+  // Transfer
   if (parsed.intent === "TRANSFER") {
     await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
     try { ws.close(); } catch {}
     return;
   }
 
+  // Booking
   if (parsed.intent === "BOOK") {
     state.phase = "booking";
-    // Make sure service/date/time/name/phone merged above; simply ask next missing
     await askForMissing(ws, state);
     return;
   }
 
-  // Smalltalk / Unknown → strictly short receptionist line, then resume if booking
-  if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+  // Smalltalk / Unknown
+  if (state.phase === "booking") {
+    // Keep it super tight: brief ack then resume (no weird meta answers)
+    await say(ws, "Got it.");
+    await maybeResume(ws, state);
+    return;
+  } else {
+    // Idle mode: one short friendly line
     const fallbackPrompt = `
-You are a friendly, human receptionist at Old Line Barbershop.
-ONLY reply with ONE short, conversational sentence (<= 18 words).
-Do not explain rules or how you work. Keep it casual and helpful.
+You are a friendly receptionist at Old Line Barbershop.
+Reply with ONE short sentence (<= 15 words). Be natural.
+Never mention calling/texting capabilities or limitations. Never describe how you work.
 Examples: "Sure—what do you need?" / "Got it—how can I help?" / "No problem—what's up?"
     `.trim();
     const nlg = await askGPT(fallbackPrompt, transcript);
-    await say(ws, nlg || "Okay—how can I help?");
-    await maybeResume(ws, state);
+    await say(ws, nlg || "Sure—what do you need?");
     return;
   }
 }
 
-// ---------- WS ----------
+/* ---------------------------------------
+   WS
+----------------------------------------*/
 wss.on("connection", (ws) => {
   let dg = null;
   let pendingULaw = [];
