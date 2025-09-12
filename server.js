@@ -1,27 +1,85 @@
-// server.js
+// server.js — Old Line Barbershop AI Receptionist (Deepgram + GPT + ElevenLabs + Make.com)
+
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
-import fetch from "node-fetch";
+import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
-const app = express();
-const PORT = process.env.PORT || 10000;
 
-// ---------- ENV VARS ----------
+const PORT = process.env.PORT || 5000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID || "pNInz6obpgDQGcFmaJgB";
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
+const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL;
 
-// ---------- LOG ----------
-function log(level, msg, meta = {}) {
-  console.log(JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta }));
+if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
+if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
+if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
+
+const app = express();
+app.use(bodyParser.json());
+app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
+app.post("/twiml", (_, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`
+    <Response>
+      <Connect>
+        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || "localhost:"+PORT}"/>
+      </Connect>
+    </Response>
+  `);
+});
+const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
+
+const wss = new WebSocketServer({ server });
+
+// ---------- Deepgram WebSocket ----------
+function startDeepgram({ onFinal }) {
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=linear16"
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&language=en-US"
+    + "&endpointing=250";
+
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    perMessageDeflate: false
+  });
+
+  dg.on("open", () => console.log("[Deepgram] ws open"));
+  dg.on("message", (data) => {
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch { return; }
+    if (ev.type !== "Results") return;
+    const alt = ev.channel?.alternatives?.[0];
+    if (!alt) return;
+    const text = (alt.transcript || "").trim();
+    if (!text) return;
+    if (ev.is_final || ev.speech_final) {
+      console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
+      onFinal?.(text);
+    }
+  });
+  dg.on("error", (e) => console.error("[Deepgram error]", e.message));
+  dg.on("close", () => console.log("[Deepgram closed]"));
+
+  return {
+    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
+    close() { try { dg.close(); } catch {} }
+  };
 }
 
-// ---------- ULaw → PCM16 ----------
+// μ-law decode
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -29,9 +87,7 @@ function ulawByteToPcm16(u) {
   const mantissa = u & 0x0f;
   let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
   if (sign) sample = -sample;
-  if (sample > 32767) sample = 32767;
-  if (sample < -32768) sample = -32768;
-  return sample;
+  return Math.max(-32768, Math.min(32767, sample));
 }
 function ulawBufferToPCM16LEBuffer(ulawBuf) {
   const out = Buffer.alloc(ulawBuf.length * 2);
@@ -42,207 +98,210 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- Deepgram Client ----------
-function startDeepgram({ onFinal }) {
-  const url =
-    "wss://api.deepgram.com/v1/listen" +
-    "?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true";
-
-  const dg = new WebSocket(url, {
-    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
-  });
-
-  dg.on("open", () => log("INFO", "[Deepgram] ws open"));
-  dg.on("message", (data) => {
-    let ev;
-    try {
-      ev = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
-    if (ev.type === "Results") {
-      const alt = ev.channel?.alternatives?.[0];
-      const txt = (alt?.transcript || "").trim();
-      if (txt && ev.is_final) {
-        log("ASR_FINAL", txt);
-        onFinal?.(txt);
-      }
-    }
-  });
-  dg.on("close", () => log("INFO", "[Deepgram] ws closed"));
-
-  return {
-    send(buf) {
-      try {
-        dg.send(buf);
-      } catch (e) {
-        log("ERROR", "[DG send]", { error: e.message });
-      }
-    },
-    close() {
-      try {
-        dg.close();
-      } catch {}
-    },
-  };
+// ---------- GPT ----------
+async function askGPT(systemPrompt, userPrompt, response_format = "text") {
+  try {
+    const resp = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.4,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
+      },
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    );
+    return resp.data.choices[0].message.content.trim();
+  } catch (e) {
+    console.error("[GPT ERROR]", e.message);
+    return "";
+  }
 }
 
-// ---------- GPT ----------
-async function classifyAndReply(transcript) {
-  const sysPrompt = `
-You are a helpful AI receptionist for Old Line Barbershop.
-Classify the intent and also generate a short human-sounding reply.
-Return strict JSON:
+// ---------- TTS ----------
+async function say(ws, text) {
+  if (!text) return;
+  const streamSid = ws.__streamSid;
+  if (!streamSid) return;
+
+  console.log(JSON.stringify({ event: "BOT_SAY", reply: text }));
+
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    console.warn("[WARN] No ElevenLabs credentials, skipping TTS");
+    return;
+  }
+
+  try {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const resp = await axios.post(
+      url,
+      { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
+      { headers: { "xi-api-key": ELEVENLABS_API_KEY }, responseType: "stream" }
+    );
+    resp.data.on("data", (chunk) => {
+      const b64 = Buffer.from(chunk).toString("base64");
+      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+    });
+    resp.data.on("end", () =>
+      ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }))
+    );
+  } catch (e) {
+    console.error("[TTS ERROR]", e.message);
+  }
+}
+
+// ---------- SLOT FILLING ----------
+function initSlots() {
+  return { service: "", date: "", time: "", name: "", phone: "" };
+}
+function missingSlot(slots) {
+  if (!slots.service) return "service";
+  if (!slots.date || !slots.time) return "datetime";
+  if (!slots.name) return "name";
+  if (!slots.phone) return "phone";
+  return null;
+}
+
+// ---------- WS ----------
+wss.on("connection", (ws) => {
+  let dg = null;
+  let pendingULaw = [];
+  const BATCH_FRAMES = 5;
+
+  const convoId = uuidv4();
+  const slots = initSlots();
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.event === "start") {
+      ws.__streamSid = msg.start.streamSid;
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId }));
+
+      // Start Deepgram
+      dg = startDeepgram({
+        onFinal: async (text) => {
+          // classify
+          const systemPrompt = `
+Return JSON like:
 {
- "intent": "FAQ"|"BOOK"|"SMALLTALK"|"UNKNOWN",
- "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"|"",
+ "intent": "FAQ" | "BOOK" | "SMALLTALK" | "TRANSFER" | "UNKNOWN",
+ "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
  "service": "",
  "date": "",
  "time": "",
  "name": "",
- "phone": "",
- "reply": "short natural response"
+ "phone": ""
 }`;
+          const parsed = await askGPT(systemPrompt, text, "json");
+          let info = {};
+          try { info = JSON.parse(parsed); } catch {}
+          console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript: text, parsed: info }));
 
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      { role: "system", content: sysPrompt },
-      { role: "user", content: transcript },
-    ],
-    temperature: 0.4,
-    max_tokens: 120,
-    response_format: { type: "json_object" },
-  };
+          // handle FAQ
+          if (info.intent === "FAQ") {
+            let answer = "";
+            if (info.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
+            if (info.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
+            if (info.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and combo packages.";
+            if (info.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
+            await say(ws, answer);
+            return;
+          }
 
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+          if (info.intent === "TRANSFER") {
+            await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
+            try { ws.close(); } catch {}
+            return;
+          }
 
-  const json = await res.json();
-  let parsed = {};
-  try {
-    parsed = JSON.parse(json.choices[0].message.content);
-  } catch {
-    parsed = { intent: "UNKNOWN", reply: "Sorry, I didn’t catch that." };
-  }
-  log("GPT_CLASSIFY", transcript, { parsed });
-  return parsed;
-}
+          if (info.intent === "BOOK") {
+            // update slots dynamically
+            if (info.service) slots.service = info.service;
+            if (info.date) slots.date = info.date;
+            if (info.time) slots.time = info.time;
+            if (info.name) slots.name = info.name;
+            if (info.phone) slots.phone = info.phone;
 
-// ---------- TTS (ElevenLabs) ----------
-async function speak(ws, streamSid, text) {
-  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-    log("WARN", "No ElevenLabs credentials, skipping TTS");
-    return;
-  }
-  log("BOT_SAY", text);
+            const missing = missingSlot(slots);
+            console.log(JSON.stringify({ event: "SLOTS", slots, missing }));
 
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+            if (missing === "service") {
+              await say(ws, "What service would you like? Haircut, beard trim, or combo?");
+              return;
+            }
+            if (missing === "datetime") {
+              await say(ws, `What date and time would you like for your ${slots.service}?`);
+              return;
+            }
+            if (missing === "name") {
+              await say(ws, "Can I get your first name?");
+              return;
+            }
+            if (missing === "phone") {
+              await say(ws, "What phone number should I use for confirmations?");
+              return;
+            }
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVEN_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ text }),
-  });
+            // All slots filled → confirm + send to Make
+            const startTime = `${slots.date} ${slots.time}`;
+            const payload = {
+              Event_Name: `${slots.service} – ${slots.name}`,
+              Start_Time: startTime,
+              End_Time: startTime, // TODO: add +30min if needed
+              Customer_Name: slots.name,
+              Customer_Phone: slots.phone,
+              Notes: `Booked by AI agent, convoId=${convoId}`
+            };
 
-  if (!resp.ok) {
-    log("ERROR", "[TTS] ElevenLabs failed", { status: resp.status });
-    return;
-  }
+            try {
+              await axios.post(MAKE_CREATE_URL, payload);
+              console.log(JSON.stringify({ event: "MAKE_CREATE", payload }));
+            } catch (e) {
+              console.error("[MAKE ERROR]", e.message);
+            }
 
-  const reader = resp.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const b64 = Buffer.from(value).toString("base64");
-    ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
-  }
-  ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }));
-}
+            await say(ws, `Great, I’ve booked a ${slots.service} for ${slots.name} on ${slots.date} at ${slots.time}. You’ll get a confirmation at ${slots.phone}.`);
+            return;
+          }
 
-// ---------- TwiML ----------
-app.get("/twiml", (req, res) => {
-  log("INFO", "TwiML requested");
-  res.type("text/xml");
-  res.send(`
-<Response>
-  <Connect>
-    <Stream url="wss://${req.headers.host}/media"/>
-  </Connect>
-</Response>`);
-});
+          // fallback smalltalk
+          const phrased = await askGPT(process.env.AGENT_PROMPT || "You are a friendly receptionist.", text);
+          await say(ws, phrased);
+        }
+      });
 
-// ---------- WS (Twilio Media Stream) ----------
-const wss = new WebSocketServer({ noServer: true });
-const convos = {};
-
-wss.on("connection", (ws) => {
-  const convoId = uuidv4();
-  convos[convoId] = {};
-  let dg = null;
-  let streamSid = null;
-
-  log("CALL_START", "", { convoId });
-
-  ws.on("message", async (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-    } catch {
+      await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
       return;
     }
 
-    if (data.event === "start") {
-      streamSid = data.start.streamSid;
-      log("INFO", "Stream started", { streamSid });
-      // Greeting
-      speak(ws, streamSid, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
-      if (DEEPGRAM_API_KEY) {
-        dg = startDeepgram({
-          onFinal: async (text) => {
-            const parsed = await classifyAndReply(text);
-            await speak(ws, streamSid, parsed.reply);
-          },
-        });
+    if (msg.event === "media") {
+      const b64 = msg.media?.payload || "";
+      if (!b64 || !dg) return;
+      const ulaw = Buffer.from(b64, "base64");
+      pendingULaw.push(ulaw);
+      if (pendingULaw.length >= BATCH_FRAMES) {
+        const ulawChunk = Buffer.concat(pendingULaw);
+        const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+        dg.sendPCM16LE(pcm16le);
+        pendingULaw = [];
       }
+      return;
     }
 
-    if (data.event === "media" && dg) {
-      const ulaw = Buffer.from(data.media.payload, "base64");
-      const pcm = ulawBufferToPCM16LEBuffer(ulaw);
-      dg.send(pcm);
-    }
-
-    if (data.event === "stop") {
-      log("INFO", "Twilio stream STOP");
-      try {
-        dg?.close();
-      } catch {}
-      try {
-        ws.close();
-      } catch {}
+    if (msg.event === "stop") {
+      console.log("[INFO] Twilio stream STOP");
+      try { dg?.close(); } catch {}
+      try { ws.close(); } catch {}
     }
   });
 
   ws.on("close", () => {
-    log("INFO", "WS closed", { convoId });
+    try { dg?.close(); } catch {}
+    console.log("[INFO] WS closed", { convoId });
   });
-});
-
-const server = app.listen(PORT, () => log("INFO", `🚀 Server running on ${PORT}`));
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/media") {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
-    socket.destroy();
-  }
 });
