@@ -32,7 +32,7 @@ app.post("/twiml", (_, res) => {
     </Response>
   `);
 });
-const server = app.listen(PORT, () => console.log([INFO] Server running on ${PORT}));
+const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 
 const wss = new WebSocketServer({ server });
 
@@ -53,13 +53,13 @@ function parseWeekdayToISO(weekday){
   if (add===0) add = 7; // next occurrence
   const d = new Date(now.getFullYear(), now.getMonth(), now.getDate()+add);
   const yyyy=d.getFullYear(), mm=String(d.getMonth()+1).padStart(2,"0"), dd=String(d.getDate()).padStart(2,"0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 function prettyDate(iso){
   if(!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso||"";
   const [y,m,d] = iso.split("-").map(x=>parseInt(x,10));
-  return ${MONTHS[m-1]} ${ordinal(d)};
+  return `${MONTHS[m-1]} ${ordinal(d)}`;
 }
 function prettyTime(t){
   // accept "15:00" or "3 PM" / "3PM"
@@ -68,7 +68,7 @@ function prettyTime(t){
   if(/\d{1,2}:\d{2}/.test(s)){ // 24h -> 12h
     const [hh,mm]=s.split(":").map(n=>parseInt(n,10));
     const h=((hh+11)%12)+1;
-    return ${h}:${String(mm).padStart(2,"0")} ${hh<12?"AM":"PM"};
+    return `${h}:${String(mm).padStart(2,"0")} ${hh<12?"AM":"PM"}`;
   }
   return s.replace(/\s+/g," ").replace("PM","PM").replace("AM","AM");
 }
@@ -78,7 +78,7 @@ const nowNY = () => {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 };
 function addDaysISO(isoDate, days) {
   const d = new Date(isoDate);
@@ -86,7 +86,7 @@ function addDaysISO(isoDate, days) {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 }
 function normalizeDate(d) {
   if (!d) return "";
@@ -127,7 +127,7 @@ function startDeepgram({ onFinal }) {
     + "&endpointing=250";
 
   const dg = new WebSocket(url, {
-    headers: { Authorization: token ${DEEPGRAM_API_KEY} },
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
   });
 
@@ -188,7 +188,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
         ],
         ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
       },
-      { headers: { Authorization: Bearer ${OPENAI_API_KEY} } }
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
     return resp.data.choices[0].message.content.trim();
   } catch (e) {
@@ -212,7 +212,7 @@ async function say(ws, text) {
   }
 
   try {
-    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await axios.post(
       url,
       { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
@@ -278,7 +278,7 @@ function nextMissing(state) {
 }
 function buildAskForSlotText(state, missing){
   if (missing === "service") return "What service would you like — a haircut, beard trim, or the combo?";
-  if (missing === "datetime") return What date and time would you like for your ${state.slots.service || "appointment"}?;
+  if (missing === "datetime") return `What date and time would you like for your ${state.slots.service || "appointment"}?`;
   if (missing === "name") return "Can I get your first name?";
   if (missing === "phone") return "What phone number should I use for confirmations?";
   return "";
@@ -314,12 +314,12 @@ async function askForMissing(ws, state) {
 
   // done → single confirmation once
   if (missing === "done" && !state.confirmSent) {
-    const when = ${prettyDate(state.slots.date)} at ${prettyTime(state.slots.time)};
+    const when = `${prettyDate(state.slots.date)} at ${prettyTime(state.slots.time)}`;
     console.log(JSON.stringify({ event: "CONFIRM_READY", slots: state.slots, whenSpoken: when }));
     state.confirmSent = true;
     state.lastAsked = ""; // reset ask tracking
     state.lastAskTs = Date.now();
-    return say(ws, Great — I’ve got a ${state.slots.service} for ${state.slots.name} on ${when}. I have your number as (${state.slots.phone.slice(0,3)}) ${state.slots.phone.slice(3,6)}-${state.slots.phone.slice(6)}. You’re all set. Anything else I can help with?);
+    return say(ws, `Great — I’ve got a ${state.slots.service} for ${state.slots.name} on ${when}. I have your number as (${state.slots.phone.slice(0,3)}) ${state.slots.phone.slice(3,6)}-${state.slots.phone.slice(6)}. You’re all set. Anything else I can help with?`);
   }
 }
 async function maybeResume(ws, state) {
@@ -355,7 +355,7 @@ async function smalltalkThenResume(ws, state, transcript){
   }
   const ask = buildAskForSlotText(state, missing);
   // blend into one message so we don't spawn two overlapping "threads"
-  const out = ${line} ${ask};
+  const out = `${line} ${ask}`;
   state.lastAsked = missing;
   state.lastAskTs = Date.now();
   await say(ws, out);
@@ -407,7 +407,7 @@ Rules:
       await say(ws, answer);
       await maybeResume(ws, state);
     } else {
-      await say(ws, ${answer} Would you like to book an appointment?);
+      await say(ws, `${answer} Would you like to book an appointment?`);
     }
     return;
   }
@@ -456,7 +456,7 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__state = newState();
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws._streamSid, convoId: ws._convoId }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
       dg = startDeepgram({
         onFinal: async (text) => {
