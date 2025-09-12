@@ -14,8 +14,6 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
-const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL;
 
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
@@ -34,17 +32,53 @@ app.post("/twiml", (_, res) => {
     </Response>
   `);
 });
-const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
+const server = app.listen(PORT, () => console.log([INFO] Server running on ${PORT}));
 
 const wss = new WebSocketServer({ server });
 
-// ---------- Utilities ----------
+/* ---------------- Utilities ---------------- */
+
+const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+function ordinal(n){const s=["th","st","nd","rd"],v=n%100;return n+(s[(v-20)%10]||s[v]||s[0]);}
+
+function parseWeekdayToISO(weekday){
+  // best-effort: resolve next weekday name to ISO (America/New_York naive)
+  const map = { sunday:0,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5,saturday:6 };
+  const w = (weekday||"").toLowerCase();
+  if(!(w in map)) return "";
+  const now = new Date();
+  const today = now.getDay();
+  const target = map[w];
+  let add = (target - today + 7) % 7;
+  if (add===0) add = 7; // next occurrence
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate()+add);
+  const yyyy=d.getFullYear(), mm=String(d.getMonth()+1).padStart(2,"0"), dd=String(d.getDate()).padStart(2,"0");
+  return ${yyyy}-${mm}-${dd};
+}
+
+function prettyDate(iso){
+  if(!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso||"";
+  const [y,m,d] = iso.split("-").map(x=>parseInt(x,10));
+  return ${MONTHS[m-1]} ${ordinal(d)};
+}
+function prettyTime(t){
+  // accept "15:00" or "3 PM" / "3PM"
+  if(!t) return "";
+  const s=t.trim().toUpperCase();
+  if(/\d{1,2}:\d{2}/.test(s)){ // 24h -> 12h
+    const [hh,mm]=s.split(":").map(n=>parseInt(n,10));
+    const h=((hh+11)%12)+1;
+    return ${h}:${String(mm).padStart(2,"0")} ${hh<12?"AM":"PM"};
+  }
+  return s.replace(/\s+/g," ").replace("PM","PM").replace("AM","AM");
+}
+
 const nowNY = () => {
   const d = new Date();
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+  return ${yyyy}-${mm}-${dd};
 };
 function addDaysISO(isoDate, days) {
   const d = new Date(isoDate);
@@ -52,14 +86,17 @@ function addDaysISO(isoDate, days) {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+  return ${yyyy}-${mm}-${dd};
 }
 function normalizeDate(d) {
   if (!d) return "";
-  const t = String(d).toLowerCase();
+  const t = d.toLowerCase().trim();
   if (t === "today") return nowNY();
   if (t === "tomorrow") return addDaysISO(nowNY(), 1);
-  return d;
+  if (["monday","tuesday","wednesday","thursday","friday","saturday","sunday"].includes(t)) {
+    return parseWeekdayToISO(t) || d;
+  }
+  return d; // keep as-is (already ISO or natural)
 }
 function normalizeService(s) {
   if (!s) return "";
@@ -75,42 +112,8 @@ function normalizePhone(num) {
   return d.length >= 10 ? d : "";
 }
 
-// Friendly confirmation readout
-const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-function ordinal(n) {
-  const s = ["th","st","nd","rd"], v = n % 100;
-  return n + (s[(v-20)%10] || s[v] || s[0]);
-}
-function humanDate(isoOrWord) {
-  // if already YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}$/.test(isoOrWord)) {
-    const d = new Date(isoOrWord + "T00:00:00");
-    if (isNaN(d.getTime())) return isoOrWord;
-    const m = MONTHS[d.getMonth()];
-    const day = ordinal(d.getDate());
-    return `${m} ${day}`;
-  }
-  // pass through words like "Monday" (GPT may produce ISO upstream, but handle gracefully)
-  return isoOrWord;
-}
-function humanTime(t) {
-  // accepts "3 PM", "15:00", "3PM"
-  const m = String(t).trim().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap]m)?$/i);
-  if (!m) return t;
-  let h = parseInt(m[1], 10);
-  const min = m[2] ? m[2] : "00";
-  const ampm = m[3] ? m[3].toUpperCase() : (h >= 12 ? "PM" : "AM");
-  if (!m[3] && h > 12) h = h - 12;
-  if (h === 0) h = 12;
-  return `${h}:${min !== "00" ? min : ""} ${ampm}`.replace(":  ", " ").replace(": ", " ");
-}
-function whenSpoken(date, time) {
-  const d = humanDate(date);
-  const t = humanTime(time);
-  return `${d} at ${t}`.replace(/\s+/g, " ").trim();
-}
+/* ---------------- Deepgram ---------------- */
 
-// ---------- Deepgram WebSocket ----------
 function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -124,7 +127,7 @@ function startDeepgram({ onFinal }) {
     + "&endpointing=250";
 
   const dg = new WebSocket(url, {
-    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    headers: { Authorization: token ${DEEPGRAM_API_KEY} },
     perMessageDeflate: false
   });
 
@@ -170,7 +173,8 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-// ---------- GPT ----------
+/* ---------------- OpenAI ---------------- */
+
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
     const resp = await axios.post(
@@ -184,7 +188,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
         ],
         ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
       },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+      { headers: { Authorization: Bearer ${OPENAI_API_KEY} } }
     );
     return resp.data.choices[0].message.content.trim();
   } catch (e) {
@@ -193,7 +197,8 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   }
 }
 
-// ---------- TTS ----------
+/* ---------------- TTS (ElevenLabs) ---------------- */
+
 async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
@@ -202,12 +207,12 @@ async function say(ws, text) {
   console.log(JSON.stringify({ event: "BOT_SAY", reply: text }));
 
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-    console.warn("[WARN] No ElevenLabs credentials, skipping TTS");
+    console.warn('{"ts":"'+new Date().toISOString()+'","level":"WARN","msg":"No ElevenLabs credentials, skipping TTS"}');
     return;
   }
 
   try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000;
     const resp = await axios.post(
       url,
       { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
@@ -225,12 +230,16 @@ async function say(ws, text) {
   }
 }
 
-// ---------- Slot state helpers ----------
+/* ---------------- Slot / State ---------------- */
+
 function newState() {
   return {
     phase: "idle", // 'idle' | 'booking'
-    confirmed: false, // <-- NEW: prevents repeat confirmations
-    slots: { service: "", date: "", time: "", name: "", phone: "" }
+    slots: { service: "", date: "", time: "", name: "", phone: "" },
+    lastAsked: "",       // which slot we last asked for (service|datetime|name|phone)
+    lastAskTs: 0,        // when we last asked
+    confirmSent: false,  // confirmation already spoken
+    clarify: { name:0, phone:0, datetime:0 }, // simple clarify counters
   };
 }
 function mergeSlots(state, parsed) {
@@ -257,8 +266,6 @@ function mergeSlots(state, parsed) {
   }
 
   if (changed) {
-    // any slot change after confirmation forces re-confirm
-    if (state.confirmed) state.confirmed = false;
     console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots }));
   }
 }
@@ -269,44 +276,93 @@ function nextMissing(state) {
   if (!state.slots.phone) return "phone";
   return "done";
 }
-
-async function confirmOnce(ws, state) {
-  // Gate: confirm ONLY once per complete set of slots
-  if (state.confirmed) return;
-  const spoken = whenSpoken(state.slots.date, state.slots.time);
-  console.log(JSON.stringify({ event: "CONFIRM_READY", slots: state.slots, whenSpoken: spoken }));
-  await say(ws, `Great — I’ve got a ${state.slots.service} for ${state.slots.name} on ${spoken}. I have your number as (${state.slots.phone.slice(0,3)}) ${state.slots.phone.slice(3,6)}-${state.slots.phone.slice(6)}. You’re all set. Anything else I can help with?`);
-  state.confirmed = true;
+function buildAskForSlotText(state, missing){
+  if (missing === "service") return "What service would you like — a haircut, beard trim, or the combo?";
+  if (missing === "datetime") return What date and time would you like for your ${state.slots.service || "appointment"}?;
+  if (missing === "name") return "Can I get your first name?";
+  if (missing === "phone") return "What phone number should I use for confirmations?";
+  return "";
 }
-
 async function askForMissing(ws, state) {
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: state.slots, missing }));
 
-  // Only confirm if not yet confirmed
-  if (missing === "done") {
-    return confirmOnce(ws, state);
+  // prevent duplicate rapid-fire asking the same thing
+  const now = Date.now();
+  if (missing !== "done") {
+    if (state.lastAsked === missing && (now - state.lastAskTs) < 1200) {
+      return; // throttle duplicate ask
+    }
   }
 
-  if (missing === "service") return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
-  if (missing === "datetime") return say(ws, `What date and time would you like for your ${state.slots.service || "appointment"}?`);
-  if (missing === "name") return say(ws, "Can I get your first name?");
-  if (missing === "phone") return say(ws, "What phone number should I use for confirmations?");
+  if (missing === "service") {
+    state.lastAsked = "service"; state.lastAskTs = now;
+    return say(ws, buildAskForSlotText(state, "service"));
+  }
+  if (missing === "datetime") {
+    state.lastAsked = "datetime"; state.lastAskTs = now;
+    return say(ws, buildAskForSlotText(state, "datetime"));
+  }
+  if (missing === "name") {
+    state.lastAsked = "name"; state.lastAskTs = now;
+    return say(ws, buildAskForSlotText(state, "name"));
+  }
+  if (missing === "phone") {
+    state.lastAsked = "phone"; state.lastAskTs = now;
+    return say(ws, buildAskForSlotText(state, "phone"));
+  }
+
+  // done → single confirmation once
+  if (missing === "done" && !state.confirmSent) {
+    const when = ${prettyDate(state.slots.date)} at ${prettyTime(state.slots.time)};
+    console.log(JSON.stringify({ event: "CONFIRM_READY", slots: state.slots, whenSpoken: when }));
+    state.confirmSent = true;
+    state.lastAsked = ""; // reset ask tracking
+    state.lastAskTs = Date.now();
+    return say(ws, Great — I’ve got a ${state.slots.service} for ${state.slots.name} on ${when}. I have your number as (${state.slots.phone.slice(0,3)}) ${state.slots.phone.slice(3,6)}-${state.slots.phone.slice(6)}. You’re all set. Anything else I can help with?);
+  }
+}
+async function maybeResume(ws, state) {
+  if (state.phase === "booking") {
+    const missing = nextMissing(state);
+    if (missing !== "done") {
+      await askForMissing(ws, state);
+      return true;
+    }
+  }
+  return false;
 }
 
-async function maybeResume(ws, state) {
-  if (state.phase !== "booking") return false;
+/* ------------- Smalltalk blending (governor) ------------- */
+
+async function smalltalkLine(transcript){
+  const fallbackPrompt = `
+You are a friendly receptionist at Old Line Barbershop.
+Reply with ONE short, warm line (<=16 words).
+Do NOT ask a question. Do NOT mention booking. No emojis.
+Examples: "I know, right? Perfect weather!" / "Nice to meet you!" / "Totally understand."
+`.trim();
+  const nlg = await askGPT(fallbackPrompt, transcript);
+  return (nlg || "Got it.");
+}
+
+async function smalltalkThenResume(ws, state, transcript){
+  // One utterance to keep a single conversational thread
+  const line = await smalltalkLine(transcript);
   const missing = nextMissing(state);
   if (missing === "done") {
-    // already confirmed? do nothing.
-    if (!state.confirmed) await confirmOnce(ws, state);
-    return true;
+    return say(ws, line);
   }
-  await askForMissing(ws, state);
-  return true;
+  const ask = buildAskForSlotText(state, missing);
+  // blend into one message so we don't spawn two overlapping "threads"
+  const out = ${line} ${ask};
+  state.lastAsked = missing;
+  state.lastAskTs = Date.now();
+  await say(ws, out);
 }
 
-// ---------- Classify + handle ----------
+/* ---------------- Classify & Handle ---------------- */
+
 async function classifyAndHandle(ws, state, transcript) {
   const systemPrompt = `
 Return STRICT JSON:
@@ -321,11 +377,11 @@ Return STRICT JSON:
 }
 
 Rules:
-- Detect booking requests even if mixed with questions.
-- If user changes their mind about service, update "service".
+- Detect booking even if mixed with chit-chat.
+- If user changes service, update "service".
 - For FAQs, do NOT start booking unless they ask to book.
 - Keep values short; leave blank if unsure.
-  `.trim();
+`.trim();
 
   let parsed = {};
   try {
@@ -334,10 +390,10 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // Merge/normalize & possibly reset confirmation
+  // Merge slots (never lose info)
   mergeSlots(state, parsed);
 
-  // FAQ
+  // Branch: FAQ
   if (parsed.intent === "FAQ") {
     let answer = "";
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
@@ -347,42 +403,46 @@ Rules:
     if (!answer) answer = "Happy to help. What else can I answer?";
 
     if (state.phase === "booking") {
+      // Answer, then resume the ONE booking thread
       await say(ws, answer);
       await maybeResume(ws, state);
     } else {
-      await say(ws, `${answer} Would you like to book an appointment?`);
+      await say(ws, ${answer} Would you like to book an appointment?);
     }
     return;
   }
 
-  // Transfer
+  // Branch: transfer
   if (parsed.intent === "TRANSFER") {
     await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
     try { ws.close(); } catch {}
     return;
   }
 
-  // Booking
+  // Branch: booking
   if (parsed.intent === "BOOK") {
     state.phase = "booking";
+    state.confirmSent = false; // if they changed anything, allow a fresh confirmation
     await askForMissing(ws, state);
     return;
   }
 
   // Smalltalk/Unknown
-  const fallbackPrompt = `
-You are a friendly receptionist at Old Line Barbershop.
-Reply with ONE short, natural sentence (<= 18 words).
-If caller is mid-booking, keep it friendly, then continue the flow when possible.
-Examples: "I know—wild weather! Can I get your first name?" or "Sure—what do you need?"
-  `.trim();
-  const nlg = await askGPT(fallbackPrompt, transcript);
-  await say(ws, nlg || "Okay—how can I help?");
-  // Only resume if not already fully confirmed.
-  if (!state.confirmed) await maybeResume(ws, state);
+  if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+    if (state.phase === "booking") {
+      // GOVERNOR: keep one thread only → blend a warm line + resume missing slot
+      await smalltalkThenResume(ws, state, transcript);
+    } else {
+      // idle smalltalk
+      const line = await smalltalkLine(transcript);
+      await say(ws, line);
+    }
+    return;
+  }
 }
 
-// ---------- WS ----------
+/* ---------------- WS: Twilio Media Stream ---------------- */
+
 wss.on("connection", (ws) => {
   let dg = null;
   let pendingULaw = [];
@@ -396,9 +456,8 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__state = newState();
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws._streamSid, convoId: ws._convoId }));
 
-      // Start Deepgram
       dg = startDeepgram({
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
