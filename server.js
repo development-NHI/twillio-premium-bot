@@ -11,80 +11,93 @@ dotenv.config();
 
 const PORT = process.env.PORT || 5000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || process.env.DEEPGRAM_API_KEY; // tolerate both
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
 const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL;
+const AGENT_PROMPT = process.env.AGENT_PROMPT || "You are a friendly, human-sounding AI receptionist.";
 
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
 if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
 
+// ---- express
 const app = express();
 app.use(bodyParser.json());
-
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
-
 app.post("/twiml", (_, res) => {
   res.set("Content-Type", "text/xml");
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || "localhost:"+PORT}"/>
+        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || ("localhost:" + PORT)}"/>
       </Connect>
     </Response>
   `);
 });
-
 const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
+
 const wss = new WebSocketServer({ server });
 
-/* ----------------- Helpers ----------------- */
-const SERVICES = ["haircut", "beard trim", "combo"];
-function normalizeService(t = "") {
-  const s = t.toLowerCase();
-  if (/\b(combo|both|haircut\s*(\+|and|&)\s*beard)\b/.test(s)) return "combo";
-  if (/\bbeard/.test(s)) return "beard trim";
-  if (/\bhair ?cut\b/.test(s)) return "haircut";
+// ---------- helpers: state/slots ----------
+function newState() {
+  return {
+    convoId: uuidv4(),
+    phase: "idle", // idle | booking
+    lastPrompt: "",
+    lastPromptAt: 0,
+    slots: { service: "", date: "", time: "", name: "", phone: "" }
+  };
+}
+function logJSON(obj) {
+  try { console.log(JSON.stringify(obj)); } catch {}
+}
+function normalizeService(s) {
+  if (!s) return "";
+  const t = s.toLowerCase();
+  if (/\b(combo|both|haircut\s*(\+|and|&)\s*beard)\b/.test(t)) return "combo";
+  if (/\bbeard\b/.test(t)) return "beard trim";
+  if (/\bhair\s*cut|\bhaircut\b/.test(t)) return "haircut";
   return "";
 }
-function normalizePhone(num) {
-  if (!num) return "";
-  const d = num.replace(/\D/g, "");
-  if (d.length >= 10) return d.slice(-10);
-  return "";
+function mergeSlots(state, info) {
+  const before = { ...state.slots };
+  if (info.service) state.slots.service = normalizeService(info.service) || state.slots.service;
+  if (info.date) state.slots.date = info.date;
+  if (info.time) state.slots.time = info.time;
+  if (info.name) state.slots.name = info.name;
+  if (info.phone) state.slots.phone = info.phone;
+  logJSON({ event: "SLOTS_MERGE", before, after: state.slots });
 }
-function fmtPhone10(d) {
-  if (d.length !== 10) return d;
-  return `(${d.slice(0,3)}) ${d.slice(3,6)}-${d.slice(6)}`;
-}
-function tomorrowISO() {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-function computeEndFrom(dateISO, time24) {
-  try {
-    if (!dateISO || !time24) return "";
-    const [hh, mm] = time24.split(":").map(x => parseInt(x, 10));
-    const dt = new Date(`${dateISO}T${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:00Z`);
-    const end = new Date(dt.getTime() + 30 * 60 * 1000);
-    return end.toISOString();
-  } catch { return ""; }
-}
-function missingSlot(slots) {
+function nextMissingSlot(slots) {
   if (!slots.service) return "service";
   if (!slots.date || !slots.time) return "datetime";
   if (!slots.name) return "name";
   if (!slots.phone) return "phone";
-  return "";
+  return null;
+}
+function debouncePrompt(state, text, ms = 1800) {
+  const now = Date.now();
+  if (text === state.lastPrompt && (now - state.lastPromptAt) < ms) return true;
+  state.lastPrompt = text;
+  state.lastPromptAt = now;
+  return false;
+}
+function isWeekdayBusinessHours(dateISO, time24) {
+  if (!dateISO || !time24) return true; // don’t block if we can’t parse
+  try {
+    const d = new Date(`${dateISO}T${time24}:00`);
+    const day = d.getUTCDay(); // 0 Sun .. 6 Sat (UTC; approximate)
+    // business: Mon–Fri
+    if (day === 0 || day === 6) return false;
+    const hour = parseInt(time24.split(":")[0], 10);
+    // 9–17 local desired; we can’t easily TZ-correct here, keep loose
+    return hour >= 9 && hour < 17;
+  } catch { return true; }
 }
 
-/* ----------------- Deepgram WebSocket ----------------- */
+// ---------- Deepgram WebSocket ----------
 function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -112,7 +125,7 @@ function startDeepgram({ onFinal }) {
     const text = (alt.transcript || "").trim();
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
-      console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
+      logJSON({ event: "ASR_FINAL", transcript: text });
       onFinal?.(text);
     }
   });
@@ -125,7 +138,7 @@ function startDeepgram({ onFinal }) {
   };
 }
 
-// μ-law -> PCM16LE
+// μ-law decode
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -137,11 +150,14 @@ function ulawByteToPcm16(u) {
 }
 function ulawBufferToPCM16LEBuffer(ulawBuf) {
   const out = Buffer.alloc(ulawBuf.length * 2);
-  for (let i = 0; i < ulawBuf.length; i++) out.writeInt16LE(ulawByteToPcm16(ulawBuf[i]), i * 2);
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const s = ulawByteToPcm16(ulawBuf[i]);
+    out.writeInt16LE(s, i * 2);
+  }
   return out;
 }
 
-/* ----------------- GPT ----------------- */
+// ---------- GPT ----------
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
     const resp = await axios.post(
@@ -164,13 +180,13 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   }
 }
 
-/* ----------------- TTS ----------------- */
+// ---------- TTS ----------
 async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
   if (!streamSid) return;
 
-  console.log(JSON.stringify({ event: "BOT_SAY", reply: text }));
+  logJSON({ event: "BOT_SAY", reply: text });
 
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[WARN] No ElevenLabs credentials, skipping TTS");
@@ -196,112 +212,75 @@ async function say(ws, text) {
   }
 }
 
-/* ----------------- Booking utils (NEW) ----------------- */
-function ensureBookingMode(ws) {
-  if (!ws.__slots) ws.__slots = { service: "", date: "", time: "", name: "", phone: "" };
-  if (!ws.__booking) ws.__booking = false;
-}
-function mergeSlots(ws, info, transcript) {
-  ensureBookingMode(ws);
+// ---------- booking helpers ----------
+function promptForNext(ws, state) {
+  const missing = nextMissingSlot(state.slots);
+  logJSON({ event: "SLOTS", slots: state.slots, missing });
+  if (!missing) return false;
 
-  // Service corrections (“actually I want combo”)
-  const svcInTranscript = normalizeService(transcript);
-  const svcParsed = normalizeService(info.service || "");
-  const svcPick = svcParsed || svcInTranscript;
-  if (svcPick) ws.__slots.service = svcPick;
+  let line = "";
+  if (missing === "service") line = "What service would you like — a haircut, beard trim, or the combo?";
+  else if (missing === "datetime") {
+    const svc = state.slots.service || "that";
+    line = `What date and time would you like for your ${svc}?`;
+  } else if (missing === "name") line = "Can I get your first name?";
+  else if (missing === "phone") line = "What phone number should I use for confirmations?";
 
-  // Date/time quick normalize for "tomorrow"
-  const dateRaw = (info.date || "").toLowerCase();
-  if (dateRaw === "tomorrow") ws.__slots.date = tomorrowISO();
-  else if (info.date) ws.__slots.date = info.date;
-
-  if (info.time) ws.__slots.time = info.time;
-
-  // Name & phone (pull even if intent flips to SMALLTALK)
-  if (info.name) ws.__slots.name = info.name.trim();
-  const phoneFromJSON = normalizePhone(info.phone || "");
-  const phoneFromWords = normalizePhone(transcript);
-  if (phoneFromJSON) ws.__slots.phone = phoneFromJSON;
-  else if (phoneFromWords && phoneFromWords.length === 10) ws.__slots.phone = phoneFromWords;
-
-  // If any booking slot is present, lock booking mode
-  if (Object.values(ws.__slots).some(Boolean)) ws.__booking = true;
-
-  console.log(JSON.stringify({ event: "SLOTS", slots: ws.__slots, missing: missingSlot(ws.__slots) || "none" }));
-}
-
-async function driveBooking(ws) {
-  ensureBookingMode(ws);
-  const m = missingSlot(ws.__slots);
-
-  if (m === "service") {
-    await say(ws, "What service would you like — a haircut, beard trim, or the combo?");
-    return true;
+  if (!debouncePrompt(state, line)) {
+    say(ws, line);
   }
-  if (m === "datetime") {
-    await say(ws, `What date and time would you like for your ${ws.__slots.service || "appointment"}?`);
-    return true;
-  }
-  if (m === "name") {
-    await say(ws, "Can I get your first name?");
-    return true;
-  }
-  if (m === "phone") {
-    await say(ws, "What phone number should I use for confirmations?");
-    return true;
-  }
-
-  // All set → finalize
-  const { service, date, time, name, phone } = ws.__slots;
-  const startISO = date && time ? new Date(`${date}T${time}:00Z`).toISOString() : "";
-  const endISO = computeEndFrom(date, time);
-
-  // Send to Make (best-effort)
-  if (MAKE_CREATE_URL) {
-    try {
-      await axios.post(MAKE_CREATE_URL, {
-        Event_Name: service || "Appointment",
-        Start_Time: startISO,
-        End_Time: endISO,
-        Customer_Name: name || "",
-        Customer_Phone: phone || "",
-        Customer_Email: "",
-        Notes: `Booked by voice agent.`
-      }, { timeout: 8000 });
-      console.log(JSON.stringify({ event: "MAKE_CREATE_OK" }));
-    } catch (e) {
-      console.error("[Make CREATE] error", e.message);
-    }
-  }
-
-  await say(ws, `Great, ${name}. I’ve booked a ${service} on ${date} at ${time}. I have your number as ${fmtPhone10(phone)}. You’re all set. Anything else I can help with?`);
-
-  // Keep ws.__booking true so user can adjust; if they say "actually", the next utterance can correct slots and we can reconfirm.
   return true;
 }
 
-/* ----------------- WS ----------------- */
-wss.on("connection", (ws) => {
-  let dg = null;
-  let pendingULaw = [];
-  const BATCH_FRAMES = 5;
+async function maybeResume(ws, state) {
+  if (state.phase === "booking" && nextMissingSlot(state.slots)) {
+    await promptForNext(ws, state);
+    return true;
+  }
+  return false;
+}
 
-  ws.on("message", async (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+async function finalizeIfReady(ws, state) {
+  const { service, date, time, name, phone } = state.slots;
+  if (!(service && date && time && name && phone)) return false;
 
-    if (msg.event === "start") {
-      ws.__streamSid = msg.start.streamSid;
-      ws.__convoId = uuidv4();
-      ws.__booking = false;
-      ws.__slots = { service: "", date: "", time: "", name: "", phone: "" };
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
+  if (!isWeekdayBusinessHours(date, time)) {
+    await say(ws, "We book appointments Monday to Friday, 9 AM to 5 PM. Could you pick a time during business hours?");
+    return true;
+  }
 
-      // Start Deepgram
-      dg = startDeepgram({
-        onFinal: async (text) => {
-          const systemPrompt = `
-Return JSON like:
+  const startISO = `${date}T${time}:00`;
+  // Add 30 minutes (simple string math not guaranteed; leave end to Make if needed)
+  // We’ll send both; if Make expects ISO strictly, it can compute end.
+  const payload = {
+    Event_Name: service,
+    Start_Time: startISO,
+    End_Time: "", // let Make compute 30-min end or leave blank if your scenario handles it
+    Customer_Name: name,
+    Customer_Phone: phone,
+    Customer_Email: "",
+    Notes: `Booked by phone agent.`
+  };
+
+  try {
+    if (MAKE_CREATE_URL) {
+      await axios.post(MAKE_CREATE_URL, payload, { timeout: 8000 });
+      logJSON({ event: "MAKE_CREATE", ok: true, payload });
+    }
+  } catch (e) {
+    logJSON({ event: "MAKE_CREATE", ok: false, error: e.message });
+  }
+
+  await say(ws, `Great, I’ve booked a ${service} for ${name} on ${date} at ${time}. You’ll get a confirmation at ${phone}. Anything else I can help with today?`);
+  state.phase = "idle"; // done
+  return true;
+}
+
+// ---------- intent classify ----------
+async function classifyAndHandle(ws, state, transcript) {
+  // strict JSON extractor that also pulls slot hints even during FAQ/SMALLTALK
+  const sys = `
+Return ONLY this JSON:
 {
  "intent": "FAQ" | "BOOK" | "SMALLTALK" | "TRANSFER" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
@@ -311,54 +290,87 @@ Return JSON like:
  "name": "",
  "phone": ""
 }
-- Always extract any slot values you can, even for SMALLTALK.
-- For "tomorrow", put "tomorrow" in date (the app will convert).
-- Prefer 24h time like "15:00".
-- Services: "haircut", "beard trim", or "combo".
-`;
-          const parsedJson = await askGPT(systemPrompt, text, "json");
-          let info = {};
-          try { info = JSON.parse(parsedJson || "{}"); } catch {}
-          console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript: text, parsed: info }));
+Rules:
+- If user changes service ("actually, make it combo"), set service to the NEW value.
+- If user asks about hours/prices/services/location, intent=FAQ and fill faq_topic.
+- For booking: prefer extracting service/date/time/name/phone if mentioned.
+- Keep answers short and natural when we later ask NLG.
+  `.trim();
 
-          // Always merge slots (even if intent wobbles)
-          mergeSlots(ws, info, text);
+  let parsed = {};
+  try {
+    const out = await askGPT(sys, transcript, "json");
+    parsed = JSON.parse(out || "{}");
+  } catch { parsed = {}; }
+  logJSON({ event: "GPT_CLASSIFY", transcript, parsed });
 
-          // FAQ outside booking mode
-          if (!ws.__booking && info.intent === "FAQ") {
-            let answer = "";
-            if (info.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
-            if (info.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
-            if (info.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo package.";
-            if (info.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
-            if (MAKE_FAQ_URL && info.faq_topic) {
-              try { await axios.post(MAKE_FAQ_URL, { intent: "FAQ", topic: info.faq_topic }, { timeout: 4000 }); } catch {}
-            }
-            await say(ws, answer || "Happy to help. Anything else?");
-            return;
-          }
+  // Merge slots from ANY intent (so “actually, combo” sticks)
+  mergeSlots(state, parsed);
 
-          // Transfer outside booking mode
-          if (!ws.__booking && info.intent === "TRANSFER") {
-            await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
-            try { ws.close(); } catch {}
-            return;
-          }
+  // FAQ answers
+  if (parsed.intent === "FAQ") {
+    let answer = "";
+    if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
+    if (parsed.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
+    if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and a combo package.";
+    if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
+    if (answer) {
+      await say(ws, answer);
+      // optional: log to Make
+      try {
+        if (MAKE_FAQ_URL) await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, transcript }, { timeout: 4000 });
+      } catch {}
+      // >>> resume booking if in progress
+      if (await maybeResume(ws, state)) return;
+      // else softly invite to book (without hijacking)
+      await say(ws, "Would you like to book an appointment?");
+      return;
+    }
+  }
 
-          // If user says “book”, or we already have any slots, drive booking
-          if (info.intent === "BOOK" || ws.__booking) {
-            ws.__booking = true;
-            await driveBooking(ws);
-            return;
-          }
+  // Transfer cases
+  if (parsed.intent === "TRANSFER") {
+    await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
+    try { ws.close(); } catch {}
+    return;
+  }
 
-          // Otherwise smalltalk fallback
-          const phrased = await askGPT(
-            "You are a helpful, concise, friendly receptionist. One short sentence. If user seems ready to book, gently ask what service they want.",
-            text
-          );
-          await say(ws, phrased || "How can I help you further?");
-        }
+  // Booking case (or we’re already in booking)
+  if (parsed.intent === "BOOK" || state.phase === "booking") {
+    state.phase = "booking";
+    if (await finalizeIfReady(ws, state)) return;
+    await promptForNext(ws, state);
+    return;
+  }
+
+  // Smalltalk / Unknown → brief reply, then resume if applicable
+  const hint = (state.phase === "booking" && nextMissingSlot(state.slots))
+    ? `Be brief, then ask ONLY the next missing item: ${nextMissingSlot(state.slots)}.` 
+    : "Be brief and helpful.";
+  const nlg = await askGPT(AGENT_PROMPT, `${transcript}\n\n${hint}`);
+  await say(ws, nlg || "Okay.");
+  if (await maybeResume(ws, state)) return;
+}
+
+// ---------- WS ----------
+wss.on("connection", (ws) => {
+  let dg = null;
+  let pendingULaw = [];
+  const BATCH_FRAMES = 5;
+
+  ws.__state = newState();
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg.event === "start") {
+      ws.__streamSid = msg.start.streamSid;
+      logJSON({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__state.convoId });
+
+      // Start Deepgram
+      dg = startDeepgram({
+        onFinal: async (text) => { await classifyAndHandle(ws, ws.__state, text); }
       });
 
       await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
@@ -381,6 +393,14 @@ Return JSON like:
 
     if (msg.event === "stop") {
       console.log("[INFO] Twilio stream STOP");
+      if (pendingULaw.length && dg) {
+        try {
+          const ulawChunk = Buffer.concat(pendingULaw);
+          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+          dg.sendPCM16LE(pcm16le);
+        } catch {}
+        pendingULaw = [];
+      }
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
     }
@@ -388,7 +408,6 @@ Return JSON like:
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
-    console.log("[INFO] WS closed", { convoId: ws.__convoId });
+    console.log("[INFO] WS closed", { convoId: ws.__state?.convoId });
   });
 });
-
