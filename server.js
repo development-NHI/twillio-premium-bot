@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
@@ -8,120 +9,193 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-let conversations = {};
+// =============================
+// GLOBAL STATE
+// =============================
+let conversations = {}; // { callSid: { step, service, datetime, name, phone } }
 
-const server = app.listen(PORT, () =>
-  console.log(`✅ Server running on port ${PORT}`)
-);
-const wss = new WebSocketServer({ server });
+function log(level, msg, meta = {}) {
+  console.log(`${new Date().toISOString()} - [${level}] - ${msg}`, Object.keys(meta).length ? meta : "");
+}
 
-// ===== Twilio entry point (for voice calls) =====
-app.post("/voice", (req, res) => {
-  res.type("text/xml");
-  res.send(`
-    <Response>
-      <Connect>
-        <Stream url="wss://${process.env.RENDER_URL}" />
-      </Connect>
-    </Response>
-  `);
+// =============================
+// HELPERS
+// =============================
+function normalizePhone(num) {
+  if (!num) return null;
+  return num.replace(/\D/g, "");
+}
+
+function computeEndTime(start) {
+  try {
+    const d = new Date(start);
+    return new Date(d.getTime() + 30 * 60000).toISOString();
+  } catch {
+    return "";
+  }
+}
+
+// Wrap GPT for phrasing
+async function phraseWithGPT(instruction, convo) {
+  try {
+    const resp = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: process.env.AGENT_PROMPT || "You are a natural receptionist. Rephrase instructions conversationally." },
+          { role: "user", content: instruction }
+        ],
+        temperature: 0.5,
+        max_tokens: 50
+      },
+      { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
+    );
+    return resp.data.choices[0].message.content.trim();
+  } catch (e) {
+    log("ERROR", "GPT phrasing failed", { error: e.message });
+    return instruction;
+  }
+}
+
+// =============================
+// MAKE.COM FUNCTIONS
+// =============================
+async function checkAvailability(startISO, endISO) {
+  try {
+    const r = await axios.post(process.env.MAKE_READ, { start: startISO, end: endISO });
+    return r.data.available; // assume Make returns { available: true/false }
+  } catch (e) {
+    log("ERROR", "Make READ failed", { error: e.message });
+    return false;
+  }
+}
+
+async function createBooking(payload) {
+  try {
+    const r = await axios.post(process.env.MAKE_CREATE, payload);
+    log("INFO", "Booking created", { status: r.status });
+    return true;
+  } catch (e) {
+    log("ERROR", "Make CREATE failed", { error: e.message });
+    return false;
+  }
+}
+
+async function logFAQ(topic) {
+  try {
+    await axios.post(process.env.MAKE_FAQ, { topic });
+  } catch {}
+}
+
+// =============================
+// STATE MACHINE HANDLER
+// =============================
+async function handleUtterance(ws, convo, text) {
+  log("DEBUG", "Handling", { step: convo.step, text });
+
+  if (convo.step === "start") {
+    convo.step = "service";
+    return phraseWithGPT("Ask what service they would like: haircut, beard trim, or combo.", convo);
+  }
+
+  if (convo.step === "service") {
+    if (/haircut/i.test(text)) convo.service = "Haircut";
+    else if (/beard/i.test(text)) convo.service = "Beard Trim";
+    else if (/combo|both/i.test(text)) convo.service = "Haircut + Beard Trim Combo";
+    if (convo.service) {
+      convo.step = "datetime";
+      return phraseWithGPT(`Ask what date and time they prefer for their ${convo.service}.`, convo);
+    }
+    return phraseWithGPT("Please confirm: haircut, beard trim, or combo?", convo);
+  }
+
+  if (convo.step === "datetime") {
+    convo.datetime = text; // TODO: add chrono parser if needed
+    convo.startISO = new Date(text).toISOString();
+    convo.endISO = computeEndTime(convo.startISO);
+    convo.step = "check_availability";
+    const available = await checkAvailability(convo.startISO, convo.endISO);
+    if (available) {
+      convo.step = "name";
+      return phraseWithGPT(`That time is open. Ask for their first name.`, convo);
+    } else {
+      convo.step = "datetime";
+      return phraseWithGPT("That time is not available. Suggest another slot.", convo);
+    }
+  }
+
+  if (convo.step === "name") {
+    convo.name = text;
+    convo.step = "phone";
+    return phraseWithGPT("Ask for their phone number for confirmations.", convo);
+  }
+
+  if (convo.step === "phone") {
+    const phone = normalizePhone(text);
+    if (phone && phone.length >= 10) {
+      convo.phone = phone;
+      convo.step = "confirm";
+      return phraseWithGPT(
+        `Confirm booking: ${convo.service} for ${convo.name} on ${convo.datetime}. Phone: ${convo.phone}.`,
+        convo
+      );
+    }
+    return phraseWithGPT("Sorry, I didn’t catch that. Please repeat your phone number with area code.", convo);
+  }
+
+  if (convo.step === "confirm") {
+    convo.step = "done";
+    await createBooking({
+      Event_Name: `${convo.service} – ${convo.name}`,
+      Start_Time: convo.startISO,
+      End_Time: convo.endISO,
+      Customer_Name: convo.name,
+      Customer_Phone: convo.phone,
+      Notes: `Booked via AI receptionist. CallSid=${convo.callSid}`
+    });
+    return phraseWithGPT("Great, your appointment is confirmed. Ask if anything else is needed before goodbye.", convo);
+  }
+
+  if (convo.step === "done") {
+    return phraseWithGPT("Thank them and say goodbye.", convo);
+  }
+}
+
+// =============================
+// WEBSOCKET SERVER
+// =============================
+const wss = new WebSocketServer({ noServer: true });
+
+app.server = app.listen(PORT, () => log("INFO", `🚀 Server running on ${PORT}`));
+
+app.server.on("upgrade", (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
 
-// ===== WebSocket handling =====
 wss.on("connection", (ws) => {
   const callSid = uuidv4();
-  conversations[callSid] = { transcript: [] };
-
-  console.log("📞 New call connected", callSid);
+  conversations[callSid] = { callSid, step: "start" };
+  log("INFO", "WS CONNECTED", { callSid });
 
   ws.on("message", async (msg) => {
     try {
       const data = JSON.parse(msg.toString());
-
-      // Handle transcription events from Twilio STT
-      if (data.event === "transcription") {
-        const transcript = data.transcription.text;
-        if (!transcript) return;
-
-        conversations[callSid].transcript.push({ role: "user", content: transcript });
-        console.log("👤 Caller:", transcript);
-
-        // GPT
-        const gptRes = await axios.post(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            model: "gpt-4o-mini",
-            messages: [
-              { role: "system", content: process.env.AGENT_PROMPT },
-              ...conversations[callSid].transcript,
-            ],
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              "Content-Type": "application/json",
-            },
-          }
-        );
-
-        const aiReply = gptRes.data.choices[0].message.content;
-        conversations[callSid].transcript.push({ role: "assistant", content: aiReply });
-        console.log("🤖 AI:", aiReply);
-
-        // Check for JSON action
-        let jsonAction = null;
-        try {
-          const match = aiReply.match(/\{[\s\S]*\}/);
-          if (match) jsonAction = JSON.parse(match[0]);
-        } catch {
-          console.log("⚠️ No valid JSON found in reply");
-        }
-
-        if (jsonAction && jsonAction.action) {
-          console.log("➡️ Action detected:", jsonAction.action);
-
-          let url = null;
-          if (jsonAction.action === "create_booking") url = process.env.MAKE_CREATE;
-          else if (jsonAction.action === "cancel_booking") url = process.env.MAKE_DELETE;
-          else if (jsonAction.action === "reschedule_booking") url = process.env.MAKE_READ;
-          else url = process.env.MAKE_WEBHOOK;
-
-          if (url) {
-            await axios.post(url, {
-              secret: process.env.MAKE_SECRET,
-              ...jsonAction,
-            });
-            console.log(`📡 Sent to Make.com scenario: ${url}`);
-          }
-        }
-
-        // ElevenLabs TTS
-        const tts = await axios.post(
-          `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVEN_VOICE_ID}`,
-          { text: aiReply },
-          {
-            headers: {
-              "xi-api-key": process.env.ELEVEN_API_KEY,
-              "Content-Type": "application/json",
-            },
-            responseType: "arraybuffer",
-          }
-        );
-
-        ws.send(
-          JSON.stringify({
-            event: "assistant",
-            audio: Buffer.from(tts.data).toString("base64"),
-          })
-        );
+      if (data.event === "transcript") {
+        const reply = await handleUtterance(ws, conversations[callSid], data.text);
+        if (reply) ws.send(JSON.stringify({ event: "bot", text: reply }));
       }
-    } catch (err) {
-      console.error("❌ Error:", err.message);
+    } catch (e) {
+      log("ERROR", "WS handler failed", { error: e.message });
     }
   });
 
   ws.on("close", () => {
-    console.log("☎️ Call ended", callSid);
+    log("INFO", "WS CLOSED", { callSid });
     delete conversations[callSid];
   });
 });
+
+app.get("/", (_, res) => res.send("✅ Old Line Barbershop receptionist running"));
