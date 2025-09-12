@@ -1,9 +1,10 @@
-// server.js
+// server.js — Old Line Barbershop AI Receptionist
 import express from "express";
 import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
+import twilio from "twilio";
 
 dotenv.config();
 const app = express();
@@ -239,4 +240,17 @@ wss.on("connection", (ws) => {
   });
 });
 
+// =============================
+// TWILIO ROUTE for 11200 FIX
+// =============================
+app.post("/twiml", (req, res) => {
+  const response = new twilio.twiml.VoiceResponse();
+  response.connect().stream({
+    url: `wss://${req.headers.host}/`
+  });
+  res.type("text/xml");
+  res.send(response.toString());
+});
+
+// Health check
 app.get("/", (_, res) => res.send("✅ Old Line Barbershop AI receptionist is running"));
