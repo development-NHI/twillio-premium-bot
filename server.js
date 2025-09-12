@@ -16,13 +16,11 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL;
 const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL;
-const AGENT_PROMPT = process.env.AGENT_PROMPT || "You are a friendly, human-sounding AI receptionist.";
 
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
 if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
 
-// ---- express
 const app = express();
 app.use(bodyParser.json());
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
@@ -31,7 +29,7 @@ app.post("/twiml", (_, res) => {
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || ("localhost:" + PORT)}"/>
+        <Stream url="wss://${process.env.RENDER_EXTERNAL_HOSTNAME || "localhost:"+PORT}"/>
       </Connect>
     </Response>
   `);
@@ -40,61 +38,43 @@ const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PO
 
 const wss = new WebSocketServer({ server });
 
-// ---------- helpers: state/slots ----------
-function newState() {
-  return {
-    convoId: uuidv4(),
-    phase: "idle", // idle | booking
-    lastPrompt: "",
-    lastPromptAt: 0,
-    slots: { service: "", date: "", time: "", name: "", phone: "" }
-  };
+// ---------- Utilities (tiny, safe) ----------
+const nowNY = () => {
+  // America/New_York naive handling (sufficient for "today/tomorrow" slot)
+  const d = new Date();
+  // quick-string YYYY-MM-DD
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+};
+function addDaysISO(isoDate, days) {
+  const d = new Date(isoDate);
+  d.setDate(d.getDate() + days);
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
-function logJSON(obj) {
-  try { console.log(JSON.stringify(obj)); } catch {}
+function normalizeDate(d) {
+  if (!d) return "";
+  const t = d.toLowerCase();
+  if (t === "today") return nowNY();
+  if (t === "tomorrow") return addDaysISO(nowNY(), 1);
+  return d; // keep as given if specific
 }
 function normalizeService(s) {
   if (!s) return "";
   const t = s.toLowerCase();
-  if (/\b(combo|both|haircut\s*(\+|and|&)\s*beard)\b/.test(t)) return "combo";
-  if (/\bbeard\b/.test(t)) return "beard trim";
+  if (/\b(combo|both|haircut\s*(?:\+|and|&)\s*beard)\b/.test(t)) return "combo";
+  if (/\bbeard/.test(t)) return "beard trim";
   if (/\bhair\s*cut|\bhaircut\b/.test(t)) return "haircut";
   return "";
 }
-function mergeSlots(state, info) {
-  const before = { ...state.slots };
-  if (info.service) state.slots.service = normalizeService(info.service) || state.slots.service;
-  if (info.date) state.slots.date = info.date;
-  if (info.time) state.slots.time = info.time;
-  if (info.name) state.slots.name = info.name;
-  if (info.phone) state.slots.phone = info.phone;
-  logJSON({ event: "SLOTS_MERGE", before, after: state.slots });
-}
-function nextMissingSlot(slots) {
-  if (!slots.service) return "service";
-  if (!slots.date || !slots.time) return "datetime";
-  if (!slots.name) return "name";
-  if (!slots.phone) return "phone";
-  return null;
-}
-function debouncePrompt(state, text, ms = 1800) {
-  const now = Date.now();
-  if (text === state.lastPrompt && (now - state.lastPromptAt) < ms) return true;
-  state.lastPrompt = text;
-  state.lastPromptAt = now;
-  return false;
-}
-function isWeekdayBusinessHours(dateISO, time24) {
-  if (!dateISO || !time24) return true; // don’t block if we can’t parse
-  try {
-    const d = new Date(`${dateISO}T${time24}:00`);
-    const day = d.getUTCDay(); // 0 Sun .. 6 Sat (UTC; approximate)
-    // business: Mon–Fri
-    if (day === 0 || day === 6) return false;
-    const hour = parseInt(time24.split(":")[0], 10);
-    // 9–17 local desired; we can’t easily TZ-correct here, keep loose
-    return hour >= 9 && hour < 17;
-  } catch { return true; }
+function normalizePhone(num) {
+  if (!num) return "";
+  const d = num.replace(/\D/g, "");
+  return d.length >= 10 ? d : "";
 }
 
 // ---------- Deepgram WebSocket ----------
@@ -125,7 +105,7 @@ function startDeepgram({ onFinal }) {
     const text = (alt.transcript || "").trim();
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
-      logJSON({ event: "ASR_FINAL", transcript: text });
+      console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
       onFinal?.(text);
     }
   });
@@ -186,7 +166,7 @@ async function say(ws, text) {
   const streamSid = ws.__streamSid;
   if (!streamSid) return;
 
-  logJSON({ event: "BOT_SAY", reply: text });
+  console.log(JSON.stringify({ event: "BOT_SAY", reply: text }));
 
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[WARN] No ElevenLabs credentials, skipping TTS");
@@ -212,144 +192,143 @@ async function say(ws, text) {
   }
 }
 
-// ---------- booking helpers ----------
-function promptForNext(ws, state) {
-  const missing = nextMissingSlot(state.slots);
-  logJSON({ event: "SLOTS", slots: state.slots, missing });
-  if (!missing) return false;
-
-  let line = "";
-  if (missing === "service") line = "What service would you like — a haircut, beard trim, or the combo?";
-  else if (missing === "datetime") {
-    const svc = state.slots.service || "that";
-    line = `What date and time would you like for your ${svc}?`;
-  } else if (missing === "name") line = "Can I get your first name?";
-  else if (missing === "phone") line = "What phone number should I use for confirmations?";
-
-  if (!debouncePrompt(state, line)) {
-    say(ws, line);
-  }
-  return true;
+// ---------- Slot state helpers (minimal) ----------
+function newState() {
+  return {
+    phase: "idle", // 'idle' | 'booking'
+    slots: { service: "", date: "", time: "", name: "", phone: "" }
+  };
 }
+function mergeSlots(state, parsed) {
+  const before = { ...state.slots };
+  let changed = false;
 
+  if (parsed.service) {
+    const svc = normalizeService(parsed.service);
+    if (svc && svc !== state.slots.service) { state.slots.service = svc; changed = true; }
+  }
+  if (parsed.date) {
+    const nd = normalizeDate(parsed.date);
+    if (nd && nd !== state.slots.date) { state.slots.date = nd; changed = true; }
+  }
+  if (parsed.time) {
+    if (parsed.time !== state.slots.time) { state.slots.time = parsed.time; changed = true; }
+  }
+  if (parsed.name) {
+    if (parsed.name !== state.slots.name) { state.slots.name = parsed.name; changed = true; }
+  }
+  if (parsed.phone) {
+    const ph = normalizePhone(parsed.phone);
+    if (ph && ph !== state.slots.phone) { state.slots.phone = ph; changed = true; }
+  }
+
+  if (changed) {
+    console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots }));
+  }
+}
+function nextMissing(state) {
+  if (!state.slots.service) return "service";
+  if (!state.slots.date || !state.slots.time) return "datetime";
+  if (!state.slots.name) return "name";
+  if (!state.slots.phone) return "phone";
+  return "done";
+}
+async function askForMissing(ws, state) {
+  const missing = nextMissing(state);
+  console.log(JSON.stringify({ event: "SLOTS", slots: state.slots, missing }));
+  if (missing === "service") return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+  if (missing === "datetime") return say(ws, `What date and time would you like for your ${state.slots.service || "appointment"}?`);
+  if (missing === "name") return say(ws, "Can I get your first name?");
+  if (missing === "phone") return say(ws, "What phone number should I use for confirmations?");
+  if (missing === "done") return say(ws, `Great — I have a ${state.slots.service} on ${state.slots.date} at ${state.slots.time} for ${state.slots.name}. I’ll text the confirmation to ${state.slots.phone}. Anything else I can help with?`);
+}
 async function maybeResume(ws, state) {
-  if (state.phase === "booking" && nextMissingSlot(state.slots)) {
-    await promptForNext(ws, state);
-    return true;
+  if (state.phase === "booking") {
+    const missing = nextMissing(state);
+    if (missing !== "done") {
+      await askForMissing(ws, state);
+      return true;
+    }
   }
   return false;
 }
 
-async function finalizeIfReady(ws, state) {
-  const { service, date, time, name, phone } = state.slots;
-  if (!(service && date && time && name && phone)) return false;
-
-  if (!isWeekdayBusinessHours(date, time)) {
-    await say(ws, "We book appointments Monday to Friday, 9 AM to 5 PM. Could you pick a time during business hours?");
-    return true;
-  }
-
-  const startISO = `${date}T${time}:00`;
-  // Add 30 minutes (simple string math not guaranteed; leave end to Make if needed)
-  // We’ll send both; if Make expects ISO strictly, it can compute end.
-  const payload = {
-    Event_Name: service,
-    Start_Time: startISO,
-    End_Time: "", // let Make compute 30-min end or leave blank if your scenario handles it
-    Customer_Name: name,
-    Customer_Phone: phone,
-    Customer_Email: "",
-    Notes: `Booked by phone agent.`
-  };
-
-  try {
-    if (MAKE_CREATE_URL) {
-      await axios.post(MAKE_CREATE_URL, payload, { timeout: 8000 });
-      logJSON({ event: "MAKE_CREATE", ok: true, payload });
-    }
-  } catch (e) {
-    logJSON({ event: "MAKE_CREATE", ok: false, error: e.message });
-  }
-
-  await say(ws, `Great, I’ve booked a ${service} for ${name} on ${date} at ${time}. You’ll get a confirmation at ${phone}. Anything else I can help with today?`);
-  state.phase = "idle"; // done
-  return true;
-}
-
-// ---------- intent classify ----------
+// ---------- Classify + handle (tight fallbacks) ----------
 async function classifyAndHandle(ws, state, transcript) {
-  // strict JSON extractor that also pulls slot hints even during FAQ/SMALLTALK
-  const sys = `
-Return ONLY this JSON:
+  const systemPrompt = `
+Return STRICT JSON:
 {
- "intent": "FAQ" | "BOOK" | "SMALLTALK" | "TRANSFER" | "UNKNOWN",
+ "intent": "FAQ" | "BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",
- "date": "",
- "time": "",
+ "service": "",  // "haircut" | "beard trim" | "combo" or phrase
+ "date": "",     // "today" | "tomorrow" | "YYYY-MM-DD" | weekday phrase
+ "time": "",     // e.g., "3 PM" or "15:00"
  "name": "",
  "phone": ""
 }
+
 Rules:
-- If user changes service ("actually, make it combo"), set service to the NEW value.
-- If user asks about hours/prices/services/location, intent=FAQ and fill faq_topic.
-- For booking: prefer extracting service/date/time/name/phone if mentioned.
-- Keep answers short and natural when we later ask NLG.
+- Detect booking requests even if mixed with questions.
+- If user changes their mind about service, update "service".
+- For FAQs, do NOT start booking unless they ask to book.
+- Keep values short; leave blank if unsure.
   `.trim();
 
   let parsed = {};
   try {
-    const out = await askGPT(sys, transcript, "json");
-    parsed = JSON.parse(out || "{}");
-  } catch { parsed = {}; }
-  logJSON({ event: "GPT_CLASSIFY", transcript, parsed });
+    const res = await askGPT(systemPrompt, transcript, "json");
+    parsed = JSON.parse(res || "{}");
+  } catch {}
+  console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // Merge slots from ANY intent (so “actually, combo” sticks)
+  // Normalize & merge slots (never lose context)
   mergeSlots(state, parsed);
 
-  // FAQ answers
+  // Branches
   if (parsed.intent === "FAQ") {
     let answer = "";
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
-    if (parsed.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
-    if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and a combo package.";
-    if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
-    if (answer) {
+    else if (parsed.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
+    else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
+    else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
+    if (!answer) answer = "Happy to help. What else can I answer?";
+
+    // One short line. If in booking, answer then resume; otherwise add a soft CTA.
+    if (state.phase === "booking") {
       await say(ws, answer);
-      // optional: log to Make
-      try {
-        if (MAKE_FAQ_URL) await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, transcript }, { timeout: 4000 });
-      } catch {}
-      // >>> resume booking if in progress
-      if (await maybeResume(ws, state)) return;
-      // else softly invite to book (without hijacking)
-      await say(ws, "Would you like to book an appointment?");
-      return;
+      await maybeResume(ws, state);
+    } else {
+      await say(ws, `${answer} Would you like to book an appointment?`);
     }
+    return;
   }
 
-  // Transfer cases
   if (parsed.intent === "TRANSFER") {
     await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
     try { ws.close(); } catch {}
     return;
   }
 
-  // Booking case (or we’re already in booking)
-  if (parsed.intent === "BOOK" || state.phase === "booking") {
+  if (parsed.intent === "BOOK") {
     state.phase = "booking";
-    if (await finalizeIfReady(ws, state)) return;
-    await promptForNext(ws, state);
+    // Make sure service/date/time/name/phone merged above; simply ask next missing
+    await askForMissing(ws, state);
     return;
   }
 
-  // Smalltalk / Unknown → brief reply, then resume if applicable
-  const hint = (state.phase === "booking" && nextMissingSlot(state.slots))
-    ? `Be brief, then ask ONLY the next missing item: ${nextMissingSlot(state.slots)}.` 
-    : "Be brief and helpful.";
-  const nlg = await askGPT(AGENT_PROMPT, `${transcript}\n\n${hint}`);
-  await say(ws, nlg || "Okay.");
-  if (await maybeResume(ws, state)) return;
+  // Smalltalk / Unknown → strictly short receptionist line, then resume if booking
+  if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+    const fallbackPrompt = `
+You are a friendly, human receptionist at Old Line Barbershop.
+ONLY reply with ONE short, conversational sentence (<= 18 words).
+Do not explain rules or how you work. Keep it casual and helpful.
+Examples: "Sure—what do you need?" / "Got it—how can I help?" / "No problem—what's up?"
+    `.trim();
+    const nlg = await askGPT(fallbackPrompt, transcript);
+    await say(ws, nlg || "Okay—how can I help?");
+    await maybeResume(ws, state);
+    return;
+  }
 }
 
 // ---------- WS ----------
@@ -358,19 +337,21 @@ wss.on("connection", (ws) => {
   let pendingULaw = [];
   const BATCH_FRAMES = 5;
 
-  ws.__state = newState();
-
   ws.on("message", async (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start") {
       ws.__streamSid = msg.start.streamSid;
-      logJSON({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__state.convoId });
+      ws.__convoId = uuidv4();
+      ws.__state = newState();
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
       // Start Deepgram
       dg = startDeepgram({
-        onFinal: async (text) => { await classifyAndHandle(ws, ws.__state, text); }
+        onFinal: async (text) => {
+          try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
+        }
       });
 
       await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
@@ -385,7 +366,7 @@ wss.on("connection", (ws) => {
       if (pendingULaw.length >= BATCH_FRAMES) {
         const ulawChunk = Buffer.concat(pendingULaw);
         const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-        try { dg.sendPCM16LE(pcm16le); } catch {}
+        dg.sendPCM16LE(pcm16le);
         pendingULaw = [];
       }
       return;
@@ -393,14 +374,6 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       console.log("[INFO] Twilio stream STOP");
-      if (pendingULaw.length && dg) {
-        try {
-          const ulawChunk = Buffer.concat(pendingULaw);
-          const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
-          dg.sendPCM16LE(pcm16le);
-        } catch {}
-        pendingULaw = [];
-      }
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
     }
@@ -408,6 +381,6 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
-    console.log("[INFO] WS closed", { convoId: ws.__state?.convoId });
+    console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
