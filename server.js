@@ -62,7 +62,7 @@ function addDaysISO(iso, days) {
   d.setDate(d.getDate() + days);
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate() + 0).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
 function weekdayToISO(weekday) {
@@ -176,8 +176,7 @@ function enforceBusinessWindow(state) {
   return { ok: true };
 }
 
-/* ----------------------- (NEW) Silence re-ask timers ----------------------- */
-// Do NOT modify existing behavior; only add per request.
+/* ----------------------- Silence re-ask timers (ADDED) ----------------------- */
 function clearQuestionTimers(ws) {
   if (ws.__qTimer1) { clearTimeout(ws.__qTimer1); ws.__qTimer1 = null; }
   if (ws.__qTimer2) { clearTimeout(ws.__qTimer2); ws.__qTimer2 = null; }
@@ -190,7 +189,7 @@ function startQuestionTimers(ws, questionText) {
   // 25s → re-ask
   ws.__qTimer1 = setTimeout(async () => {
     try {
-      await say(ws, `Sorry, I didn’t hear that. Could you please repeat? ${ws.__lastQuestion}`);
+      await say(ws, `Sorry, I didn’t hear that. Could you please tell me? ${ws.__lastQuestion}`);
     } catch {}
     // Another 25s → goodbye, then 8s → close
     ws.__qTimer2 = setTimeout(async () => {
@@ -401,7 +400,7 @@ async function askForMissing(ws, state) {
 
   if (missing !== "done") {
     await say(ws, question);
-    startQuestionTimers(ws, question); // <—— start 25s → re-ask → 25s → goodbye
+    startQuestionTimers(ws, question); // start 25s → re-ask → 25s → goodbye
     return;
   }
 
@@ -451,7 +450,7 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
-  // “this/my number” -> use caller ID
+  // “this/my number” -> use caller ID (if available)
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -466,9 +465,9 @@ Return STRICT JSON:
 {
  "intent": "FAQ" | "BOOK" | "DECLINE_BOOK" | "TRANSFER" | "END" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",
- "date": "",
- "time": "",
+ "service": "",  // "haircut" | "beard trim" | "combo" or phrase
+ "date": "",     // "today" | "tomorrow" | weekday | "YYYY-MM-DD"
+ "time": "",     // "3 PM" | "15:00"
  "name": "",
  "phone": ""
 }
@@ -588,7 +587,7 @@ Rules:
     }
 
     // Smalltalk/Unknown during booking: brief bridge + precise ask
-    if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN")) {
+    if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or combo?",
         "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
@@ -641,7 +640,7 @@ wss.on("connection", (ws) => {
       ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
-      // Start Deepgram (now passes ws so we can clear re-ask timers when caller speaks)
+      // Start Deepgram (pass ws so timers can be cleared when caller speaks)
       dg = startDeepgram(ws, {
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
@@ -675,6 +674,8 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
+    // Clear any outstanding question timers on socket close
+    clearQuestionTimers(ws);
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
