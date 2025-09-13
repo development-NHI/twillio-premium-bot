@@ -123,7 +123,7 @@ function to12h(t) {
   const ampm = hh >= 12 ? "PM" : "AM";
   if (hh === 0) hh = 12;
   if (hh > 12) hh -= 12;
-  return `${`${hh}:${mm}`.replace(":00","")} ${ampm}`;
+  return `${hh}:${mm}`.replace(":00","") + ` ${ampm}`;
 }
 function humanWhen(dateISO, timeStr) {
   const dSpoken = formatDateSpoken(dateISO);
@@ -138,6 +138,7 @@ function isWeekend(dateISO) {
   return day === 0 || day === 6;
 }
 function isWithinHours(timeStr) {
+  // Accept "3 PM" or "15:00" (we normalize to 24h minutes)
   if (!timeStr) return false;
   let hh = 0, mm = 0;
   const ampm = /am|pm/i.test(timeStr);
@@ -176,31 +177,8 @@ function enforceBusinessWindow(state) {
   return { ok: true };
 }
 
-/* ----------------------- Silence re-ask timers (ADDED) ----------------------- */
-function clearQuestionTimers(ws) {
-  if (ws.__qTimer1) { clearTimeout(ws.__qTimer1); ws.__qTimer1 = null; }
-  if (ws.__qTimer2) { clearTimeout(ws.__qTimer2); ws.__qTimer2 = null; }
-  ws.__lastQuestion = "";
-}
-function startQuestionTimers(ws, questionText) {
-  clearQuestionTimers(ws);
-  ws.__lastQuestion = questionText;
-
-  // 25s → re-ask
-  ws.__qTimer1 = setTimeout(async () => {
-    try {
-      await say(ws, `Sorry, I didn’t hear that. Could you please tell me? ${ws.__lastQuestion}`);
-    } catch {}
-    // Another 25s → goodbye, then 8s → close
-    ws.__qTimer2 = setTimeout(async () => {
-      try { await say(ws, "Thank you for calling Old Line Barbershop, goodbye."); } catch {}
-      setTimeout(() => { try { ws.close(); } catch {} }, 8000);
-    }, 25000);
-  }, 25000);
-}
-
 /* ----------------------- Deepgram WS ----------------------- */
-function startDeepgram(ws, { onFinal }) {
+function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=linear16"
@@ -228,8 +206,6 @@ function startDeepgram(ws, { onFinal }) {
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
       console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
-      // Caller spoke → cancel pending re-ask / goodbye timers
-      clearQuestionTimers(ws);
       onFinal?.(text);
     }
   });
@@ -370,6 +346,22 @@ function nextMissing(state) {
   if (!s.phone) return "phone";
   return "done";
 }
+
+/* ------ Goodbye handling (post-confirmation) ------ */
+function clearGoodbyeTimers(ws) {
+  if (ws.__goodbyeSilenceTimer) { clearTimeout(ws.__goodbyeSilenceTimer); ws.__goodbyeSilenceTimer = null; }
+  if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+}
+function armGoodbyeSilence(ws, state) {
+  clearGoodbyeTimers(ws);
+  ws.__goodbyeSilenceTimer = setTimeout(async () => {
+    await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+    ws.__hangTimer = setTimeout(() => {
+      try { ws.close(); } catch {}
+    }, 8000); // Wait 8s so audio fully plays before hangup
+  }, 7000);   // 7s silence before goodbye
+}
+
 async function askForMissing(ws, state) {
   const s = state.slots;
   const missing = nextMissing(state);
@@ -382,47 +374,42 @@ async function askForMissing(ws, state) {
   state.lastAskKey = key;
   state.lastAskAt = now;
 
-  let question = "";
   if (missing === "service")
-    question = "Which service would you like — haircut, beard trim, or combo?";
-  else if (missing === "datetime") {
-    if (s.date && !s.time) question = `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`;
-    else if (!s.date && s.time) question = `What day works for your ${s.service} at ${to12h(s.time)}?`;
-    else question = `What date and time would you like for your ${s.service || "appointment"}?`;
-  } else if (missing === "date")
-    question = `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`;
-  else if (missing === "time")
-    question = `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`;
-  else if (missing === "name")
-    question = "Can I get your first name?";
-  else if (missing === "phone")
-    question = "What phone number should I use for confirmations?";
+    return say(ws, "Which service would you like — haircut, beard trim, or combo?");
 
-  if (missing !== "done") {
-    await say(ws, question);
-    startQuestionTimers(ws, question); // start 25s → re-ask → 25s → goodbye
-    return;
+  if (missing === "datetime") {
+    if (s.date && !s.time) return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+    if (!s.date && s.time) return say(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
+    return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
   }
 
-  // Enforce hours before confirming
-  const check = enforceBusinessWindow(state);
-  if (!check.ok) {
-    if (check.reason === "weekend") {
-      const q = "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?";
-      await say(ws, q);
-      startQuestionTimers(ws, q);
-      return;
-    }
-    if (check.reason === "hours") {
-      const q = "We’re open 9 AM to 5 PM. What time that day works within business hours?";
-      await say(ws, q);
-      startQuestionTimers(ws, q);
-      return;
-    }
-    return askForMissing(ws, state);
-  }
+  if (missing === "date")
+    return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
 
-  return triggerConfirm(ws, state);
+  if (missing === "time")
+    return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+
+  if (missing === "name")
+    return say(ws, "Can I get your first name?");
+
+  if (missing === "phone")
+    return say(ws, "What phone number should I use for confirmations?");
+
+  if (missing === "done") {
+    // Enforce business hours before confirming
+    const check = enforceBusinessWindow(state);
+    if (!check.ok) {
+      if (check.reason === "weekend") {
+        return say(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+      }
+      if (check.reason === "hours") {
+        return say(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+      }
+      // If incomplete, fall through to resume
+      return askForMissing(ws, state);
+    }
+    return triggerConfirm(ws, state);
+  }
 }
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
@@ -446,11 +433,14 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
   await say(ws, line);
+
+  // Arm post-confirmation silence hangup (7s silence → goodbye → wait 8s → close)
+  armGoodbyeSilence(ws, state);
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
-  // “this/my number” -> use caller ID (if available)
+  // “this/my number” -> use caller ID (do not modify per your request)
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -485,6 +475,18 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
+  // NEW: guard against accidental END on casual remarks
+  const explicitEnd = /\b(bye|goodbye|that'?s (it|all)|nothing else|we('re| are) done|hang ?up|end (the )?call|no(,)? (thanks|thank you),? (that'?s )?(all|it))\b/i.test(transcript);
+  if (parsed.intent === "END" && !explicitEnd) {
+    parsed.intent = "SMALLTALK";
+  }
+
+  // Reset goodbye silence if user talks after confirmation
+  if (state.phase === "confirmed") {
+    clearGoodbyeTimers(ws);
+  }
+
+  const prevPhase = state.phase;
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
   // Acknowledge slot changes during booking
@@ -500,8 +502,13 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
-  // End / post-confirm wrap
-  if (parsed.intent === "END") {
+  // End / post-confirm wrap (guarded)
+  if (parsed.intent === "END" && explicitEnd) {
+    if (state.phase === "confirmed") {
+      await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+      setTimeout(() => { try { ws.close(); } catch {} }, 8000);
+      return;
+    }
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
     setTimeout(() => { try { ws.close(); } catch {} }, 8000);
     return;
@@ -566,16 +573,10 @@ Rules:
       const check = enforceBusinessWindow(state);
       if (!check.ok) {
         if (check.reason === "weekend") {
-          const q = "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?";
-          await say(ws, q);
-          startQuestionTimers(ws, q);
-          return;
+          return say(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
         }
         if (check.reason === "hours") {
-          const q = "We’re open 9 AM to 5 PM. What time that day works within business hours?";
-          await say(ws, q);
-          startQuestionTimers(ws, q);
-          return;
+          return say(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
         }
       }
       return triggerConfirm(ws, state);
@@ -604,10 +605,7 @@ Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
 `.trim();
 
       const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure.";
-      const combo = `${bridge} ${targetAsk}`;
-      await say(ws, combo);
-      startQuestionTimers(ws, targetAsk);
-      return;
+      return say(ws, `${bridge} ${targetAsk}`);
     }
 
     return askForMissing(ws, state);
@@ -615,6 +613,17 @@ Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
 
   // SMALLTALK / UNKNOWN outside booking — short + pivot to help
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+    // Idle smalltalk pivot: ask how to help next
+    if (state.phase === "idle") {
+      const polite = `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`;
+      return say(ws, polite);
+    }
+    // Confirmed smalltalk: keep it short, but don't re-offer booking
+    if (state.phase === "confirmed") {
+      const nlg = "Happy to help!";
+      return say(ws, nlg);
+    }
+    // In booking, we handle above with bridge+targeted ask
     const fallbackPrompt = `
 Reply with one short, casual sentence (<=12 words). No follow-up questions.
 `.trim();
@@ -638,10 +647,11 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
+      clearGoodbyeTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
-      // Start Deepgram (pass ws so timers can be cleared when caller speaks)
-      dg = startDeepgram(ws, {
+      // Start Deepgram
+      dg = startDeepgram({
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
         }
@@ -666,7 +676,6 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "stop") {
-      console.log("[INFO] Twilio stream STOP");
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
     }
@@ -674,8 +683,5 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
-    // Clear any outstanding question timers on socket close
-    clearQuestionTimers(ws);
-    console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
