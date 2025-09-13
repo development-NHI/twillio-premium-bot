@@ -137,7 +137,7 @@ function clearSilenceTimers(ws) {
 async function sayAndHangUp(ws, msg) {
   try {
     await say(ws, msg);
-    await sleep(8000); // let audio play out fully
+    await sleep(8000);
     try { ws.close(); } catch {}
   } catch {}
 }
@@ -155,7 +155,7 @@ function armSilence(ws, lastQuestion) {
 }
 
 /* ----------------------- Deepgram WS ----------------------- */
-function startDeepgram({ onFinal }) {
+function startDeepgram(ws, { onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=linear16"
@@ -336,8 +336,8 @@ function armGoodbyeSilence(ws, state) {
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
     ws.__hangTimer = setTimeout(() => {
       try { ws.close(); } catch {}
-    }, 8000); // Wait 8s so audio fully plays before hangup
-  }, 7000);   // 7s silence before goodbye
+    }, 8000);
+  }, 7000);
 }
 
 async function askForMissing(ws, state) {
@@ -345,49 +345,46 @@ async function askForMissing(ws, state) {
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
-  // avoid repeating exact same ask within 1.2s
   const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
   const now = Date.now();
   if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
   state.lastAskKey = key;
   state.lastAskAt = now;
 
-  if (missing === "service")
-    return say(ws, "Which service would you like — haircut, beard trim, or combo?");
+  let question = "";
+  if (missing === "service") question = "Which service would you like — haircut, beard trim, or combo?";
+  else if (missing === "datetime") {
+    if (s.date && !s.time) question = `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`;
+    else if (!s.date && s.time) question = `What day works for your ${s.service} at ${to12h(s.time)}?`;
+    else question = `What date and time would you like for your ${s.service || "appointment"}?`;
+  } else if (missing === "date") question = `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`;
+  else if (missing === "time") question = `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`;
+  else if (missing === "name") question = "Can I get your first name?";
+  else if (missing === "phone") question = "What phone number should I use for confirmations?";
 
-  if (missing === "datetime") {
-    if (s.date && !s.time) return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-    if (!s.date && s.time) return say(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
-    return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
+  if (missing !== "done") {
+    await say(ws, question);
+    armSilence(ws, question); // start 25s silence watchdog after each question
+    return;
   }
 
-  if (missing === "date")
-    return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
-
-  if (missing === "time")
-    return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-
-  if (missing === "name")
-    return say(ws, "Can I get your first name?");
-
-  if (missing === "phone")
-    return say(ws, "What phone number should I use for confirmations?");
-
-  if (missing === "done") {
-    // Enforce business hours before confirming
-    const check = enforceBusinessWindow(state);
-    if (!check.ok) {
-      if (check.reason === "weekend") {
-        return say(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
-      }
-      if (check.reason === "hours") {
-        return say(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
-      }
-      // If incomplete, fall through to resume
-      return askForMissing(ws, state);
+  const check = enforceBusinessWindow(state);
+  if (!check.ok) {
+    if (check.reason === "weekend") {
+      const q = "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?";
+      await say(ws, q);
+      armSilence(ws, q);
+      return;
     }
-    return triggerConfirm(ws, state);
+    if (check.reason === "hours") {
+      const q = "We’re open 9 AM to 5 PM. What time that day works within business hours?";
+      await say(ws, q);
+      armSilence(ws, q);
+      return;
+    }
+    return askForMissing(ws, state);
   }
+  return triggerConfirm(ws, state);
 }
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
@@ -411,12 +408,10 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
   await say(ws, line);
-
-  // Arm post-confirmation silence hangup (7s silence → goodbye → wait 8s → close)
   armGoodbyeSilence(ws, state);
 }
 
-/* ---- Hours guard used above ---- */
+/* ---- Hours guard ---- */
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
   const day = d.getDay();
@@ -463,7 +458,6 @@ function enforceBusinessWindow(state) {
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
-  // “this/my number” -> use caller ID (do not modify per your request)
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -478,9 +472,9 @@ Return STRICT JSON:
 {
  "intent": "FAQ" | "BOOK" | "DECLINE_BOOK" | "TRANSFER" | "END" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",  // "haircut" | "beard trim" | "combo" or phrase
- "date": "",     // "today" | "tomorrow" | weekday | "YYYY-MM-DD"
- "time": "",     // "3 PM" | "15:00"
+ "service": "",
+ "date": "",
+ "time": "",
  "name": "",
  "phone": ""
 }
@@ -498,15 +492,12 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // Reset goodbye silence if user talks after confirmation
   if (state.phase === "confirmed") {
     clearGoodbyeTimers(ws);
   }
 
-  const prevPhase = state.phase;
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // Acknowledge slot changes during booking
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
     for (const k of changedKeys) {
@@ -519,7 +510,6 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
-  // End / post-confirm wrap
   if (parsed.intent === "END") {
     if (state.phase === "confirmed") {
       await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
@@ -531,13 +521,11 @@ Rules:
     return;
   }
 
-  // Declined booking (keep idle)
   if (parsed.intent === "DECLINE_BOOK") {
     state.phase = "idle";
     return say(ws, "No problem. How else can I help?");
   }
 
-  // FAQs
   if (parsed.intent === "FAQ") {
     let answer = "";
     try {
@@ -581,7 +569,6 @@ Rules:
     return;
   }
 
-  // Booking gate: only enter booking if the user asked to book OR already in booking
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
 
@@ -590,21 +577,25 @@ Rules:
       const check = enforceBusinessWindow(state);
       if (!check.ok) {
         if (check.reason === "weekend") {
-          return say(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+          const q = "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?";
+          await say(ws, q);
+          armSilence(ws, q);
+          return;
         }
         if (check.reason === "hours") {
-          return say(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+          const q = "We’re open 9 AM to 5 PM. What time that day works within business hours?";
+          await say(ws, q);
+          armSilence(ws, q);
+          return;
         }
       }
       return triggerConfirm(ws, state);
     }
 
-    // If caller gave exactly the missing piece, move to the next ask
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
       return askForMissing(ws, state);
     }
 
-    // Smalltalk/Unknown during booking: brief bridge + precise ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or combo?",
@@ -628,7 +619,6 @@ Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
     return askForMissing(ws, state);
   }
 
-  // SMALLTALK / UNKNOWN outside booking — short + pivot to help
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
     if (state.phase === "idle") {
       const polite = "I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?";
@@ -660,12 +650,12 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__state = newState();
-      ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
+      ws.__callerFrom = msg.start?.customParameters?.from || "";
       clearGoodbyeTimers(ws);
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws._streamSid, convoId: ws._convoId }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
       // Start Deepgram
-      dg = startDeepgram({
+      dg = startDeepgram(ws, {
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
         }
