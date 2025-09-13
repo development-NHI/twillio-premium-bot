@@ -161,10 +161,10 @@ function isWithinHours(timeStr) {
     hh = parseInt(m[1] || "0", 10);
     mm = parseInt(m[2] || "0", 10);
   }
-  const minutes = hh * 60 + mm;
+  const minutes = hh * 60;
   const start = 9 * 60;
   const end = 17 * 60;
-  return minutes >= start && minutes <= end;
+  return minutes + mm >= start && minutes + mm <= end;
 }
 function enforceBusinessWindow(state) {
   const s = state.slots;
@@ -232,7 +232,21 @@ async function makeReadWindow(startISO, endISO) {
       window: { start: startISO, end: endISO }
     };
     const { data } = await axios.post(MAKE_READ_URL, payload, { timeout: 10000 });
-    const events = Array.isArray(data?.events) ? data.events : [];
+
+    // ****** ONLY CHANGE: normalize Make's `events` to an array (object or array) ******
+    let raw = data?.events;
+    let events = [];
+    if (Array.isArray(raw)) {
+      events = raw;
+    } else if (raw && typeof raw === "object") {
+      // Some Make aggregators return { array: [...] } or a single object
+      if (Array.isArray(raw.array)) events = raw.array;
+      else events = [raw];
+    } else {
+      events = [];
+    }
+    // ***********************************************************************************
+
     return { ok: !!data?.ok, events };
   } catch (e) {
     console.error("[MAKE READ ERROR]", e.message);
