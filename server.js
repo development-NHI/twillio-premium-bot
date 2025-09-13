@@ -17,7 +17,7 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || "";
 const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || "";
 
-/* === Make READ/DELETE endpoints and simple identifiers (no api_key sent) === */
+/* === NEW: Make READ/DELETE endpoints and simple identifiers (no api_key sent) === */
 const MAKE_READ_URL = process.env.MAKE_READ_URL || "";
 const MAKE_DELETE_URL = process.env.MAKE_DELETE_URL || "";
 const MAKE_BIZ = process.env.MAKE_BIZ || "oldline";
@@ -33,7 +33,8 @@ app.use(bodyParser.json());
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
 
 /**
- * TwiML
+ * TwiML: pass caller number & CallSid as custom parameters so we can honor
+ * “this number” during phone capture and for logging.
  */
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
@@ -55,6 +56,9 @@ const wss = new WebSocketServer({ server });
 
 /* ----------------------- Utilities ----------------------- */
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const MONTH_LOOKUP = {
+  jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12
+};
 function nowNY() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -81,15 +85,48 @@ function weekdayToISO(weekday) {
   if (delta <= 0) delta += 7;
   return addDaysISO(nowNY(), delta);
 }
+
+/* === NEW: flexible natural date → YYYY-MM-DD (e.g., "September 15", "Sep 15", "9/15") === */
+function parseMonthDayToISO(txt) {
+  if (!txt) return "";
+  const t = txt.trim().toLowerCase();
+
+  // "september 15" / "sept 15" / "sep 15"
+  let m = /^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t);
+  if (m) {
+    const mm = MONTH_LOOKUP[m[1].slice(0,3)] || MONTH_LOOKUP[m[1]];
+    const dd = parseInt(m[2], 10);
+    if (mm && dd >= 1 && dd <= 31) {
+      const yyyy = new Date().getFullYear();
+      return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
+    }
+  }
+  // "9/15" or "09/15"
+  m = /^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/.exec(t);
+  if (m) {
+    const mm = parseInt(m[1], 10);
+    const dd = parseInt(m[2], 10);
+    let yyyy = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
+    if (yyyy < 100) yyyy += 2000;
+    if (mm >=1 && mm <=12 && dd >=1 && dd <=31) {
+      return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
+    }
+  }
+  return "";
+}
+
 function normalizeDate(d) {
   if (!d) return "";
-  const t = d.toLowerCase();
+  const t = d.toLowerCase().trim();
   if (t === "today") return nowNY();
   if (t === "tomorrow") return addDaysISO(nowNY(), 1);
   const w = weekdayToISO(t);
   if (w) return w;
-  return d;
+  const natural = parseMonthDayToISO(t);
+  if (natural) return natural;
+  return d; // already ISO or something we leave as-is
 }
+
 function normalizeService(s) {
   if (!s) return "";
   const t = s.toLowerCase();
@@ -160,10 +197,10 @@ function isWithinHours(timeStr) {
     hh = parseInt(m[1] || "0", 10);
     mm = parseInt(m[2] || "0", 10);
   }
-  const minutes = hh * 60;
+  const minutes = hh * 60 + mm;
   const start = 9 * 60;
   const end = 17 * 60;
-  return minutes + mm >= start && minutes + mm <= end;
+  return minutes >= start && minutes <= end;
 }
 function enforceBusinessWindow(state) {
   const s = state.slots;
@@ -181,8 +218,9 @@ function enforceBusinessWindow(state) {
   return { ok: true };
 }
 
-/* === Time helpers for Make payloads === */
+/* === NEW: time helpers for Make payloads === */
 function to24h(timeStr) {
+  // "1PM" | "1:30 PM" | "13:30" -> "HH:MM"
   if (!timeStr) return "";
   const s = timeStr.trim().toUpperCase();
   let hh = 0, mm = 0;
@@ -206,7 +244,7 @@ function durationMinutesForService(service) {
   if (s === "haircut") return 30;
   if (s === "beard trim") return 15;
   if (s === "combo") return 45;
-  return 30;
+  return 30; // default
 }
 function buildStartEndISO(dateISO, timeStr, service) {
   const hhmm = to24h(timeStr);
@@ -214,19 +252,18 @@ function buildStartEndISO(dateISO, timeStr, service) {
   const start = new Date(`${dateISO}T${hhmm}:00`);
   const mins = durationMinutesForService(service);
   const end = new Date(start.getTime() + mins * 60000);
-  const iso = (d) => `${d.toISOString().slice(0,19)}`; // naive
+  const iso = (d) => `${d.toISOString().slice(0,19)}`;
   return { startISO: iso(start), endISO: iso(end) };
 }
-/* New: full-day window (for reliable READ during cancel) */
-function buildDayWindowISO(dateISO) {
-  if (!dateISO) return { startISO: "", endISO: "" };
-  return {
-    startISO: `${dateISO}T00:00:00`,
-    endISO: `${dateISO}T23:59:59`
-  };
+/* === NEW: day bounds === */
+function dayBoundsISO(dateISO) {
+  const start = new Date(`${dateISO}T00:00:00`);
+  const end = new Date(`${dateISO}T23:59:59`);
+  const iso = (d) => `${d.toISOString().slice(0,19)}`;
+  return { startISO: iso(start), endISO: iso(end) };
 }
 
-/* === Make.com helpers === */
+/* === NEW: Make.com helpers === */
 async function makeReadWindow(startISO, endISO) {
   if (!MAKE_READ_URL) return { ok: false, events: [] };
   try {
@@ -238,7 +275,7 @@ async function makeReadWindow(startISO, endISO) {
     };
     const { data } = await axios.post(MAKE_READ_URL, payload, { timeout: 10000 });
 
-    // Normalize Make's `events` to an array (object or array or {array:[...]})
+    // Normalize Make's `events` to an array (object or array)
     let raw = data?.events;
     let events = [];
     if (Array.isArray(raw)) {
@@ -246,6 +283,8 @@ async function makeReadWindow(startISO, endISO) {
     } else if (raw && typeof raw === "object") {
       if (Array.isArray(raw.array)) events = raw.array;
       else events = [raw];
+    } else {
+      events = [];
     }
 
     return { ok: !!data?.ok, events };
@@ -280,7 +319,7 @@ async function makeDeleteEvent(event_id) {
       intent: "DELETE",
       biz: MAKE_BIZ,
       source: MAKE_SOURCE,
-      event_id: `${event_id}`
+      event_id
     };
     const { data } = await axios.post(MAKE_DELETE_URL, payload, { timeout: 10000 });
     return { ok: !!data?.ok };
@@ -539,6 +578,7 @@ async function askForMissing(ws, state) {
     return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
 
   if (missing === "done") {
+    // Enforce business hours before confirming
     const check = enforceBusinessWindow(state);
     if (!check.ok) {
       if (check.reason === "weekend") {
@@ -547,6 +587,7 @@ async function askForMissing(ws, state) {
       if (check.reason === "hours") {
         return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
       }
+      // If incomplete, fall through to resume
       return askForMissing(ws, state);
     }
     return triggerConfirm(ws, state);
@@ -555,18 +596,21 @@ async function askForMissing(ws, state) {
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
 
-/* === Booking: check availability + create via Make === */
+/* === NEW: check availability + create on Make before we “finalize” with the caller === */
 async function createViaMakeIfFree(ws, state) {
   const s = state.slots;
   const { startISO, endISO } = buildStartEndISO(s.date, s.time, s.service);
   if (!startISO || !endISO) return { ok: false, reason: "bad_time" };
 
+  // Read window = exact appt window
   const read = await makeReadWindow(startISO, endISO);
   if (!read.ok) {
     console.log(JSON.stringify({ event: "MAKE_READ_FAILED" }));
+    // If read fails, to avoid double-booking, do NOT auto-create.
     return { ok: false, reason: "unverified" };
   }
 
+  // If any event overlaps our desired window, it's taken
   const conflict = read.events?.some(ev => {
     const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
     const evEnd = ev.End_Time || ev.end || ev.end_time || ev.endISO || evStart;
@@ -575,10 +619,11 @@ async function createViaMakeIfFree(ws, state) {
 
   if (conflict) return { ok: false, reason: "conflict" };
 
+  // Create
   const created = await makeCreateEvent({
     name: s.name,
     phone: s.phone,
-    email: "",
+    email: "", // not collected in current flow
     notes: s.service,
     startISO,
     endISO,
@@ -586,6 +631,7 @@ async function createViaMakeIfFree(ws, state) {
   });
   if (!created.ok) return { ok: false, reason: "create_failed" };
 
+  // Echo event_id back on state for potential cancel
   const eventId = created.event?.event_id || created.event?.id || created.event?.eventId || null;
   if (eventId) state.__lastEventId = eventId;
 
@@ -600,14 +646,17 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   const snap = confirmSnapshot(s);
   if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
 
+  // === verify availability + create in Make ===
   const makeRes = await createViaMakeIfFree(ws, state);
   if (!makeRes.ok) {
     if (makeRes.reason === "conflict") {
       await say(ws, "That time just became unavailable. What other time that day works?");
+      // Clear only time so we stay on same date
       state.slots.time = "";
       state.phase = "booking";
       return askForMissing(ws, state);
     }
+    // If unverified or create_failed, ask for another time (safer than double-booking)
     await say(ws, "I couldn’t lock that time just now. What other time works?");
     state.slots.time = "";
     state.phase = "booking";
@@ -624,14 +673,15 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
     ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
+  // Ask and wait (silence timers handle re-ask → goodbye)
   await askWithReaskAndGoodbye(ws, line);
 }
 
-/* === Helpers for cancellation confirmation === */
+/* === NEW: helpers for cancellation confirmation === */
 function isoToDateTimeSpeech(iso) {
   if (!iso || typeof iso !== "string" || iso.length < 16) return "";
-  const dateISO = iso.slice(0, 10);
-  const timeHHMM = iso.slice(11, 16);
+  const dateISO = iso.slice(0, 10);             // YYYY-MM-DD
+  const timeHHMM = iso.slice(11, 16);           // HH:MM
   return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
 function describeEventForSpeech(ev) {
@@ -652,9 +702,10 @@ function parseYesNo(text) {
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
+  // Any speech cancels the pending question timers
   clearQuestionTimers(ws);
 
-  /* Intercept yes/no while awaiting cancel confirmation */
+  // === NEW: intercept yes/no while awaiting cancel confirmation ===
   if (ws.__pendingCancel && transcript) {
     const yn = parseYesNo(transcript);
     if (yn === "yes") {
@@ -669,9 +720,11 @@ async function classifyAndHandle(ws, state, transcript) {
       return;
     } else if (yn === "no") {
       ws.__pendingCancel = null;
+      ws.__cancelFlow = { active: true, want: "datetime" };
       await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
       return;
     }
+    // Fall through to normal NLU if it's not a clear yes/no.
   }
 
   // “this/my number” -> use caller ID
@@ -710,12 +763,79 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
+  // Reset goodbye silence if user talks after confirmation
   if (state.phase === "confirmed") {
     clearGoodbyeTimers(ws);
   }
 
+  /* === NEW: If we're in a cancel flow, treat follow-ups as cancel context even if NLU says BOOK === */
+  if (ws.__cancelFlow?.active) {
+    const dateISO = parsed.date ? normalizeDate(parsed.date) : "";
+    const timeStr = parsed.time || "";
+
+    // If we don't have anything useful yet, prompt again
+    if (!dateISO && !timeStr) {
+      await askWithReaskAndGoodbye(ws, "Which date and time should I cancel?");
+      return;
+    }
+
+    // Build read window: whole day if only date; exact slot if both date & time
+    let startISO = "", endISO = "";
+    if (dateISO && timeStr) {
+      const se = buildStartEndISO(dateISO, timeStr, "haircut");
+      startISO = se.startISO; endISO = se.endISO;
+    } else if (dateISO && !timeStr) {
+      const se = dayBoundsISO(dateISO);
+      startISO = se.startISO; endISO = se.endISO;
+    }
+
+    if (!startISO || !endISO) {
+      await askWithReaskAndGoodbye(ws, "Got it. What time on that date is the appointment?");
+      return;
+    }
+
+    const read = await makeReadWindow(startISO, endISO);
+    if (!read.ok) {
+      await say(ws, "I couldn’t reach the calendar just now. Want me to try again?");
+      return;
+    }
+    if (!Array.isArray(read.events) || read.events.length === 0) {
+      await askWithReaskAndGoodbye(ws, "I couldn’t find that appointment. What date and time should I cancel?");
+      return;
+    }
+
+    // Pick best candidate (time match first; phone/name if present)
+    const phone = state.slots.phone || "";
+    const name = state.slots.name || "";
+    let target = null;
+    for (const ev of read.events) {
+      const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
+      const evEnd = ev.End_Time || ev.end || ev.end_time || ev.endISO || evStart;
+      const evName = (ev.Customer_Name || ev.name || "").toString().toLowerCase();
+      const evPhone = normalizePhone(ev.Customer_Phone || ev.phone || "");
+      const timeMatch = evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
+      const phoneMatch = phone && evPhone ? evPhone.endsWith(phone.slice(-4)) : true;
+      const nameMatch = name ? evName.includes(name.toLowerCase()) : true;
+      if (timeMatch && phoneMatch && nameMatch) { target = ev; break; }
+    }
+    if (!target) target = read.events[0];
+
+    const eventId = target.event_id || target.id || target.eventId;
+    if (!eventId) {
+      await askWithReaskAndGoodbye(ws, "I found an appointment, but not its ID. What’s the exact time?");
+      return;
+    }
+
+    const spoken = describeEventForSpeech(target);
+    ws.__pendingCancel = { eventId, spoken };
+    ws.__cancelFlow = { active: false };
+    await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
+    return;
+  }
+
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
+  // Acknowledge slot changes during booking
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
     for (const k of changedKeys) {
@@ -728,6 +848,7 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
+  // End / post-confirm wrap
   if (parsed.intent === "END") {
     if (state.phase === "confirmed") {
       await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
@@ -739,68 +860,29 @@ Rules:
     return;
   }
 
+  // Declined booking (keep idle)
   if (parsed.intent === "DECLINE_BOOK") {
     state.phase = "idle";
     return say(ws, "No problem. How else can I help?");
   }
 
-  /* === Cancellation flow — READ full day, confirm, DELETE on yes === */
+  /* === UPDATED: Cancellation flow — read, confirm with user, then delete on yes === */
   if (parsed.intent === "CANCEL") {
-    const name = parsed.name || state.slots.name || "";
-    const phone = parsed.phone ? normalizePhone(parsed.phone) : state.slots.phone || "";
-    const dateISO = normalizeDate(parsed.date) || state.slots.date || nowNY();
-    const timeStr = parsed.time || state.slots.time || "";
+    ws.__cancelFlow = { active: true, want: "datetime" };
 
-    // READ for the whole day to avoid missing timezone/slot mismatches
-    const dayWin = buildDayWindowISO(dateISO);
-    const read = await makeReadWindow(dayWin.startISO, dayWin.endISO);
-    if (!read.ok) {
-      await say(ws, "I couldn’t reach the calendar just now. Want me to try again?");
-      return;
-    }
-    if (!Array.isArray(read.events) || read.events.length === 0) {
-      await askWithReaskAndGoodbye(ws, "I couldn’t find any appointments that day. What date and time should I cancel?");
-      return;
-    }
+    const dateISO0 = normalizeDate(parsed.date);
+    const timeStr0 = parsed.time || "";
 
-    // Filter by phone/name if available; otherwise nearest to requested time (if provided)
-    let candidates = read.events.slice();
-    if (phone) {
-      candidates = candidates.filter(ev => {
-        const evPhone = normalizePhone(ev.Customer_Phone || ev.phone || "");
-        return evPhone ? evPhone.endsWith(phone.slice(-4)) : true;
-      });
-      if (candidates.length === 0) candidates = read.events.slice();
+    // If the user already gave details, jump straight to the cancel handler above on next turn
+    if (!dateISO0 && !timeStr0) {
+      await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
+    } else {
+      // Re-enter classifyAndHandle path immediately with cancelFlow active to process these details
+      const synthetic = [];
+      if (dateISO0) synthetic.push(`Date ${dateISO0}`);
+      if (timeStr0) synthetic.push(`Time ${timeStr0}`);
+      await askWithReaskAndGoodbye(ws, "Got it — is that the only appointment on that date?");
     }
-    if (name) {
-      const lname = name.toLowerCase();
-      const byName = candidates.filter(ev => (ev.Customer_Name || ev.name || ev.summary || "")
-        .toString().toLowerCase().includes(lname));
-      if (byName.length) candidates = byName;
-    }
-
-    // Choose best candidate
-    let target = candidates[0];
-    if (timeStr) {
-      const hhmm = to24h(timeStr) || "12:00";
-      const desired = new Date(`${dateISO}T${hhmm}:00`).getTime();
-      target = candidates.reduce((best, ev) => {
-        const evStartStr = ev.Start_Time || ev.start || ev.start_time || ev.startISO || `${dateISO}T12:00:00`;
-        const evT = new Date(evStartStr).getTime();
-        return Math.abs(evT - desired) < Math.abs((new Date(best.Start_Time || best.start || best.start_time || best.startISO || `${dateISO}T12:00:00`).getTime()) - desired)
-          ? ev : best;
-      }, candidates[0]);
-    }
-
-    const eventId = target?.event_id || target?.id || target?.eventId;
-    if (!eventId) {
-      await say(ws, "I found an appointment but couldn’t identify its ID. Could you give me the date and time again?");
-      return;
-    }
-
-    const spoken = describeEventForSpeech(target);
-    ws.__pendingCancel = { eventId, spoken };
-    await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
   }
 
@@ -848,7 +930,7 @@ Rules:
     return;
   }
 
-  // Booking
+  // Booking gate: only enter booking if the user asked to book OR already in booking
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
 
@@ -866,10 +948,12 @@ Rules:
       return triggerConfirm(ws, state);
     }
 
+    // If caller gave exactly the missing piece, move to the next ask
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
       return askForMissing(ws, state);
     }
 
+    // Smalltalk/Unknown during booking: brief bridge + precise ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or combo?",
@@ -893,7 +977,7 @@ Do NOT ask open-ended questions. Examples: "Totally!", "Got it.", "No worries.",
     return askForMissing(ws, state);
   }
 
-  // Smalltalk / Unknown
+  // SMALLTALK / UNKNOWN outside booking — short + pivot to help
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
     if (state.phase === "idle") {
       const polite = `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`;
@@ -926,11 +1010,13 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
-      ws.__pendingCancel = null; // track cancel confirmation
+      ws.__pendingCancel = null; // track cancel confirmation state
+      ws.__cancelFlow = { active: false };
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
+      // Start Deepgram
       dg = startDeepgram({
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
