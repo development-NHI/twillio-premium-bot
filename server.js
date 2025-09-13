@@ -312,7 +312,7 @@ function startDeepgram({ onFinal }) {
     perMessageDeflate: false
   });
 
-  dg.on("open", () => console.log("[Deepgram] ws open"]));
+  dg.on("open", () => console.log("[Deepgram] ws open"));
   dg.on("message", (data) => {
     let ev;
     try { ev = JSON.parse(data.toString()); } catch { return; }
@@ -970,4 +970,5 @@ wss.on("connection", (ws) => {
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
+
 
