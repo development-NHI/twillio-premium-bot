@@ -14,8 +14,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL; // optional
-const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL;       // optional
+const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || "";
+const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || "";
 
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
@@ -81,10 +81,8 @@ function normalizeDate(d) {
   const t = d.toLowerCase();
   if (t === "today") return nowNY();
   if (t === "tomorrow") return addDaysISO(nowNY(), 1);
-  // weekday (Monday, etc.)
   const w = weekdayToISO(t);
   if (w) return w;
-  // assume already YYYY-MM-DD or a literal; leave as-is
   return d;
 }
 function normalizeService(s) {
@@ -98,23 +96,22 @@ function normalizeService(s) {
 function normalizePhone(num) {
   if (!num) return "";
   const d = num.replace(/\D/g, "");
-  return d.length >= 10 ? d : "";
+  // Use last 10 digits if 10+ provided
+  const ten = d.length >= 10 ? d.slice(-10) : "";
+  return ten;
 }
 function ordinal(n) {
   const s = ["th", "st", "nd", "rd"], v = n % 100;
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 function formatDateSpoken(iso) {
-  // iso "YYYY-MM-DD"
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
   if (!m) return iso || "";
-  const yyyy = Number(m[1]);
   const mm = Number(m[2]);
   const dd = Number(m[3]);
   return `${MONTHS[mm - 1]} ${ordinal(dd)}`;
 }
 function to12h(t) {
-  // "15:00" -> "3 PM"; pass through "3 PM"
   if (!t) return "";
   if (/am|pm/i.test(t)) {
     const up = t.toUpperCase().replace(/\s+/g, " ").trim();
@@ -257,8 +254,8 @@ function newState() {
     slots: { service: "", date: "", time: "", name: "", phone: "" },
     lastConfirmSnapshot: "",
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
-    bookingLock: false, // reserved; keep to match your last working base
-    lastAskKey: "",       // prevent repeating same ask back-to-back
+    bookingLock: false,
+    lastAskKey: "",
     lastAskAt: 0
   };
 }
@@ -317,11 +314,11 @@ async function askForMissing(ws, state) {
   state.lastAskAt = now;
 
   if (missing === "service")
-    return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+    return say(ws, "Which service would you like — haircut, beard trim, or combo?");
 
   if (missing === "datetime") {
     if (s.date && !s.time) return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-    if (!s.date && s.time) return say(ws, `What day works best for your ${s.service} at ${to12h(s.time)}?`);
+    if (!s.date && s.time) return say(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
     return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
   }
 
@@ -349,24 +346,24 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   console.log(JSON.stringify({ event: "CONFIRM_READY", slots: s, whenSpoken: when }));
 
   const snap = confirmSnapshot(s);
-  if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") {
-    // already confirmed this exact info; don't repeat
-    return;
-  }
+  if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
+
   state.phase = "confirmed";
   state.lastConfirmSnapshot = snap;
 
-  const phoneFmt = s.phone ? `(${s.phone.slice(0,3)}) ${s.phone.slice(3,6)}-${s.phone.slice(6)}` : "";
+  const last4 = s.phone ? s.phone.slice(-4) : "";
+  const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
+
   const line = updated
-    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`
-    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`;
+    ? `Updated. ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
+    : `Great. ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
   await say(ws, line);
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
-  // Special-case: “this number / my number” for phone, use caller number if available
+  // “this/my number” -> use caller ID
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -379,19 +376,20 @@ async function classifyAndHandle(ws, state, transcript) {
   const systemPrompt = `
 Return STRICT JSON:
 {
- "intent": "FAQ" | "BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
+ "intent": "FAQ" | "BOOK" | "DECLINE_BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
  "service": "",  // "haircut" | "beard trim" | "combo" or phrase
  "date": "",     // "today" | "tomorrow" | weekday | "YYYY-MM-DD"
- "time": "",     // "3 PM" or "15:00"
+ "time": "",     // "3 PM" | "15:00"
  "name": "",
  "phone": ""
 }
 Rules:
-- Detect booking even if mixed with smalltalk.
+- Detect booking only if the user asks to schedule, book, reschedule, or gives date/time.
+- If user says they do NOT want to book, set intent = "DECLINE_BOOK".
 - If user changes service/date/time/name/phone, include only the new value.
-- If the user says "this number", leave phone empty (we fill it from caller ID).
-- Keep values short; leave blank if unsure.
+- If the user says "this number", leave phone empty (we fill from caller ID).
+- Keep values minimal; leave blank if unsure.
 `.trim();
 
   let parsed = {};
@@ -401,61 +399,91 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  const beforeMissing = nextMissing(state);
+  const prevPhase = state.phase;
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // If info changed after confirmation, re-confirm or resume asking
-  if (state.phase === "confirmed" && changed) {
-    const missing = nextMissing(state);
-    if (missing === "done") {
-      return triggerConfirm(ws, state, { updated: true });
-    } else {
-      state.phase = "booking";
-      return askForMissing(ws, state);
+  // Acknowledge slot changes during booking
+  if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
+    const acks = [];
+    for (const k of changedKeys) {
+      if (k === "service") acks.push(`Got it. ${state.slots.service}.`);
+      if (k === "date") acks.push(`Okay. ${formatDateSpoken(state.slots.date)}.`);
+      if (k === "time") acks.push(`Noted. ${to12h(state.slots.time)}.`);
+      if (k === "name") acks.push(`Thanks, ${state.slots.name}.`);
+      if (k === "phone") acks.push(`Thanks. I’ve saved your number.`);
     }
+    if (acks.length) await say(ws, acks.join(" "));
+  }
+
+  // Declined booking
+  if (parsed.intent === "DECLINE_BOOK") {
+    state.phase = "idle";
+    return say(ws, "No problem. What else can I help with?");
   }
 
   // FAQs
   if (parsed.intent === "FAQ") {
     let answer = "";
-    if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
-    else if (parsed.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
-    else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
-    else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
-    if (!answer) answer = "Happy to help. What else can I answer?";
+    // Optional: fetch FAQ from MAKE if configured
+    try {
+      if (MAKE_FAQ_URL) {
+        await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, service: parsed.service || state.slots.service || "" });
+      }
+    } catch {}
+
+    const priceTable = { "haircut": 30, "beard trim": 15, "combo": 40 };
+
+    if (parsed.faq_topic === "HOURS") {
+      answer = "We’re open Monday to Friday, 9 AM to 5 PM. Closed weekends.";
+    } else if (parsed.faq_topic === "PRICES") {
+      const svc = normalizeService(parsed.service || state.slots.service);
+      if (svc && priceTable[svc]) {
+        answer = `${svc} is $${priceTable[svc]}.`;
+      } else {
+        answer = "Haircut $30, beard trim $15, combo $40.";
+      }
+    } else if (parsed.faq_topic === "SERVICES") {
+      answer = "We offer haircuts, beard trims, and the combo.";
+    } else if (parsed.faq_topic === "LOCATION") {
+      answer = "We’re at 123 Blueberry Lane.";
+    } else {
+      answer = "Happy to help. What else can I answer?";
+    }
 
     if (state.phase === "booking") {
       await say(ws, answer);
       return askForMissing(ws, state);
-    } else {
-      return say(ws, `${answer} Would you like to book an appointment?`);
     }
+    if (state.phase === "confirmed") {
+      // Do NOT ask to book again post-confirmation
+      return say(ws, answer);
+    }
+    // Idle: lightly offer to book
+    return say(ws, `${answer} Would you like to book an appointment?`);
   }
 
   if (parsed.intent === "TRANSFER") {
-    await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
+    await say(ws, "I’m not sure about that. Let me transfer you. Please hold.");
     try { ws.close(); } catch {}
     return;
   }
 
-  // BOOK or mid-booking (single-threaded flow)
-  if (parsed.intent === "BOOK" || state.phase === "booking" || beforeMissing !== "done") {
-    state.phase = "booking";
+  // Booking gate: only enter booking if the user asked to book OR already in booking
+  if (parsed.intent === "BOOK" || state.phase === "booking") {
+    if (state.phase !== "booking") state.phase = "booking";
 
     const missing = nextMissing(state);
-    if (missing === "done") {
-      return triggerConfirm(ws, state);
-    }
+    if (missing === "done") return triggerConfirm(ws, state);
 
-    // If the user provided exactly the missing item, be direct (no fluff)
+    // If caller gave exactly the missing piece, move to the next ask
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
       return askForMissing(ws, state);
     }
 
-    // Smalltalk/Unknown bridge during booking: ONE short line + the precise ask
+    // Smalltalk/Unknown during booking: brief bridge + precise ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
-        "service": "Which service would you like — haircut, beard trim, or the combo?",
+        "service": "Which service would you like — haircut, beard trim, or combo?",
         "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
         "date": `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
         "time": `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
@@ -464,27 +492,26 @@ Rules:
       }[missing];
 
       const bridgePrompt = `
-You are a receptionist. Reply with one short, natural sentence (<=12 words) acknowledging the remark.
-Do NOT ask open-ended questions. Then we will append a targeted booking question separately.
-Examples: "Totally!" , "Got it!" , "No worries!" , "Sounds good!"
+Reply with one short, natural sentence (<=12 words) acknowledging the remark.
+Do NOT ask open-ended questions. We append the booking question separately.
+Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
 `.trim();
 
-      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure!";
+      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure.";
       return say(ws, `${bridge} ${targetAsk}`);
     }
 
-    // Normal path
     return askForMissing(ws, state);
   }
 
-  // SMALLTALK outside booking — short, no follow-up
+  // SMALLTALK / UNKNOWN outside booking — short, no follow-up
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+    // Stay idle. Do not auto-start booking.
     const fallbackPrompt = `
-You are a receptionist. Reply with one short, casual sentence (<=12 words).
-No follow-up questions.
+Reply with one short, casual sentence (<=12 words). No follow-up questions.
 `.trim();
     const nlg = await askGPT(fallbackPrompt, transcript);
-    return say(ws, nlg || "Sure—how can I help?");
+    return say(ws, nlg || "How can I help?");
   }
 }
 
