@@ -147,7 +147,7 @@ function dayKeyFromISO(iso) {
 }
 function parseToHHMM(t) {
   if (!t) return "";
-  const s = String(t).trim().replace(/\.$/, ""); // tolerate trailing period
+  const s = String(t).trim().replace(/\.$/, "");
   const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
   if (ampm) {
     let h = parseInt(ampm[1],10);
@@ -198,6 +198,10 @@ function nextOpenSuggestion(dateISO, timeStr) {
     }
   }
   return { date: dateISO, time: t24 };
+}
+function isClosedDay(iso) {
+  const key = dayKeyFromISO(iso);
+  return !HOURS[key];
 }
 
 /* ----------------------- Deepgram WS ----------------------- */
@@ -325,7 +329,7 @@ function newState() {
     bookingLock: false,
     lastAskKey: "",
     lastAskAt: 0,
-    expectingBookYes: false, // for Yes/No after an offer
+    expectingBookYes: false,
   };
 }
 
@@ -372,6 +376,12 @@ function nextMissing(state) {
 }
 async function askForMissing(ws, state) {
   const s = state.slots;
+
+  // block closed days early
+  if (s.date && isClosedDay(s.date)) {
+    return say(ws, "We’re closed on weekends. What weekday works?");
+  }
+
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
@@ -401,7 +411,7 @@ async function askForMissing(ws, state) {
     return say(ws, "Can I get your first name?");
 
   if (missing === "phone") {
-    if (state.slots.phone) return askForMissing(ws, state); // re-evaluate if we already filled from caller ID
+    if (state.slots.phone) return askForMissing(ws, state); // re-evaluate
     return say(ws, "What phone number should I use for confirmations?");
   }
 
@@ -413,6 +423,16 @@ function confirmSnapshot(slots) { return JSON.stringify(slots); }
 
 async function triggerConfirm(ws, state, { updated=false } = {}) {
   const s = state.slots;
+
+  // enforce hours before confirm
+  if (!isWithinHours(s.date, s.time)) {
+    const sug = nextOpenSuggestion(s.date, s.time);
+    state.slots.date = sug.date;
+    state.slots.time = sug.time;
+    await say(ws, `We’re open Monday to Friday, 9 to 5. I can do ${humanWhen(sug.date, sug.time)}. Does that work?`);
+    return;
+  }
+
   const when = humanWhen(s.date, s.time);
   console.log(JSON.stringify({ event: "CONFIRM_READY", slots: s, whenSpoken: when }));
 
@@ -449,9 +469,9 @@ Return STRICT JSON:
 {
  "intent": "FAQ" | "BOOK" | "DECLINE_BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",  // "haircut" | "beard trim" | "combo" or phrase
- "date": "",     // "today" | "tomorrow" | weekday | "YYYY-MM-DD"
- "time": "",     // "3 PM" | "15:00"
+ "service": "",
+ "date": "",
+ "time": "",
  "name": "",
  "phone": ""
 }
@@ -469,32 +489,34 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
+  // If user indicates BOOK at any time, enter booking mode immediately
+  if (parsed.intent === "BOOK") state.phase = "booking";
+
   // Coerce Yes/No after we offered to book
   if (state.expectingBookYes) {
     const lx = transcript.trim().toLowerCase();
     if (/(^|\b)(yes|sure|okay|ok|yeah|yep)\b/.test(lx)) parsed.intent = "BOOK";
     if (/(^|\b)(no|nah|not now|maybe later)\b/.test(lx)) parsed.intent = "DECLINE_BOOK";
     state.expectingBookYes = false;
+    if (parsed.intent === "BOOK") state.phase = "booking";
   }
 
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // If caller ID filled phone and everything is set, enforce hours then confirm
-  if ((state.phase === "booking" || parsed.intent === "BOOK") && nextMissing(state) === "done") {
-    const s = state.slots;
-    if (!isWithinHours(s.date, s.time)) {
-      const sug = nextOpenSuggestion(s.date, s.time);
-      state.slots.date = sug.date;
-      state.slots.time = sug.time;
-      await say(ws, `We’re open Monday to Friday, 9 to 5. I can do ${humanWhen(sug.date, sug.time)}. Does that work?`);
-      return;
-    }
+  // If in booking and a closed date was just set, stop and ask for weekday
+  if (state.phase === "booking" && changedKeys.includes("date") && state.slots.date && isClosedDay(state.slots.date)) {
+    await say(ws, "We’re closed on weekends. What weekday works?");
+    return;
+  }
+
+  // If in booking and everything is set, confirm with hours guard
+  if (state.phase === "booking" && nextMissing(state) === "done") {
     return triggerConfirm(ws, state);
   }
 
   // Acknowledge slot changes during booking and ask next in one line
   const cap = (x) => x ? x.charAt(0).toUpperCase() + x.slice(1) : x;
-  if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
+  if (state.phase === "booking" && changed) {
     const acks = [];
     for (const k of changedKeys) {
       if (k === "service") acks.push(`Got it. ${cap(state.slots.service)}.`);
@@ -516,7 +538,7 @@ Rules:
       await say(ws, (acks.join(" ") + " " + q).trim());
       return;
     }
-    if (acks.length) await say(ws, acks.join(" "));
+    if (acks.length) { await say(ws, acks.join(" ")); return; }
   }
 
   // Declined booking
@@ -525,7 +547,12 @@ Rules:
     return say(ws, "No problem. What else can I help with?");
   }
 
-  // FAQs
+  // Booking gate first, to avoid small-talk while booking
+  if (state.phase === "booking") {
+    return askForMissing(ws, state);
+  }
+
+  // FAQs (only when not in booking)
   if (parsed.intent === "FAQ") {
     let answer = "";
     try {
@@ -554,14 +581,7 @@ Rules:
       answer = "Happy to help. What else can I answer?";
     }
 
-    if (state.phase === "booking") {
-      await say(ws, answer);
-      return askForMissing(ws, state);
-    }
-    if (state.phase === "confirmed") {
-      return say(ws, answer);
-    }
-    state.expectingBookYes = true; // set offer flag for Yes/No
+    state.expectingBookYes = true;
     return say(ws, `${answer} Would you like to book an appointment?`);
   }
 
@@ -569,32 +589,6 @@ Rules:
     await say(ws, "I’m not sure about that. Let me transfer you. Please hold.");
     try { ws.close(); } catch {}
     return;
-  }
-
-  // Booking gate: only enter booking if asked OR already in booking
-  if (parsed.intent === "BOOK" || state.phase === "booking") {
-    if (state.phase !== "booking") state.phase = "booking";
-
-    const missing = nextMissing(state);
-    if (missing === "done") {
-      const s = state.slots;
-      if (!isWithinHours(s.date, s.time)) {
-        const sug = nextOpenSuggestion(s.date, s.time);
-        state.slots.date = sug.date;
-        state.slots.time = sug.time;
-        await say(ws, `We’re open Monday to Friday, 9 to 5. I can do ${humanWhen(sug.date, sug.time)}. Does that work?`);
-        return;
-      }
-      return triggerConfirm(ws, state);
-    }
-
-    // If caller gave exactly the missing piece, move to the next ask
-    if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
-      return askForMissing(ws, state);
-    }
-
-    // IMPORTANT: No small-talk bridge during booking. Be direct.
-    return askForMissing(ws, state);
   }
 
   // SMALLTALK / UNKNOWN outside booking — short, no follow-up
