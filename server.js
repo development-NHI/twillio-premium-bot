@@ -267,8 +267,8 @@ async function sayAndHangUp(ws, msg) {
 
 /**
  * Arms a silence handler for any question the bot just asked.
- * - After 5s: if no reply, say "Sorry, I didn’t catch that — could you repeat?" + same question (one time).
- * - Then arm 7s: if still no reply, say goodbye and hang up.
+ * - After 25s: if no reply, say "Sorry, I didn’t catch that — could you repeat?" + same question (one time).
+ * - Then arm 25s: if still no reply, say goodbye and hang up.
  */
 function armQuestionSilence(ws, questionText) {
   clearQuestionTimers(ws);
@@ -282,8 +282,8 @@ function armQuestionSilence(ws, questionText) {
     // After retry, arm final goodbye if still nothing
     ws.__questionFinalTimer = setTimeout(async () => {
       await sayAndHangUp(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-    }, 7000);
-  }, 5000);
+    }, 25000); // <-- was 7000, now 25s
+  }, 25000); // <-- was 5000, now 25s
 }
 
 /* ----------------------- State & Slots ----------------------- */
@@ -396,7 +396,7 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} Anything else I can help with?`;
 
   await say(ws, line);
-  // Arm question silence on the final "Anything else?" with one retry then 7s -> goodbye -> 8s drain
+  // Arm question silence on the final "Anything else?" with one retry then 25s -> goodbye -> 8s drain
   armQuestionSilence(ws, "Is there anything else I can help you with?");
 }
 
