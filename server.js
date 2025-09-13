@@ -17,7 +17,7 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 const MAKE_CREATE_URL = process.env.MAKE_CREATE_URL || "";
 const MAKE_FAQ_URL = process.env.MAKE_FAQ_URL || "";
 
-/* === NEW: Make READ/DELETE endpoints and simple identifiers (no api_key sent) === */
+/* === Make READ/DELETE endpoints and simple identifiers === */
 const MAKE_READ_URL = process.env.MAKE_READ_URL || "";
 const MAKE_DELETE_URL = process.env.MAKE_DELETE_URL || "";
 const MAKE_BIZ = process.env.MAKE_BIZ || "oldline";
@@ -32,10 +32,7 @@ app.use(bodyParser.json());
 
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
 
-/**
- * TwiML: pass caller number & CallSid as custom parameters so we can honor
- * “this number” during phone capture and for logging.
- */
+/** TwiML */
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
@@ -56,9 +53,8 @@ const wss = new WebSocketServer({ server });
 
 /* ----------------------- Utilities ----------------------- */
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
-const MONTH_LOOKUP = {
-  jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12
-};
+const MONTH_LOOKUP = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12 };
+
 function nowNY() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -86,7 +82,7 @@ function weekdayToISO(weekday) {
   return addDaysISO(nowNY(), delta);
 }
 
-/* === NEW: flexible natural date → YYYY-MM-DD (e.g., "September 15", "Sep 15", "9/15") === */
+/* --- Natural date parsing upgrades for cancel flow --- */
 function parseMonthDayToISO(txt) {
   if (!txt) return "";
   const t = txt.trim().toLowerCase();
@@ -94,14 +90,14 @@ function parseMonthDayToISO(txt) {
   // "september 15" / "sept 15" / "sep 15"
   let m = /^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t);
   if (m) {
-    const mm = MONTH_LOOKUP[m[1].slice(0,3)] || MONTH_LOOKUP[m[1]];
+    const mm = MONTH_LOOKUP[m[1].slice(0,3)];
     const dd = parseInt(m[2], 10);
     if (mm && dd >= 1 && dd <= 31) {
       const yyyy = new Date().getFullYear();
       return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
     }
   }
-  // "9/15" or "09/15"
+  // "9/15" or "09/15" or with year
   m = /^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/.exec(t);
   if (m) {
     const mm = parseInt(m[1], 10);
@@ -114,7 +110,15 @@ function parseMonthDayToISO(txt) {
   }
   return "";
 }
-
+function coerceToThisYearIfLikely(isoMaybe) {
+  // If GPT supplies a past year but same month/day, bump to this year
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoMaybe || "");
+  if (!m) return isoMaybe;
+  const yyyyNow = new Date().getFullYear();
+  const yyyy = parseInt(m[1],10);
+  if (yyyy !== yyyyNow) return `${yyyyNow}-${m[2]}-${m[3]}`;
+  return isoMaybe;
+}
 function normalizeDate(d) {
   if (!d) return "";
   const t = d.toLowerCase().trim();
@@ -124,7 +128,8 @@ function normalizeDate(d) {
   if (w) return w;
   const natural = parseMonthDayToISO(t);
   if (natural) return natural;
-  return d; // already ISO or something we leave as-is
+  const pass = coerceToThisYearIfLikely(d);
+  return pass;
 }
 
 function normalizeService(s) {
@@ -142,7 +147,7 @@ function normalizePhone(num) {
   return ten;
 }
 function ordinal(n) {
-  const s = ["th", "st", "nd", "rd"], v = n % 100;
+  const s = ["th","st","nd","rd"], v = n % 100;
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 function formatDateSpoken(iso) {
@@ -173,10 +178,10 @@ function humanWhen(dateISO, timeStr) {
   return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
 }
 
-/* ----- Business hours (Mon–Fri, 9AM–5PM) ----- */
+/* ----- Business hours (Mon–Fri, 9–5) ----- */
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
-  const day = d.getDay(); // 0=Sun,6=Sat
+  const day = d.getDay();
   return day === 0 || day === 6;
 }
 function isWithinHours(timeStr) {
@@ -205,22 +210,13 @@ function isWithinHours(timeStr) {
 function enforceBusinessWindow(state) {
   const s = state.slots;
   if (!s.date || !s.time) return { ok: false, reason: "incomplete" };
-  if (isWeekend(s.date)) {
-    const oldDate = s.date;
-    s.date = "";
-    return { ok: false, reason: "weekend", oldDate };
-  }
-  if (!isWithinHours(s.time)) {
-    const oldTime = s.time;
-    s.time = "";
-    return { ok: false, reason: "hours", oldTime };
-  }
+  if (isWeekend(s.date)) { const od = s.date; s.date = ""; return { ok: false, reason: "weekend", oldDate: od }; }
+  if (!isWithinHours(s.time)) { const ot = s.time; s.time = ""; return { ok: false, reason: "hours", oldTime: ot }; }
   return { ok: true };
 }
 
-/* === NEW: time helpers for Make payloads === */
+/* === Time helpers === */
 function to24h(timeStr) {
-  // "1PM" | "1:30 PM" | "13:30" -> "HH:MM"
   if (!timeStr) return "";
   const s = timeStr.trim().toUpperCase();
   let hh = 0, mm = 0;
@@ -244,7 +240,7 @@ function durationMinutesForService(service) {
   if (s === "haircut") return 30;
   if (s === "beard trim") return 15;
   if (s === "combo") return 45;
-  return 30; // default
+  return 30;
 }
 function buildStartEndISO(dateISO, timeStr, service) {
   const hhmm = to24h(timeStr);
@@ -255,7 +251,6 @@ function buildStartEndISO(dateISO, timeStr, service) {
   const iso = (d) => `${d.toISOString().slice(0,19)}`;
   return { startISO: iso(start), endISO: iso(end) };
 }
-/* === NEW: day bounds === */
 function dayBoundsISO(dateISO) {
   const start = new Date(`${dateISO}T00:00:00`);
   const end = new Date(`${dateISO}T23:59:59`);
@@ -263,34 +258,27 @@ function dayBoundsISO(dateISO) {
   return { startISO: iso(start), endISO: iso(end) };
 }
 
-/* === NEW: Make.com helpers === */
+/* === Make.com helpers (more tolerant READ) === */
 async function makeReadWindow(startISO, endISO) {
-  if (!MAKE_READ_URL) return { ok: false, events: [] };
+  if (!MAKE_READ_URL) return { ok: false, events: [], reason: "no_url" };
   try {
-    const payload = {
-      intent: "READ",
-      biz: MAKE_BIZ,
-      source: MAKE_SOURCE,
-      window: { start: startISO, end: endISO }
-    };
-    const { data } = await axios.post(MAKE_READ_URL, payload, { timeout: 10000 });
+    const payload = { intent: "READ", biz: MAKE_BIZ, source: MAKE_SOURCE, window: { start: startISO, end: endISO } };
+    const { data } = await axios.post(MAKE_READ_URL, payload, { timeout: 12000 });
 
-    // Normalize Make's `events` to an array (object or array)
-    let raw = data?.events;
+    // Accept truthy ok, or infer ok if we got events
+    let raw = data?.events ?? data?.event ?? null;
     let events = [];
-    if (Array.isArray(raw)) {
-      events = raw;
-    } else if (raw && typeof raw === "object") {
+    if (Array.isArray(raw)) events = raw;
+    else if (raw && typeof raw === "object") {
       if (Array.isArray(raw.array)) events = raw.array;
       else events = [raw];
-    } else {
-      events = [];
     }
 
-    return { ok: !!data?.ok, events };
+    const ok = (data && (data.ok === true || data.ok === "true")) || events.length >= 0;
+    return { ok, events };
   } catch (e) {
     console.error("[MAKE READ ERROR]", e.message);
-    return { ok: false, events: [] };
+    return { ok: false, events: [], reason: "exception" };
   }
 }
 async function makeCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
@@ -298,11 +286,8 @@ async function makeCreateEvent({ name, phone, email, notes, startISO, endISO, se
   try {
     const payload = {
       Event_Name: `${service || "Appointment"} (${name || "Guest"})`,
-      Start_Time: startISO,
-      End_Time: endISO,
-      Customer_Name: name || "",
-      Customer_Phone: phone || "",
-      Customer_Email: email || "",
+      Start_Time: startISO, End_Time: endISO,
+      Customer_Name: name || "", Customer_Phone: phone || "", Customer_Email: email || "",
       Notes: notes || service || ""
     };
     const { data } = await axios.post(MAKE_CREATE_URL, payload, { timeout: 10000 });
@@ -315,14 +300,9 @@ async function makeCreateEvent({ name, phone, email, notes, startISO, endISO, se
 async function makeDeleteEvent(event_id) {
   if (!MAKE_DELETE_URL) return { ok: false };
   try {
-    const payload = {
-      intent: "DELETE",
-      biz: MAKE_BIZ,
-      source: MAKE_SOURCE,
-      event_id
-    };
+    const payload = { intent: "DELETE", biz: MAKE_BIZ, source: MAKE_SOURCE, event_id };
     const { data } = await axios.post(MAKE_DELETE_URL, payload, { timeout: 10000 });
-    return { ok: !!data?.ok };
+    return { ok: !!data?.ok || data?.ok === "true" };
   } catch (e) {
     console.error("[MAKE DELETE ERROR]", e.message);
     return { ok: false };
@@ -377,7 +357,7 @@ function startDeepgram({ onFinal }) {
   };
 }
 
-// μ-law decode
+/* μ-law decode */
 function ulawByteToPcm16(u) {
   u = ~u & 0xff;
   const sign = u & 0x80;
@@ -459,7 +439,6 @@ function clearQuestionTimers(ws) {
   if (ws.__qTimer2) { clearTimeout(ws.__qTimer2); ws.__qTimer2 = null; }
   ws.__lastQuestion = "";
 }
-
 async function askWithReaskAndGoodbye(ws, questionText) {
   clearQuestionTimers(ws);
   ws.__lastQuestion = questionText;
@@ -486,8 +465,6 @@ function newState() {
     lastAskAt: 0
   };
 }
-
-/** Merge parsed into state; return {changed:boolean, changedKeys:string[]} */
 function mergeSlots(state, parsed) {
   const before = { ...state.slots };
   let changed = false;
@@ -513,9 +490,7 @@ function mergeSlots(state, parsed) {
     if (ph && ph !== state.slots.phone) { state.slots.phone = ph; changed = true; changedKeys.push("phone"); }
   }
 
-  if (changed) {
-    console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots }));
-  }
+  if (changed) console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots }));
   return { changed, changedKeys };
 }
 function nextMissing(state) {
@@ -534,107 +509,41 @@ function clearGoodbyeTimers(ws) {
   if (ws.__goodbyeSilenceTimer) { clearTimeout(ws.__goodbyeSilenceTimer); ws.__goodbyeSilenceTimer = null; }
   if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
 }
-function armGoodbyeSilence(ws, state) {
+function armGoodbyeSilence(ws) {
   clearGoodbyeTimers(ws);
   ws.__goodbyeSilenceTimer = setTimeout(async () => {
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-    ws.__hangTimer = setTimeout(() => {
-      try { ws.close(); } catch {}
-    }, 8000);
+    ws.__hangTimer = setTimeout(() => { try { ws.close(); } catch {} }, 8000);
   }, 7000);
 }
 
-async function askForMissing(ws, state) {
-  const s = state.slots;
-  const missing = nextMissing(state);
-  console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
-
-  // avoid repeating exact same ask within 1.2s
-  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
-  const now = Date.now();
-  if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
-  state.lastAskKey = key;
-  state.lastAskAt = now;
-
-  if (missing === "service")
-    return askWithReaskAndGoodbye(ws, "Which service would you like — haircut, beard trim, or combo?");
-
-  if (missing === "datetime") {
-    if (s.date && !s.time) return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-    if (!s.date && s.time) return askWithReaskAndGoodbye(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
-    return askWithReaskAndGoodbye(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
-  }
-
-  if (missing === "date")
-    return askWithReaskAndGoodbye(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
-
-  if (missing === "time")
-    return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-
-  if (missing === "name")
-    return askWithReaskAndGoodbye(ws, "Can I get your first name?");
-
-  if (missing === "phone")
-    return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
-
-  if (missing === "done") {
-    // Enforce business hours before confirming
-    const check = enforceBusinessWindow(state);
-    if (!check.ok) {
-      if (check.reason === "weekend") {
-        return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
-      }
-      if (check.reason === "hours") {
-        return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
-      }
-      // If incomplete, fall through to resume
-      return askForMissing(ws, state);
-    }
-    return triggerConfirm(ws, state);
-  }
-}
-
-function confirmSnapshot(slots) { return JSON.stringify(slots); }
-
-/* === NEW: check availability + create on Make before we “finalize” with the caller === */
+/* === Book: verify free, then create === */
 async function createViaMakeIfFree(ws, state) {
   const s = state.slots;
   const { startISO, endISO } = buildStartEndISO(s.date, s.time, s.service);
   if (!startISO || !endISO) return { ok: false, reason: "bad_time" };
 
-  // Read window = exact appt window
   const read = await makeReadWindow(startISO, endISO);
   if (!read.ok) {
     console.log(JSON.stringify({ event: "MAKE_READ_FAILED" }));
-    // If read fails, to avoid double-booking, do NOT auto-create.
     return { ok: false, reason: "unverified" };
   }
 
-  // If any event overlaps our desired window, it's taken
   const conflict = read.events?.some(ev => {
     const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
     const evEnd = ev.End_Time || ev.end || ev.end_time || ev.endISO || evStart;
     return evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
   });
-
   if (conflict) return { ok: false, reason: "conflict" };
 
-  // Create
   const created = await makeCreateEvent({
-    name: s.name,
-    phone: s.phone,
-    email: "", // not collected in current flow
-    notes: s.service,
-    startISO,
-    endISO,
-    service: s.service
+    name: s.name, phone: s.phone, email: "", notes: s.service,
+    startISO, endISO, service: s.service
   });
   if (!created.ok) return { ok: false, reason: "create_failed" };
 
-  // Echo event_id back on state for potential cancel
   const eventId = created.event?.event_id || created.event?.id || created.event?.eventId || null;
   if (eventId) state.__lastEventId = eventId;
-
   return { ok: true, startISO, endISO, eventId };
 }
 
@@ -643,45 +552,36 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   const when = humanWhen(s.date, s.time);
   console.log(JSON.stringify({ event: "CONFIRM_READY", slots: s, whenSpoken: when }));
 
-  const snap = confirmSnapshot(s);
+  const snap = JSON.stringify(s);
   if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
 
-  // === verify availability + create in Make ===
   const makeRes = await createViaMakeIfFree(ws, state);
   if (!makeRes.ok) {
     if (makeRes.reason === "conflict") {
       await say(ws, "That time just became unavailable. What other time that day works?");
-      // Clear only time so we stay on same date
-      state.slots.time = "";
-      state.phase = "booking";
-      return askForMissing(ws, state);
+      state.slots.time = ""; state.phase = "booking";
+      return await askForMissing(ws, state);
     }
-    // If unverified or create_failed, ask for another time (safer than double-booking)
     await say(ws, "I couldn’t lock that time just now. What other time works?");
-    state.slots.time = "";
-    state.phase = "booking";
-    return askForMissing(ws, state);
+    state.slots.time = ""; state.phase = "booking";
+    return await askForMissing(ws, state);
   }
 
   state.phase = "confirmed";
   state.lastConfirmSnapshot = snap;
-
   const last4 = s.phone ? s.phone.slice(-4) : "";
   const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
-
   const line = updated
     ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
-
-  // Ask and wait (silence timers handle re-ask → goodbye)
   await askWithReaskAndGoodbye(ws, line);
 }
 
-/* === NEW: helpers for cancellation confirmation === */
+/* === Cancel helpers === */
 function isoToDateTimeSpeech(iso) {
   if (!iso || typeof iso !== "string" || iso.length < 16) return "";
-  const dateISO = iso.slice(0, 10);             // YYYY-MM-DD
-  const timeHHMM = iso.slice(11, 16);           // HH:MM
+  const dateISO = iso.slice(0, 10);
+  const timeHHMM = iso.slice(11, 16);
   return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
 function describeEventForSpeech(ev) {
@@ -701,33 +601,59 @@ function parseYesNo(text) {
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
+async function askForMissing(ws, state) {
+  const s = state.slots;
+  const missing = nextMissing(state);
+  console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
+
+  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
+  const now = Date.now();
+  if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
+  state.lastAskKey = key; state.lastAskAt = now;
+
+  if (missing === "service") return askWithReaskAndGoodbye(ws, "Which service would you like — haircut, beard trim, or combo?");
+  if (missing === "datetime") {
+    if (s.date && !s.time) return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+    if (!s.date && s.time) return askWithReaskAndGoodbye(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
+    return askWithReaskAndGoodbye(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
+  }
+  if (missing === "date") return askWithReaskAndGoodbye(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
+  if (missing === "time") return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+  if (missing === "name") return askWithReaskAndGoodbye(ws, "Can I get your first name?");
+  if (missing === "phone") return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
+  if (missing === "done") {
+    const check = enforceBusinessWindow(state);
+    if (!check.ok) {
+      if (check.reason === "weekend") return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+      if (check.reason === "hours") return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+      return askForMissing(ws, state);
+    }
+    return triggerConfirm(ws, state);
+  }
+}
+
 async function classifyAndHandle(ws, state, transcript) {
-  // Any speech cancels the pending question timers
   clearQuestionTimers(ws);
 
-  // === NEW: intercept yes/no while awaiting cancel confirmation ===
+  /* Pending cancel yes/no */
   if (ws.__pendingCancel && transcript) {
     const yn = parseYesNo(transcript);
     if (yn === "yes") {
       const eventId = ws.__pendingCancel.eventId;
       ws.__pendingCancel = null;
       const del = await makeDeleteEvent(eventId);
-      if (del.ok) {
-        await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
-      } else {
-        await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
-      }
+      if (del.ok) await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
+      else await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
       return;
     } else if (yn === "no") {
       ws.__pendingCancel = null;
-      ws.__cancelFlow = { active: true, want: "datetime" };
+      ws.__cancelFlow = { active: true };
       await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
       return;
     }
-    // Fall through to normal NLU if it's not a clear yes/no.
   }
 
-  // “this/my number” -> use caller ID
+  /* Caller says “this/my number” */
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -751,7 +677,6 @@ Return STRICT JSON:
 Rules:
 - Detect booking only if the user asks to schedule, book, reschedule, or gives date/time.
 - If user wants to cancel an appointment, set intent = "CANCEL" and include any date/time/name/phone mentioned.
-- If user says they do NOT want to book or they say "that's it / goodbye", set intent = "END".
 - If the user says "this number", leave phone empty (we fill from caller ID).
 - Keep values minimal; leave blank if unsure.
 `.trim();
@@ -763,30 +688,23 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // Reset goodbye silence if user talks after confirmation
-  if (state.phase === "confirmed") {
-    clearGoodbyeTimers(ws);
-  }
+  if (state.phase === "confirmed") clearGoodbyeTimers(ws);
 
-  /* === NEW: If we're in a cancel flow, treat follow-ups as cancel context even if NLU says BOOK === */
+  /* Sticky cancel mode: treat follow-ups as cancel, even if GPT says BOOK/UNKNOWN */
   if (ws.__cancelFlow?.active) {
-    const dateISO = parsed.date ? normalizeDate(parsed.date) : "";
+    const dateISO = normalizeDate(parsed.date) || "";
     const timeStr = parsed.time || "";
 
-    // If we don't have anything useful yet, prompt again
     if (!dateISO && !timeStr) {
       await askWithReaskAndGoodbye(ws, "Which date and time should I cancel?");
       return;
     }
 
-    // Build read window: whole day if only date; exact slot if both date & time
     let startISO = "", endISO = "";
     if (dateISO && timeStr) {
-      const se = buildStartEndISO(dateISO, timeStr, "haircut");
-      startISO = se.startISO; endISO = se.endISO;
-    } else if (dateISO && !timeStr) {
-      const se = dayBoundsISO(dateISO);
-      startISO = se.startISO; endISO = se.endISO;
+      ({ startISO, endISO } = buildStartEndISO(dateISO, timeStr, "haircut"));
+    } else if (dateISO) {
+      ({ startISO, endISO } = dayBoundsISO(dateISO));
     }
 
     if (!startISO || !endISO) {
@@ -796,7 +714,7 @@ Rules:
 
     const read = await makeReadWindow(startISO, endISO);
     if (!read.ok) {
-      await say(ws, "I couldn’t reach the calendar just now. Want me to try again?");
+      await askWithReaskAndGoodbye(ws, "I couldn’t reach the calendar just now. What date and time should I cancel?");
       return;
     }
     if (!Array.isArray(read.events) || read.events.length === 0) {
@@ -804,7 +722,7 @@ Rules:
       return;
     }
 
-    // Pick best candidate (time match first; phone/name if present)
+    // Choose best candidate
     const phone = state.slots.phone || "";
     const name = state.slots.name || "";
     let target = null;
@@ -822,7 +740,7 @@ Rules:
 
     const eventId = target.event_id || target.id || target.eventId;
     if (!eventId) {
-      await askWithReaskAndGoodbye(ws, "I found an appointment, but not its ID. What’s the exact time?");
+      await askWithReaskAndGoodbye(ws, "I found an appointment but couldn’t identify its ID. What’s the exact time?");
       return;
     }
 
@@ -835,7 +753,6 @@ Rules:
 
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // Acknowledge slot changes during booking
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
     for (const k of changedKeys) {
@@ -848,40 +765,26 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
-  // End / post-confirm wrap
   if (parsed.intent === "END") {
-    if (state.phase === "confirmed") {
-      await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-      setTimeout(() => { try { ws.close(); } catch {} }, 8000);
-      return;
-    }
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
     setTimeout(() => { try { ws.close(); } catch {} }, 8000);
     return;
   }
 
-  // Declined booking (keep idle)
   if (parsed.intent === "DECLINE_BOOK") {
     state.phase = "idle";
     return say(ws, "No problem. How else can I help?");
   }
 
-  /* === UPDATED: Cancellation flow — read, confirm with user, then delete on yes === */
+  /* Start cancel flow */
   if (parsed.intent === "CANCEL") {
-    ws.__cancelFlow = { active: true, want: "datetime" };
-
-    const dateISO0 = normalizeDate(parsed.date);
-    const timeStr0 = parsed.time || "";
-
-    // If the user already gave details, jump straight to the cancel handler above on next turn
-    if (!dateISO0 && !timeStr0) {
+    ws.__cancelFlow = { active: true };
+    const d0 = normalizeDate(parsed.date);
+    const t0 = parsed.time || "";
+    if (!d0 && !t0) {
       await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
     } else {
-      // Re-enter classifyAndHandle path immediately with cancelFlow active to process these details
-      const synthetic = [];
-      if (dateISO0) synthetic.push(`Date ${dateISO0}`);
-      if (timeStr0) synthetic.push(`Time ${timeStr0}`);
-      await askWithReaskAndGoodbye(ws, "Got it — is that the only appointment on that date?");
+      await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
     }
     return;
   }
@@ -889,38 +792,18 @@ Rules:
   // FAQs
   if (parsed.intent === "FAQ") {
     let answer = "";
-    try {
-      if (MAKE_FAQ_URL) {
-        await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, service: parsed.service || state.slots.service || "" });
-      }
-    } catch {}
-
+    try { if (MAKE_FAQ_URL) await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, service: parsed.service || state.slots.service || "" }); } catch {}
     const priceTable = { "haircut": "thirty dollars", "beard trim": "fifteen dollars", "combo": "forty dollars" };
-
-    if (parsed.faq_topic === "HOURS") {
-      answer = "We’re open Monday to Friday, nine A M to five P M. Closed weekends.";
-    } else if (parsed.faq_topic === "PRICES") {
+    if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, nine A M to five P M. Closed weekends.";
+    else if (parsed.faq_topic === "PRICES") {
       const svc = normalizeService(parsed.service || state.slots.service);
-      if (svc && priceTable[svc]) {
-        answer = `${svc} is ${priceTable[svc]}.`;
-      } else {
-        answer = "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
-      }
-    } else if (parsed.faq_topic === "SERVICES") {
-      answer = "We offer haircuts, beard trims, and the combo.";
-    } else if (parsed.faq_topic === "LOCATION") {
-      answer = "We’re at one two three Blueberry Lane.";
-    } else {
-      answer = "Happy to help. What else can I answer?";
-    }
+      answer = (svc && priceTable[svc]) ? `${svc} is ${priceTable[svc]}.` : "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
+    } else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
+    else if (parsed.faq_topic === "LOCATION") answer = "We’re at one two three Blueberry Lane.";
+    else answer = "Happy to help. What else can I answer?";
 
-    if (state.phase === "booking") {
-      await say(ws, answer);
-      return askForMissing(ws, state);
-    }
-    if (state.phase === "confirmed") {
-      return say(ws, answer);
-    }
+    if (state.phase === "booking") { await say(ws, answer); return askForMissing(ws, state); }
+    if (state.phase === "confirmed") return say(ws, answer);
     return say(ws, `${answer} Would you like to book an appointment or do you have another question?`);
   }
 
@@ -930,30 +813,20 @@ Rules:
     return;
   }
 
-  // Booking gate: only enter booking if the user asked to book OR already in booking
+  // Booking flow
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
-
     const missing = nextMissing(state);
     if (missing === "done") {
       const check = enforceBusinessWindow(state);
       if (!check.ok) {
-        if (check.reason === "weekend") {
-          return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
-        }
-        if (check.reason === "hours") {
-          return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
-        }
+        if (check.reason === "weekend") return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+        if (check.reason === "hours") return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
       }
       return triggerConfirm(ws, state);
     }
+    if (changed && changedKeys.length === 1 && changedKeys[0] === missing) return askForMissing(ws, state);
 
-    // If caller gave exactly the missing piece, move to the next ask
-    if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
-      return askForMissing(ws, state);
-    }
-
-    // Smalltalk/Unknown during booking: brief bridge + precise ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or combo?",
@@ -963,34 +836,18 @@ Rules:
         "name": "Can I get your first name?",
         "phone": "What phone number should I use for confirmations?"
       }[missing];
-
-      const bridgePrompt = `
-Reply with one short, natural sentence (<=12 words) acknowledging the remark.
-Do NOT ask open-ended questions. Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
-`.trim();
-
-      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure.";
+      const bridge = (await askGPT(`Reply with one short, natural sentence (<=12 words). No open questions.`, transcript)) || "Sure.";
       await say(ws, bridge);
       return askWithReaskAndGoodbye(ws, targetAsk);
     }
-
     return askForMissing(ws, state);
   }
 
-  // SMALLTALK / UNKNOWN outside booking — short + pivot to help
+  // Smalltalk outside booking
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    if (state.phase === "idle") {
-      const polite = `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`;
-      return say(ws, polite);
-    }
-    if (state.phase === "confirmed") {
-      const nlg = "Happy to help!";
-      return say(ws, nlg);
-    }
-    const fallbackPrompt = `
-Reply with one short, casual sentence (<=12 words). No follow-up questions.
-`.trim();
-    const nlg = await askGPT(fallbackPrompt, transcript);
+    if (state.phase === "idle") return say(ws, `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`);
+    if (state.phase === "confirmed") return say(ws, "Happy to help!");
+    const nlg = await askGPT(`Reply with one short, casual sentence (<=12 words). No follow-up questions.`, transcript);
     return say(ws, nlg || "How can I help?");
   }
 }
@@ -1009,14 +866,13 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__state = newState();
-      ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
-      ws.__pendingCancel = null; // track cancel confirmation state
+      ws.__callerFrom = msg.start?.customParameters?.from || "";
+      ws.__pendingCancel = null;
       ws.__cancelFlow = { active: false };
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
-      // Start Deepgram
       dg = startDeepgram({
         onFinal: async (text) => {
           try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
