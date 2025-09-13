@@ -96,7 +96,6 @@ function normalizeService(s) {
 function normalizePhone(num) {
   if (!num) return "";
   const d = num.replace(/\D/g, "");
-  // Use last 10 digits if 10+ provided
   const ten = d.length >= 10 ? d.slice(-10) : "";
   return ten;
 }
@@ -130,6 +129,75 @@ function humanWhen(dateISO, timeStr) {
   const dSpoken = formatDateSpoken(dateISO);
   const tSpoken = to12h(timeStr);
   return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
+}
+
+/* ---- Business hours guard (Mon–Fri 09:00–17:00 local) ---- */
+const HOURS = {
+  mon: { open: "09:00", close: "17:00" },
+  tue: { open: "09:00", close: "17:00" },
+  wed: { open: "09:00", close: "17:00" },
+  thu: { open: "09:00", close: "17:00" },
+  fri: { open: "09:00", close: "17:00" },
+  sat: null,
+  sun: null,
+};
+function dayKeyFromISO(iso) {
+  const d = new Date(iso);
+  return ["sun","mon","tue","wed","thu","fri","sat"][d.getDay()];
+}
+function parseToHHMM(t) {
+  if (!t) return "";
+  const s = t.trim();
+  const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (ampm) {
+    let h = parseInt(ampm[1],10);
+    const m = ampm[2] ? parseInt(ampm[2],10) : 0;
+    const ap = ampm[3].toUpperCase();
+    if (ap === "PM" && h < 12) h += 12;
+    if (ap === "AM" && h === 12) h = 0;
+    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+  }
+  const hhmm = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (hhmm) return `${hhmm[1].padStart(2,"0")}:${hhmm[2]}`;
+  const hh = s.match(/^(\d{1,2})$/);
+  if (hh) return `${String(parseInt(hh[1],10)).padStart(2,"0")}:00`;
+  return s;
+}
+function toMinutes(hhmm) { const [h,m] = (hhmm||"").split(":").map(Number); return (h||0)*60 + (m||0); }
+function isWithinHours(dateISO, timeStr) {
+  const key = dayKeyFromISO(dateISO);
+  const rule = HOURS[key];
+  if (!rule) return false;
+  const t24 = parseToHHMM(timeStr);
+  const mins = toMinutes(t24);
+  return mins >= toMinutes(rule.open) && mins <= toMinutes(rule.close);
+}
+function nextOpenSuggestion(dateISO, timeStr) {
+  const d = new Date(dateISO);
+  const t24 = parseToHHMM(timeStr);
+  const key = dayKeyFromISO(dateISO);
+  let rule = HOURS[key];
+  if (!rule) {
+    for (let i=0;i<7;i++) {
+      d.setDate(d.getDate()+1);
+      const k = ["sun","mon","tue","wed","thu","fri","sat"][d.getDay()];
+      if (HOURS[k]) { rule = HOURS[k]; break; }
+    }
+    const yyyy = d.getFullYear(), mm = String(d.getMonth()+1).padStart(2,"0"), dd = String(d.getDate()).padStart(2,"0");
+    return { date: `${yyyy}-${mm}-${dd}`, time: rule.open };
+  }
+  if (toMinutes(t24) < toMinutes(rule.open)) return { date: dateISO, time: rule.open };
+  if (toMinutes(t24) > toMinutes(rule.close)) {
+    for (let i=0;i<7;i++) {
+      d.setDate(d.getDate()+1);
+      const k = ["sun","mon","tue","wed","thu","fri","sat"][d.getDay()];
+      if (HOURS[k]) {
+        const yyyy = d.getFullYear(), mm = String(d.getMonth()+1).padStart(2,"0"), dd = String(d.getDate()).padStart(2,"0");
+        return { date: `${yyyy}-${mm}-${dd}`, time: HOURS[k].open };
+      }
+    }
+  }
+  return { date: dateISO, time: t24 };
 }
 
 /* ----------------------- Deepgram WS ----------------------- */
@@ -256,7 +324,8 @@ function newState() {
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
     bookingLock: false,
     lastAskKey: "",
-    lastAskAt: 0
+    lastAskAt: 0,
+    expectingBookYes: false, // handle Yes/No after offer
   };
 }
 
@@ -399,18 +468,53 @@ Rules:
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  const prevPhase = state.phase;
+  // Coerce Yes/No after we offered to book
+  if (state.expectingBookYes) {
+    const lx = transcript.trim().toLowerCase();
+    if (/(^|\b)(yes|sure|okay|ok|yeah|yep)\b/.test(lx)) parsed.intent = "BOOK";
+    if (/(^|\b)(no|nah|not now|maybe later)\b/.test(lx)) parsed.intent = "DECLINE_BOOK";
+    state.expectingBookYes = false;
+  }
+
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // Acknowledge slot changes during booking
+  // If caller ID filled phone and all done, jump to confirm before any bridge
+  if ((state.phase === "booking" || parsed.intent === "BOOK") && nextMissing(state) === "done") {
+    // business hours guard
+    const s = state.slots;
+    if (!isWithinHours(s.date, s.time)) {
+      const sug = nextOpenSuggestion(s.date, s.time);
+      state.slots.date = sug.date;
+      state.slots.time = sug.time;
+      await say(ws, `We’re open Monday to Friday, 9 to 5. I can do ${humanWhen(sug.date, sug.time)}. Does that work?`);
+      return;
+    }
+    return triggerConfirm(ws, state);
+  }
+
+  // Acknowledge slot changes during booking (merge with next question to avoid repeats)
+  const cap = (x) => x ? x.charAt(0).toUpperCase() + x.slice(1) : x;
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
     for (const k of changedKeys) {
-      if (k === "service") acks.push(`Got it. ${state.slots.service}.`);
+      if (k === "service") acks.push(`Got it. ${cap(state.slots.service)}.`);
       if (k === "date") acks.push(`Okay. ${formatDateSpoken(state.slots.date)}.`);
       if (k === "time") acks.push(`Noted. ${to12h(state.slots.time)}.`);
       if (k === "name") acks.push(`Thanks, ${state.slots.name}.`);
       if (k === "phone") acks.push(`Thanks. I’ve saved your number.`);
+    }
+    const missingAfter = nextMissing(state);
+    if (missingAfter !== "done" && changedKeys.length === 1) {
+      const q = {
+        service: "Which service would you like — haircut, beard trim, or combo?",
+        datetime: `What date and time would you like for your ${state.slots.service || "appointment"}?`,
+        date: `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
+        time: `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
+        name: "Can I get your first name?",
+        phone: "What phone number should I use for confirmations?"
+      }[missingAfter];
+      await say(ws, (acks.join(" ") + " " + q).trim());
+      return;
     }
     if (acks.length) await say(ws, acks.join(" "));
   }
@@ -424,7 +528,6 @@ Rules:
   // FAQs
   if (parsed.intent === "FAQ") {
     let answer = "";
-    // Optional: fetch FAQ from MAKE if configured
     try {
       if (MAKE_FAQ_URL) {
         await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, service: parsed.service || state.slots.service || "" });
@@ -438,9 +541,10 @@ Rules:
     } else if (parsed.faq_topic === "PRICES") {
       const svc = normalizeService(parsed.service || state.slots.service);
       if (svc && priceTable[svc]) {
-        answer = `${svc} is $${priceTable[svc]}.`;
+        const dollars = priceTable[svc];
+        answer = `${svc} is ${dollars} dollars.`;
       } else {
-        answer = "Haircut $30, beard trim $15, combo $40.";
+        answer = "Haircut is 30 dollars. Beard trim is 15. Combo is 40.";
       }
     } else if (parsed.faq_topic === "SERVICES") {
       answer = "We offer haircuts, beard trims, and the combo.";
@@ -455,10 +559,9 @@ Rules:
       return askForMissing(ws, state);
     }
     if (state.phase === "confirmed") {
-      // Do NOT ask to book again post-confirmation
       return say(ws, answer);
     }
-    // Idle: lightly offer to book
+    state.expectingBookYes = true; // set offer flag
     return say(ws, `${answer} Would you like to book an appointment?`);
   }
 
@@ -473,7 +576,18 @@ Rules:
     if (state.phase !== "booking") state.phase = "booking";
 
     const missing = nextMissing(state);
-    if (missing === "done") return triggerConfirm(ws, state);
+    if (missing === "done") {
+      // business hours guard
+      const s = state.slots;
+      if (!isWithinHours(s.date, s.time)) {
+        const sug = nextOpenSuggestion(s.date, s.time);
+        state.slots.date = sug.date;
+        state.slots.time = sug.time;
+        await say(ws, `We’re open Monday to Friday, 9 to 5. I can do ${humanWhen(sug.date, sug.time)}. Does that work?`);
+        return;
+      }
+      return triggerConfirm(ws, state);
+    }
 
     // If caller gave exactly the missing piece, move to the next ask
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
@@ -506,7 +620,6 @@ Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
 
   // SMALLTALK / UNKNOWN outside booking — short, no follow-up
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    // Stay idle. Do not auto-start booking.
     const fallbackPrompt = `
 Reply with one short, casual sentence (<=12 words). No follow-up questions.
 `.trim();
