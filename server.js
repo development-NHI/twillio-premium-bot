@@ -26,9 +26,13 @@ app.use(bodyParser.json());
 
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
 
+/**
+ * TwiML: pass caller number & CallSid as custom parameters so we can honor
+ * “this number” during phone capture and for logging.
+ */
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
   res.send(`
     <Response>
       <Connect>
@@ -41,7 +45,7 @@ app.post("/twiml", (req, res) => {
   `.trim());
 });
 
-const server = app.listen(PORT, () => console.log([INFO] Server running on ${PORT}));
+const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 const wss = new WebSocketServer({ server });
 
 /* ----------------------- Utilities ----------------------- */
@@ -51,7 +55,7 @@ function nowNY() {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 }
 function addDaysISO(iso, days) {
   const d = new Date(iso);
@@ -59,7 +63,7 @@ function addDaysISO(iso, days) {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 }
 function weekdayToISO(weekday) {
   const map = { sunday:0, monday:1, tuesday:2, wednesday:3, thursday:4, friday:5, saturday:6 };
@@ -92,7 +96,8 @@ function normalizeService(s) {
 function normalizePhone(num) {
   if (!num) return "";
   const d = num.replace(/\D/g, "");
-  return d.length >= 10 ? d.slice(-10) : "";
+  const ten = d.length >= 10 ? d.slice(-10) : "";
+  return ten;
 }
 function ordinal(n) {
   const s = ["th", "st", "nd", "rd"], v = n % 100;
@@ -103,7 +108,7 @@ function formatDateSpoken(iso) {
   if (!m) return iso || "";
   const mm = Number(m[2]);
   const dd = Number(m[3]);
-  return ${MONTHS[mm - 1]} ${ordinal(dd)};
+  return `${MONTHS[mm - 1]} ${ordinal(dd)}`;
 }
 function to12h(t) {
   if (!t) return "";
@@ -118,22 +123,22 @@ function to12h(t) {
   const ampm = hh >= 12 ? "PM" : "AM";
   if (hh === 0) hh = 12;
   if (hh > 12) hh -= 12;
-  return ${${hh}:${mm}.replace(":00","")} ${ampm};
+  return `${hh}:${mm}`.replace(":00","") + ` ${ampm}`;
 }
 function humanWhen(dateISO, timeStr) {
   const dSpoken = formatDateSpoken(dateISO);
   const tSpoken = to12h(timeStr);
-  return tSpoken ? ${dSpoken} at ${tSpoken} : dSpoken;
+  return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
 }
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ----- Business hours ----- */
+/* ----- Business hours (Mon–Fri, 9AM–5PM) ----- */
 function isWeekend(dateISO) {
   const d = new Date(dateISO);
-  const day = d.getDay();
+  const day = d.getDay(); // 0=Sun,6=Sat
   return day === 0 || day === 6;
 }
 function isWithinHours(timeStr) {
+  // Accept "3 PM" or "15:00" (we normalize to 24h minutes)
   if (!timeStr) return false;
   let hh = 0, mm = 0;
   const ampm = /am|pm/i.test(timeStr);
@@ -152,43 +157,84 @@ function isWithinHours(timeStr) {
     mm = parseInt(m[2] || "0", 10);
   }
   const minutes = hh * 60 + mm;
-  return minutes >= 540 && minutes <= 1020;
+  const start = 9 * 60;   // 9:00
+  const end = 17 * 60;    // 17:00
+  return minutes >= start && minutes <= end;
 }
 function enforceBusinessWindow(state) {
   const s = state.slots;
   if (!s.date || !s.time) return { ok: false, reason: "incomplete" };
-  if (isWeekend(s.date)) { s.date = ""; return { ok: false, reason: "weekend" }; }
-  if (!isWithinHours(s.time)) { s.time = ""; return { ok: false, reason: "hours" }; }
+  if (isWeekend(s.date)) {
+    const oldDate = s.date;
+    s.date = "";
+    return { ok: false, reason: "weekend", oldDate };
+  }
+  if (!isWithinHours(s.time)) {
+    const oldTime = s.time;
+    s.time = "";
+    return { ok: false, reason: "hours", oldTime };
+  }
   return { ok: true };
 }
 
-/* ---------------- Silence & Goodbye Timers ---------------- */
-function clearTimers(ws) {
-  if (ws._silenceTimer) { clearTimeout(ws.silenceTimer); ws._silenceTimer = null; }
-  if (ws._retryTimer)   { clearTimeout(ws.retryTimer);   ws._retryTimer = null; }
-  if (ws._hangTimer)    { clearTimeout(ws.hangTimer);    ws._hangTimer = null; }
-  ws.__retried = false;
+/* ----------------------- Deepgram WS ----------------------- */
+function startDeepgram({ onFinal }) {
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=linear16"
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&language=en-US"
+    + "&endpointing=250";
+
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    perMessageDeflate: false
+  });
+
+  dg.on("open", () => console.log("[Deepgram] ws open"));
+  dg.on("message", (data) => {
+    let ev;
+    try { ev = JSON.parse(data.toString()); } catch { return; }
+    if (ev.type !== "Results") return;
+    const alt = ev.channel?.alternatives?.[0];
+    if (!alt) return;
+    const text = (alt.transcript || "").trim();
+    if (!text) return;
+    if (ev.is_final || ev.speech_final) {
+      console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
+      onFinal?.(text);
+    }
+  });
+  dg.on("error", (e) => console.error("[Deepgram error]", e.message));
+  dg.on("close", () => console.log("[Deepgram closed]"));
+
+  return {
+    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
+    close() { try { dg.close(); } catch {} }
+  };
 }
-async function sayAndHang(ws, msg) {
-  await say(ws, msg);
-  await sleep(8000);
-  try { ws.close(); } catch {}
+
+// μ-law decode
+function ulawByteToPcm16(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80;
+  const exponent = (u >> 4) & 0x07;
+  const mantissa = u & 0x0f;
+  let sample = (((mantissa << 3) + 0x84) << (exponent + 2)) - 0x84 * 4;
+  if (sign) sample = -sample;
+  return Math.max(-32768, Math.min(32767, sample));
 }
-function armSilence(ws, questionText) {
-  clearTimers(ws);
-  ws.__retried = false;
-  ws.__silenceTimer = setTimeout(async () => {
-    if (ws.__retried) return;
-    ws.__retried = true;
-    await say(ws, Sorry, I didn’t catch that — could you repeat? ${questionText});
-    ws.__retryTimer = setTimeout(async () => {
-      await sayAndHang(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-    }, 25000);
-  }, 25000);
-}
-async function askAndArm(ws, text) {
-  await say(ws, text);
-  armSilence(ws, text);
+function ulawBufferToPCM16LEBuffer(ulawBuf) {
+  const out = Buffer.alloc(ulawBuf.length * 2);
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const s = ulawByteToPcm16(ulawBuf[i]);
+    out.writeInt16LE(s, i * 2);
+  }
+  return out;
 }
 
 /* ----------------------- GPT ----------------------- */
@@ -205,7 +251,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
         ],
         ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
       },
-      { headers: { Authorization: Bearer ${OPENAI_API_KEY} } }
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
     return resp.data.choices[0].message.content.trim();
   } catch (e) {
@@ -219,12 +265,18 @@ async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
   if (!streamSid) return;
+
   console.log(JSON.stringify({ event: "BOT_SAY", reply: text }));
 
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return;
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    console.warn('{"ts":"'+new Date().toISOString()+'","level":"WARN","msg":"No ElevenLabs credentials, skipping TTS"}');
+    return;
+  }
+
   try {
-    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000;
-    const resp = await axios.post(url,
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const resp = await axios.post(
+      url,
       { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
       { headers: { "xi-api-key": ELEVENLABS_API_KEY }, responseType: "stream" }
     );
@@ -232,9 +284,47 @@ async function say(ws, text) {
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
     });
-    resp.data.on("end", () => ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } })));
-  } catch (e) { console.error("[TTS ERROR]", e.message); }
-} 
+    resp.data.on("end", () =>
+      ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }))
+    );
+  } catch (e) {
+    console.error("[TTS ERROR]", e.message);
+  }
+}
+
+/* ----------------------- Silence handling (ONLY addition you asked for) ----------------------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function clearQuestionTimers(ws) {
+  if (ws.__qTimer1) { clearTimeout(ws.__qTimer1); ws.__qTimer1 = null; }
+  if (ws.__qTimer2) { clearTimeout(ws.__qTimer2); ws.__qTimer2 = null; }
+  ws.__lastQuestion = "";
+}
+
+/**
+ * Ask a question and, on silence:
+ *  - after 20s: re-ask with a polite prompt
+ *  - after a further 8s: say goodbye and hang up after 8s
+ */
+async function askWithReaskAndGoodbye(ws, questionText) {
+  clearQuestionTimers(ws);
+  ws.__lastQuestion = questionText;
+
+  await say(ws, questionText);
+
+  // Re-ask after 20 seconds of silence
+  ws.__qTimer1 = setTimeout(async () => {
+    await say(ws, `Sorry, I didn’t hear that. ${questionText}`);
+
+    // Close after 8 more seconds if still no reply
+    ws.__qTimer2 = setTimeout(async () => {
+      await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+      await sleep(8000);
+      try { ws.close(); } catch {}
+    }, 8000);
+  }, 20000);
+}
+
 /* ----------------------- State & Slots ----------------------- */
 function newState() {
   return {
@@ -290,38 +380,68 @@ function nextMissing(state) {
   return "done";
 }
 
+/* ------ Goodbye handling (post-confirmation) ------ */
+function clearGoodbyeTimers(ws) {
+  if (ws.__goodbyeSilenceTimer) { clearTimeout(ws.__goodbyeSilenceTimer); ws.__goodbyeSilenceTimer = null; }
+  if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+}
+function armGoodbyeSilence(ws, state) {
+  clearGoodbyeTimers(ws);
+  ws.__goodbyeSilenceTimer = setTimeout(async () => {
+    await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+    ws.__hangTimer = setTimeout(() => {
+      try { ws.close(); } catch {}
+    }, 8000);
+  }, 7000);
+}
+
 async function askForMissing(ws, state) {
   const s = state.slots;
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
-  const key = ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone};
+  // avoid repeating exact same ask within 1.2s
+  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
   const now = Date.now();
   if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
   state.lastAskKey = key;
   state.lastAskAt = now;
 
-  let line = "";
-  if (missing === "service") {
-    line = "Which service would you like — haircut, beard trim, or combo?";
-  } else if (missing === "datetime") {
-    if (s.date && !s.time) line = What time on ${formatDateSpoken(s.date)} works for your ${s.service}?;
-    else if (!s.date && s.time) line = What day works for your ${s.service} at ${to12h(s.time)}?;
-    else line = What date and time would you like for your ${s.service || "appointment"}?;
-  } else if (missing === "date") {
-    line = `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`;
-  } else if (missing === "time") {
-    line = What time on ${formatDateSpoken(s.date)} works for your ${s.service}?;
-  } else if (missing === "name") {
-    line = "Can I get your first name?";
-  } else if (missing === "phone") {
-    line = "What phone number should I use for confirmations?";
-  } else if (missing === "done") {
-    return triggerConfirm(ws, state);
+  if (missing === "service")
+    return askWithReaskAndGoodbye(ws, "Which service would you like — haircut, beard trim, or combo?");
+
+  if (missing === "datetime") {
+    if (s.date && !s.time) return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+    if (!s.date && s.time) return askWithReaskAndGoodbye(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
+    return askWithReaskAndGoodbye(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
   }
 
-  await say(ws, line);
-  armQuestionSilence(ws, line); // << added silence/retry timer
+  if (missing === "date")
+    return askWithReaskAndGoodbye(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
+
+  if (missing === "time")
+    return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+
+  if (missing === "name")
+    return askWithReaskAndGoodbye(ws, "Can I get your first name?");
+
+  if (missing === "phone")
+    return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
+
+  if (missing === "done") {
+    // Enforce business hours before confirming
+    const check = enforceBusinessWindow(state);
+    if (!check.ok) {
+      if (check.reason === "weekend") {
+        return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+      }
+      if (check.reason === "hours") {
+        return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+      }
+      return askForMissing(ws, state);
+    }
+    return triggerConfirm(ws, state);
+  }
 }
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
@@ -341,15 +461,21 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
 
   const line = updated
-    ? Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?
-    : Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?;
+    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
+    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
   await say(ws, line);
-  armQuestionSilence(ws, "Is there anything else I can help you with?"); // << added silence/retry timer
+
+  // Arm post-confirmation silence hangup (7s silence → goodbye → wait 8s → close)
+  armGoodbyeSilence(ws, state);
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
+  // Any speech cancels the pending question timers
+  clearQuestionTimers(ws);
+
+  // “this/my number” -> use caller ID
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -359,7 +485,23 @@ async function classifyAndHandle(ws, state, transcript) {
     }
   }
 
-  // (systemPrompt unchanged...)
+  const systemPrompt = `
+Return STRICT JSON:
+{
+ "intent": "FAQ" | "BOOK" | "DECLINE_BOOK" | "TRANSFER" | "END" | "SMALLTALK" | "UNKNOWN",
+ "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
+ "service": "",
+ "date": "",
+ "time": "",
+ "name": "",
+ "phone": ""
+}
+Rules:
+- Detect booking only if the user asks to schedule, book, reschedule, or gives date/time.
+- If user says they do NOT want to book or they say "that's it / goodbye", set intent = "END".
+- If the user says "this number", leave phone empty (we fill from caller ID).
+- Keep values minimal; leave blank if unsure.
+`.trim();
 
   let parsed = {};
   try {
@@ -368,48 +510,208 @@ async function classifyAndHandle(ws, state, transcript) {
   } catch {}
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  // reset silence timers if caller speaks
-  clearSilenceTimers(ws);
+  // Reset goodbye silence if user talks after confirmation
+  if (state.phase === "confirmed") {
+    clearGoodbyeTimers(ws);
+  }
 
-  // (rest of your classify logic unchanged — make sure after every await say(ws,line) where a question is asked, you also call armQuestionSilence(ws,line))
+  const { changed, changedKeys } = mergeSlots(state, parsed);
 
+  // Acknowledge slot changes during booking
+  if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
+    const acks = [];
+    for (const k of changedKeys) {
+      if (k === "service") acks.push(`Got it: ${state.slots.service}.`);
+      if (k === "date") acks.push(`Okay: ${formatDateSpoken(state.slots.date)}.`);
+      if (k === "time") acks.push(`Noted: ${to12h(state.slots.time)}.`);
+      if (k === "name") acks.push(`Thanks, ${state.slots.name}.`);
+      if (k === "phone") acks.push(`Thanks. I’ve saved your number.`);
+    }
+    if (acks.length) await say(ws, acks.join(" "));
+  }
+
+  // End / post-confirm wrap
+  if (parsed.intent === "END") {
+    if (state.phase === "confirmed") {
+      await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+      setTimeout(() => { try { ws.close(); } catch {} }, 8000);
+      return;
+    }
+    await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+    setTimeout(() => { try { ws.close(); } catch {} }, 8000);
+    return;
+  }
+
+  // Declined booking (keep idle)
+  if (parsed.intent === "DECLINE_BOOK") {
+    state.phase = "idle";
+    return say(ws, "No problem. How else can I help?");
+  }
+
+  // FAQs
+  if (parsed.intent === "FAQ") {
+    let answer = "";
+    try {
+      if (MAKE_FAQ_URL) {
+        await axios.post(MAKE_FAQ_URL, { topic: parsed.faq_topic, service: parsed.service || state.slots.service || "" });
+      }
+    } catch {}
+
+    const priceTable = { "haircut": "thirty dollars", "beard trim": "fifteen dollars", "combo": "forty dollars" };
+
+    if (parsed.faq_topic === "HOURS") {
+      answer = "We’re open Monday to Friday, nine A M to five P M. Closed weekends.";
+    } else if (parsed.faq_topic === "PRICES") {
+      const svc = normalizeService(parsed.service || state.slots.service);
+      if (svc && priceTable[svc]) {
+        answer = `${svc} is ${priceTable[svc]}.`;
+      } else {
+        answer = "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
+      }
+    } else if (parsed.faq_topic === "SERVICES") {
+      answer = "We offer haircuts, beard trims, and the combo.";
+    } else if (parsed.faq_topic === "LOCATION") {
+      answer = "We’re at one two three Blueberry Lane.";
+    } else {
+      answer = "Happy to help. What else can I answer?";
+    }
+
+    if (state.phase === "booking") {
+      await say(ws, answer);
+      return askForMissing(ws, state);
+    }
+    if (state.phase === "confirmed") {
+      return say(ws, answer);
+    }
+    return say(ws, `${answer} Would you like to book an appointment or do you have another question?`);
+  }
+
+  if (parsed.intent === "TRANSFER") {
+    await say(ws, "I’m not sure about that. Let me transfer you. Please hold.");
+    try { ws.close(); } catch {}
+    return;
+  }
+
+  // Booking gate: only enter booking if the user asked to book OR already in booking
+  if (parsed.intent === "BOOK" || state.phase === "booking") {
+    if (state.phase !== "booking") state.phase = "booking";
+
+    const missing = nextMissing(state);
+    if (missing === "done") {
+      const check = enforceBusinessWindow(state);
+      if (!check.ok) {
+        if (check.reason === "weekend") {
+          return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+        }
+        if (check.reason === "hours") {
+          return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+        }
+      }
+      return triggerConfirm(ws, state);
+    }
+
+    // If caller gave exactly the missing piece, move to the next ask
+    if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
+      return askForMissing(ws, state);
+    }
+
+    // Smalltalk/Unknown during booking: brief bridge + precise ask
+    if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+      const targetAsk = {
+        "service": "Which service would you like — haircut, beard trim, or combo?",
+        "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
+        "date": `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
+        "time": `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
+        "name": "Can I get your first name?",
+        "phone": "What phone number should I use for confirmations?"
+      }[missing];
+
+      // Keep bridge separate so the re-ask repeats just the question
+      const bridgePrompt = `
+Reply with one short, natural sentence (<=12 words) acknowledging the remark.
+Do NOT ask open-ended questions. Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
+`.trim();
+
+      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure.";
+      await say(ws, bridge);
+      return askWithReaskAndGoodbye(ws, targetAsk);
+    }
+
+    return askForMissing(ws, state);
+  }
+
+  // SMALLTALK / UNKNOWN outside booking — short + pivot to help
+  if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
+    if (state.phase === "idle") {
+      const polite = `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`;
+      return say(ws, polite);
+    }
+    if (state.phase === "confirmed") {
+      const nlg = "Happy to help!";
+      return say(ws, nlg);
+    }
+    const fallbackPrompt = `
+Reply with one short, casual sentence (<=12 words). No follow-up questions.
+`.trim();
+    const nlg = await askGPT(fallbackPrompt, transcript);
+    return say(ws, nlg || "How can I help?");
+  }
 }
 
 /* ----------------------- WS wiring ----------------------- */
-wss.on("connection",(ws)=>{
-  let dg=null;
-  let pendingULaw=[];
-  const BATCH_FRAMES=5;
+wss.on("connection", (ws) => {
+  let dg = null;
+  let pendingULaw = [];
+  const BATCH_FRAMES = 5;
 
-  ws.on("message",async(raw)=>{
+  ws.on("message", async (raw) => {
     let msg;
-    try{msg=JSON.parse(raw.toString());}catch{return;}
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    if(msg.event==="start"){
-      ws.__streamSid=msg.start.streamSid;
-      ws.__convoId=uuidv4();
-      ws.__state=newState();
-      ws.__callerFrom=msg.start?.customParameters?.from || "";
-      clearSilenceTimers(ws);
+    if (msg.event === "start") {
+      ws.__streamSid = msg.start.streamSid;
+      ws.__convoId = uuidv4();
+      ws.__state = newState();
+      ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
+      clearGoodbyeTimers(ws);
+      clearQuestionTimers(ws);
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
-      dg=startDeepgram({
-        onFinal:async(text)=>{
-          try{
-            clearSilenceTimers(ws); // reset on user speech
-            await classifyAndHandle(ws,ws.__state,text);
-          }catch(e){console.error("[handle error]",e.message);}
+      // Start Deepgram
+      dg = startDeepgram({
+        onFinal: async (text) => {
+          try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
         }
       });
 
-      const greet="Hi, thanks for calling Old Line Barbershop. How can I help you today?";
-      await say(ws,greet);
-      armQuestionSilence(ws,greet); // << added
+      await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
       return;
     }
 
-    if(msg.event==="media"){ /* (unchanged audio handling) */ }
-    if(msg.event==="stop"){ try{dg?.close();}catch{} try{ws.close();}catch{} }
+    if (msg.event === "media") {
+      const b64 = msg.media?.payload || "";
+      if (!b64 || !dg) return;
+      const ulaw = Buffer.from(b64, "base64");
+      pendingULaw.push(ulaw);
+      if (pendingULaw.length >= BATCH_FRAMES) {
+        const ulawChunk = Buffer.concat(pendingULaw);
+        const pcm16le = ulawBufferToPCM16LEBuffer(ulawChunk);
+        dg.sendPCM16LE(pcm16le);
+        pendingULaw = [];
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      try { dg?.close(); } catch {}
+      try { ws.close(); } catch {}
+    }
   });
 
-  ws.on("close",()=>{ clearSilenceTimers(ws); try{dg?.close();}catch{} });
+  ws.on("close", () => {
+    clearQuestionTimers(ws);
+    clearGoodbyeTimers(ws);
+    try { dg?.close(); } catch {}
+    console.log("[INFO] WS closed", { convoId: ws.__convoId });
+  });
 });
