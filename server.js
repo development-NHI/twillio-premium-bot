@@ -147,7 +147,7 @@ function dayKeyFromISO(iso) {
 }
 function parseToHHMM(t) {
   if (!t) return "";
-  const s = t.trim();
+  const s = String(t).trim().replace(/\.$/, ""); // tolerate trailing period
   const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
   if (ampm) {
     let h = parseInt(ampm[1],10);
@@ -325,7 +325,7 @@ function newState() {
     bookingLock: false,
     lastAskKey: "",
     lastAskAt: 0,
-    expectingBookYes: false, // handle Yes/No after offer
+    expectingBookYes: false, // for Yes/No after an offer
   };
 }
 
@@ -400,8 +400,10 @@ async function askForMissing(ws, state) {
   if (missing === "name")
     return say(ws, "Can I get your first name?");
 
-  if (missing === "phone")
+  if (missing === "phone") {
+    if (state.slots.phone) return askForMissing(ws, state); // re-evaluate if we already filled from caller ID
     return say(ws, "What phone number should I use for confirmations?");
+  }
 
   if (missing === "done")
     return triggerConfirm(ws, state);
@@ -456,7 +458,6 @@ Return STRICT JSON:
 Rules:
 - Detect booking only if the user asks to schedule, book, reschedule, or gives date/time.
 - If user says they do NOT want to book, set intent = "DECLINE_BOOK".
-- If user changes service/date/time/name/phone, include only the new value.
 - If the user says "this number", leave phone empty (we fill from caller ID).
 - Keep values minimal; leave blank if unsure.
 `.trim();
@@ -478,9 +479,8 @@ Rules:
 
   const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // If caller ID filled phone and all done, jump to confirm before any bridge
+  // If caller ID filled phone and everything is set, enforce hours then confirm
   if ((state.phase === "booking" || parsed.intent === "BOOK") && nextMissing(state) === "done") {
-    // business hours guard
     const s = state.slots;
     if (!isWithinHours(s.date, s.time)) {
       const sug = nextOpenSuggestion(s.date, s.time);
@@ -492,7 +492,7 @@ Rules:
     return triggerConfirm(ws, state);
   }
 
-  // Acknowledge slot changes during booking (merge with next question to avoid repeats)
+  // Acknowledge slot changes during booking and ask next in one line
   const cap = (x) => x ? x.charAt(0).toUpperCase() + x.slice(1) : x;
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
@@ -561,7 +561,7 @@ Rules:
     if (state.phase === "confirmed") {
       return say(ws, answer);
     }
-    state.expectingBookYes = true; // set offer flag
+    state.expectingBookYes = true; // set offer flag for Yes/No
     return say(ws, `${answer} Would you like to book an appointment?`);
   }
 
@@ -571,13 +571,12 @@ Rules:
     return;
   }
 
-  // Booking gate: only enter booking if the user asked to book OR already in booking
+  // Booking gate: only enter booking if asked OR already in booking
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
 
     const missing = nextMissing(state);
     if (missing === "done") {
-      // business hours guard
       const s = state.slots;
       if (!isWithinHours(s.date, s.time)) {
         const sug = nextOpenSuggestion(s.date, s.time);
@@ -594,27 +593,7 @@ Rules:
       return askForMissing(ws, state);
     }
 
-    // Smalltalk/Unknown during booking: brief bridge + precise ask
-    if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-      const targetAsk = {
-        "service": "Which service would you like — haircut, beard trim, or combo?",
-        "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
-        "date": `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
-        "time": `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
-        "name": "Can I get your first name?",
-        "phone": "What phone number should I use for confirmations?"
-      }[missing];
-
-      const bridgePrompt = `
-Reply with one short, natural sentence (<=12 words) acknowledging the remark.
-Do NOT ask open-ended questions. We append the booking question separately.
-Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
-`.trim();
-
-      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure.";
-      return say(ws, `${bridge} ${targetAsk}`);
-    }
-
+    // IMPORTANT: No small-talk bridge during booking. Be direct.
     return askForMissing(ws, state);
   }
 
