@@ -233,19 +233,17 @@ async function makeReadWindow(startISO, endISO) {
     };
     const { data } = await axios.post(MAKE_READ_URL, payload, { timeout: 10000 });
 
-    // ****** ONLY CHANGE: normalize Make's `events` to an array (object or array) ******
+    // Normalize Make's `events` to an array (object or array)
     let raw = data?.events;
     let events = [];
     if (Array.isArray(raw)) {
       events = raw;
     } else if (raw && typeof raw === "object") {
-      // Some Make aggregators return { array: [...] } or a single object
       if (Array.isArray(raw.array)) events = raw.array;
       else events = [raw];
     } else {
       events = [];
     }
-    // ***********************************************************************************
 
     return { ok: !!data?.ok, events };
   } catch (e) {
@@ -314,7 +312,7 @@ function startDeepgram({ onFinal }) {
     perMessageDeflate: false
   });
 
-  dg.on("open", () => console.log("[Deepgram] ws open"));
+  dg.on("open", () => console.log("[Deepgram] ws open"]);
   dg.on("message", (data) => {
     let ev;
     try { ev = JSON.parse(data.toString()); } catch { return; }
@@ -606,7 +604,7 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   const snap = confirmSnapshot(s);
   if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
 
-  // === NEW: verify availability + create in Make ===
+  // === verify availability + create in Make ===
   const makeRes = await createViaMakeIfFree(ws, state);
   if (!makeRes.ok) {
     if (makeRes.reason === "conflict") {
@@ -633,14 +631,58 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
     ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
 
-  // Ask and wait (your silence timers handle re-ask → goodbye)
+  // Ask and wait (silence timers handle re-ask → goodbye)
   await askWithReaskAndGoodbye(ws, line);
+}
+
+/* === NEW: helpers for cancellation confirmation === */
+function isoToDateTimeSpeech(iso) {
+  if (!iso || typeof iso !== "string" || iso.length < 16) return "";
+  const dateISO = iso.slice(0, 10);             // YYYY-MM-DD
+  const timeHHMM = iso.slice(11, 16);           // HH:MM
+  return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
+}
+function describeEventForSpeech(ev) {
+  const start = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
+  const summary = ev.summary || ev.Event_Name || ev.name || "";
+  const who = ev.Customer_Name || "";
+  const when = isoToDateTimeSpeech(start);
+  if (summary) return `${summary} on ${when}`;
+  if (who) return `${who}'s appointment on ${when}`;
+  return `an appointment on ${when}`;
+}
+function parseYesNo(text) {
+  const t = (text || "").toLowerCase();
+  if (/\b(yes|yeah|yep|yup|correct|that(?:'| i)s (?:it|right)|please do|go ahead|cancel it)\b/.test(t)) return "yes";
+  if (/\b(no|nope|not that|wrong|different|don'?t|do not|hold on)\b/.test(t)) return "no";
+  return null;
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
   // Any speech cancels the pending question timers
   clearQuestionTimers(ws);
+
+  // === NEW: intercept yes/no while awaiting cancel confirmation ===
+  if (ws.__pendingCancel && transcript) {
+    const yn = parseYesNo(transcript);
+    if (yn === "yes") {
+      const eventId = ws.__pendingCancel.eventId;
+      ws.__pendingCancel = null;
+      const del = await makeDeleteEvent(eventId);
+      if (del.ok) {
+        await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
+      } else {
+        await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
+      }
+      return;
+    } else if (yn === "no") {
+      ws.__pendingCancel = null;
+      await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
+      return;
+    }
+    // Fall through to normal NLU if it's not a clear yes/no.
+  }
 
   // “this/my number” -> use caller ID
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
@@ -716,22 +758,26 @@ Rules:
     return say(ws, "No problem. How else can I help?");
   }
 
-  /* === NEW: Cancellation flow === */
+  /* === UPDATED: Cancellation flow — read, confirm with user, then delete on yes === */
   if (parsed.intent === "CANCEL") {
-    // Try to find matching event and delete it
+    // Build a window to search. Prefer user-provided date/time; otherwise today at noon as anchor.
     const name = parsed.name || state.slots.name || "";
     const phone = parsed.phone ? normalizePhone(parsed.phone) : state.slots.phone || "";
     const dateISO = normalizeDate(parsed.date) || state.slots.date || nowNY();
     const timeStr = parsed.time || state.slots.time || "12:00";
+
     const { startISO, endISO } = buildStartEndISO(dateISO, timeStr, state.slots.service || parsed.service || "haircut");
-    // Read around that window (same as booking window)
     const read = await makeReadWindow(startISO, endISO);
-    if (!read.ok || !Array.isArray(read.events) || read.events.length === 0) {
-      await say(ws, "I couldn’t find that appointment. Could you share the date and time?");
-      state.phase = "idle";
+    if (!read.ok) {
+      await say(ws, "I couldn’t reach the calendar just now. Want me to try again?");
       return;
     }
-    // Pick the event that best matches by time and (if available) phone/name
+    if (!Array.isArray(read.events) || read.events.length === 0) {
+      await askWithReaskAndGoodbye(ws, "I couldn’t find that appointment. What date and time should I cancel?");
+      return;
+    }
+
+    // Choose best candidate
     let target = null;
     for (const ev of read.events) {
       const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
@@ -744,20 +790,17 @@ Rules:
       if (timeMatch && phoneMatch && nameMatch) { target = ev; break; }
     }
     if (!target) target = read.events[0];
+
     const eventId = target.event_id || target.id || target.eventId;
     if (!eventId) {
-      await say(ws, "I found an appointment but couldn’t cancel it. Would you like me to try again?");
+      await say(ws, "I found an appointment but couldn’t identify its ID. Could you give me the date and time again?");
       return;
     }
-    const del = await makeDeleteEvent(eventId);
-    if (del.ok) {
-      await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
-      // Let silence timers handle follow-up; do not auto-hang yet.
-      return;
-    } else {
-      await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
-      return;
-    }
+
+    const spoken = describeEventForSpeech(target);
+    ws.__pendingCancel = { eventId, spoken };
+    await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
+    return;
   }
 
   // FAQs
@@ -884,6 +927,7 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
+      ws.__pendingCancel = null; // NEW: track cancel confirmation state
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
