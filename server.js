@@ -26,10 +26,6 @@ app.use(bodyParser.json());
 
 app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Receptionist running"));
 
-/**
- * TwiML: pass caller number & CallSid as custom parameters so we can honor
- * “this number” during phone capture and for logging.
- */
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
@@ -123,60 +119,39 @@ function to12h(t) {
   const ampm = hh >= 12 ? "PM" : "AM";
   if (hh === 0) hh = 12;
   if (hh > 12) hh -= 12;
-  return `${hh}:${mm}`.replace(":00","") + ` ${ampm}`;
+  return `${`${hh}:${mm}`.replace(":00","")} ${ampm}`;
 }
 function humanWhen(dateISO, timeStr) {
   const dSpoken = formatDateSpoken(dateISO);
   const tSpoken = to12h(timeStr);
   return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
 }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ----- Business hours (Mon–Fri, 9AM–5PM) ----- */
-function isWeekend(dateISO) {
-  const d = new Date(dateISO);
-  const day = d.getDay(); // 0=Sun,6=Sat
-  return day === 0 || day === 6;
+/* ----------------------- Silence Timers ----------------------- */
+function clearSilenceTimers(ws) {
+  if (ws._silenceTimer) { clearTimeout(ws.silenceTimer); ws._silenceTimer = null; }
+  if (ws._goodbyeTimer) { clearTimeout(ws.goodbyeTimer); ws._goodbyeTimer = null; }
+  ws.__retried = false;
 }
-function isWithinHours(timeStr) {
-  // Accept "3 PM" or "15:00" (we normalize to 24h minutes)
-  if (!timeStr) return false;
-  let hh = 0, mm = 0;
-  const ampm = /am|pm/i.test(timeStr);
-  if (ampm) {
-    const m = /^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i.exec(timeStr.trim().toUpperCase());
-    if (!m) return false;
-    hh = parseInt(m[1] || "0", 10);
-    mm = parseInt(m[2] || "0", 10);
-    const isPM = m[3] === "PM";
-    if (hh === 12) hh = isPM ? 12 : 0;
-    else if (isPM) hh += 12;
-  } else {
-    const m = /^(\d{1,2}):?(\d{2})$/.exec(timeStr.trim());
-    if (!m) return false;
-    hh = parseInt(m[1] || "0", 10);
-    mm = parseInt(m[2] || "0", 10);
-  }
-  const minutes = hh * 60 + mm;
-  const start = 9 * 60;   // 9:00
-  const end = 17 * 60;    // 17:00
-  return minutes >= start && minutes <= end;
+async function sayAndHangUp(ws, msg) {
+  try {
+    await say(ws, msg);
+    await sleep(8000); // let audio play out fully
+    try { ws.close(); } catch {}
+  } catch {}
 }
-function enforceBusinessWindow(state) {
-  const s = state.slots;
-  if (!s.date || !s.time) return { ok: false, reason: "incomplete" };
-  if (isWeekend(s.date)) {
-    // Clear date to force user to choose weekday
-    const oldDate = s.date;
-    s.date = "";
-    return { ok: false, reason: "weekend", oldDate };
-  }
-  if (!isWithinHours(s.time)) {
-    // Clear time to force valid business time
-    const oldTime = s.time;
-    s.time = "";
-    return { ok: false, reason: "hours", oldTime };
-  }
-  return { ok: true };
+function armSilence(ws, lastQuestion) {
+  clearSilenceTimers(ws);
+  ws.__retried = false;
+  ws.__silenceTimer = setTimeout(async () => {
+    if (ws.__retried) return;
+    ws.__retried = true;
+    await say(ws, `Sorry, I didn’t catch that — could you repeat? ${lastQuestion}`);
+    ws.__goodbyeTimer = setTimeout(async () => {
+      await sayAndHangUp(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+    }, 25000);
+  }, 25000);
 }
 
 /* ----------------------- Deepgram WS ----------------------- */
@@ -208,6 +183,7 @@ function startDeepgram({ onFinal }) {
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
       console.log(JSON.stringify({ event: "ASR_FINAL", transcript: text }));
+      clearSilenceTimers(ws); // cancel silence timers when caller speaks
       onFinal?.(text);
     }
   });
@@ -351,8 +327,8 @@ function nextMissing(state) {
 
 /* ------ Goodbye handling (post-confirmation) ------ */
 function clearGoodbyeTimers(ws) {
-  if (ws.__goodbyeSilenceTimer) { clearTimeout(ws.__goodbyeSilenceTimer); ws.__goodbyeSilenceTimer = null; }
-  if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+  if (ws._goodbyeSilenceTimer) { clearTimeout(ws.goodbyeSilenceTimer); ws._goodbyeSilenceTimer = null; }
+  if (ws._hangTimer) { clearTimeout(ws.hangTimer); ws._hangTimer = null; }
 }
 function armGoodbyeSilence(ws, state) {
   clearGoodbyeTimers(ws);
@@ -440,6 +416,51 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   armGoodbyeSilence(ws, state);
 }
 
+/* ---- Hours guard used above ---- */
+function isWeekend(dateISO) {
+  const d = new Date(dateISO);
+  const day = d.getDay();
+  return day === 0 || day === 6;
+}
+function isWithinHours(timeStr) {
+  if (!timeStr) return false;
+  let hh = 0, mm = 0;
+  const ampm = /am|pm/i.test(timeStr);
+  if (ampm) {
+    const m = /^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i.exec(timeStr.trim().toUpperCase());
+    if (!m) return false;
+    hh = parseInt(m[1] || "0", 10);
+    mm = parseInt(m[2] || "0", 10);
+    const isPM = m[3] === "PM";
+    if (hh === 12) hh = isPM ? 12 : 0;
+    else if (isPM) hh += 12;
+  } else {
+    const m = /^(\d{1,2}):?(\d{2})$/.exec(timeStr.trim());
+    if (!m) return false;
+    hh = parseInt(m[1] || "0", 10);
+    mm = parseInt(m[2] || "0", 10);
+  }
+  const minutes = hh * 60 + mm;
+  const start = 9 * 60;
+  const end = 17 * 60;
+  return minutes >= start && minutes <= end;
+}
+function enforceBusinessWindow(state) {
+  const s = state.slots;
+  if (!s.date || !s.time) return { ok: false, reason: "incomplete" };
+  if (isWeekend(s.date)) {
+    const oldDate = s.date;
+    s.date = "";
+    return { ok: false, reason: "weekend", oldDate };
+  }
+  if (!isWithinHours(s.time)) {
+    const oldTime = s.time;
+    s.time = "";
+    return { ok: false, reason: "hours", oldTime };
+  }
+  return { ok: true };
+}
+
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
   // “this/my number” -> use caller ID (do not modify per your request)
@@ -505,7 +526,6 @@ Rules:
       setTimeout(() => { try { ws.close(); } catch {} }, 8000);
       return;
     }
-    // If not confirmed, polite close anyway
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
     setTimeout(() => { try { ws.close(); } catch {} }, 8000);
     return;
@@ -550,10 +570,8 @@ Rules:
       return askForMissing(ws, state);
     }
     if (state.phase === "confirmed") {
-      // Do NOT ask to book again post-confirmation
       return say(ws, answer);
     }
-    // Idle: gently offer to help further
     return say(ws, `${answer} Would you like to book an appointment or do you have another question?`);
   }
 
@@ -612,17 +630,14 @@ Examples: "Totally!", "Got it.", "No worries.", "Sounds good."
 
   // SMALLTALK / UNKNOWN outside booking — short + pivot to help
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    // Idle smalltalk pivot: ask how to help next
     if (state.phase === "idle") {
-      const polite = `I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?`;
+      const polite = "I'm doing great, thanks! How can I help today — would you like to book an appointment or do you have a question?";
       return say(ws, polite);
     }
-    // Confirmed smalltalk: keep it short, but don't re-offer booking
     if (state.phase === "confirmed") {
       const nlg = "Happy to help!";
       return say(ws, nlg);
     }
-    // In booking, we handle above with bridge+targeted ask
     const fallbackPrompt = `
 Reply with one short, casual sentence (<=12 words). No follow-up questions.
 `.trim();
@@ -647,7 +662,7 @@ wss.on("connection", (ws) => {
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
       clearGoodbyeTimers(ws);
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws._streamSid, convoId: ws._convoId }));
 
       // Start Deepgram
       dg = startDeepgram({
