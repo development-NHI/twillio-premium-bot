@@ -81,8 +81,10 @@ function normalizeDate(d) {
   const t = d.toLowerCase();
   if (t === "today") return nowNY();
   if (t === "tomorrow") return addDaysISO(nowNY(), 1);
+  // weekday (Monday, etc.)
   const w = weekdayToISO(t);
   if (w) return w;
+  // assume already YYYY-MM-DD or a literal; leave as-is
   return d;
 }
 function normalizeService(s) {
@@ -103,6 +105,7 @@ function ordinal(n) {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 function formatDateSpoken(iso) {
+  // iso "YYYY-MM-DD"
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
   if (!m) return iso || "";
   const yyyy = Number(m[1]);
@@ -111,6 +114,7 @@ function formatDateSpoken(iso) {
   return `${MONTHS[mm - 1]} ${ordinal(dd)}`;
 }
 function to12h(t) {
+  // "15:00" -> "3 PM"; pass through "3 PM"
   if (!t) return "";
   if (/am|pm/i.test(t)) {
     const up = t.toUpperCase().replace(/\s+/g, " ").trim();
@@ -253,59 +257,43 @@ function newState() {
     slots: { service: "", date: "", time: "", name: "", phone: "" },
     lastConfirmSnapshot: "",
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
-    bookingLock: "",           // which slot we're waiting for (prevents two threads)
-    lastAskedSlot: "",         // what we last asked
+    bookingLock: false, // reserved; keep to match your last working base
+    lastAskKey: "",       // prevent repeating same ask back-to-back
+    lastAskAt: 0
   };
 }
 
-/** Merge parsed into state; return {changed, changedKeys, prior} */
+/** Merge parsed into state; return {changed:boolean, changedKeys:string[]} */
 function mergeSlots(state, parsed) {
   const before = { ...state.slots };
   let changed = false;
   const changedKeys = [];
-  const prior = {};
 
   if (parsed.service) {
     const svc = normalizeService(parsed.service);
-    if (svc && svc !== state.slots.service) {
-      prior.service = state.slots.service;
-      state.slots.service = svc; changed = true; changedKeys.push("service");
-    }
+    if (svc && svc !== state.slots.service) { state.slots.service = svc; changed = true; changedKeys.push("service"); }
   }
   if (parsed.date) {
     const nd = normalizeDate(parsed.date);
-    if (nd && nd !== state.slots.date) {
-      prior.date = state.slots.date;
-      state.slots.date = nd; changed = true; changedKeys.push("date");
-    }
+    if (nd && nd !== state.slots.date) { state.slots.date = nd; changed = true; changedKeys.push("date"); }
   }
   if (parsed.time) {
     const t = parsed.time.trim();
-    if (t && t !== state.slots.time) {
-      prior.time = state.slots.time;
-      state.slots.time = t; changed = true; changedKeys.push("time");
-    }
+    if (t && t !== state.slots.time) { state.slots.time = t; changed = true; changedKeys.push("time"); }
   }
   if (parsed.name) {
-    if (parsed.name !== state.slots.name) {
-      prior.name = state.slots.name;
-      state.slots.name = parsed.name; changed = true; changedKeys.push("name");
-    }
+    if (parsed.name !== state.slots.name) { state.slots.name = parsed.name; changed = true; changedKeys.push("name"); }
   }
   if (parsed.phone) {
     const ph = normalizePhone(parsed.phone);
-    if (ph && ph !== state.slots.phone) {
-      prior.phone = state.slots.phone;
-      state.slots.phone = ph; changed = true; changedKeys.push("phone");
-    }
+    if (ph && ph !== state.slots.phone) { state.slots.phone = ph; changed = true; changedKeys.push("phone"); }
   }
 
   if (changed) {
     console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots }));
   }
-  return { changed, changedKeys, prior };
+  return { changed, changedKeys };
 }
-
 function nextMissing(state) {
   const s = state.slots;
   if (!s.service) return "service";
@@ -316,21 +304,41 @@ function nextMissing(state) {
   if (!s.phone) return "phone";
   return "done";
 }
-
 async function askForMissing(ws, state) {
   const s = state.slots;
   const missing = nextMissing(state);
-  state.lastAskedSlot = missing;
-  state.bookingLock = missing;
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
-  if (missing === "service") return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
-  if (missing === "datetime") return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
-  if (missing === "date") return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
-  if (missing === "time") return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
-  if (missing === "name") return say(ws, "Can I get your first name?");
-  if (missing === "phone") return say(ws, "What phone number should I use for confirmations?");
-  if (missing === "done") return triggerConfirm(ws, state);
+  // avoid repeating exact same ask within 1.2s
+  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
+  const now = Date.now();
+  if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
+  state.lastAskKey = key;
+  state.lastAskAt = now;
+
+  if (missing === "service")
+    return say(ws, "What service would you like — a haircut, beard trim, or the combo?");
+
+  if (missing === "datetime") {
+    if (s.date && !s.time) return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+    if (!s.date && s.time) return say(ws, `What day works best for your ${s.service} at ${to12h(s.time)}?`);
+    return say(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
+  }
+
+  if (missing === "date")
+    return say(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
+
+  if (missing === "time")
+    return say(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+
+  if (missing === "name")
+    return say(ws, "Can I get your first name?");
+
+  if (missing === "phone")
+    return say(ws, "What phone number should I use for confirmations?");
+
+  if (missing === "done")
+    return triggerConfirm(ws, state);
 }
 
 function confirmSnapshot(slots) { return JSON.stringify(slots); }
@@ -342,14 +350,13 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
 
   const snap = confirmSnapshot(s);
   if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") {
+    // already confirmed this exact info; don't repeat
     return;
   }
   state.phase = "confirmed";
   state.lastConfirmSnapshot = snap;
-  state.bookingLock = ""; // release lock after confirmation
-  state.lastAskedSlot = "";
 
-  const phoneFmt = `(${s.phone.slice(0,3)}) ${s.phone.slice(3,6)}-${s.phone.slice(6)}`;
+  const phoneFmt = s.phone ? `(${s.phone.slice(0,3)}) ${s.phone.slice(3,6)}-${s.phone.slice(6)}` : "";
   const line = updated
     ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`
     : `Great — I’ve got a ${s.service} for ${s.name} on ${when}. I have your number as ${phoneFmt}. You’re all set. Anything else I can help with?`;
@@ -359,15 +366,14 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
 
 /* ----------------------- Classify & Handle ----------------------- */
 async function classifyAndHandle(ws, state, transcript) {
-  // Expand "this number" coverage — only when we were asking for phone
-  const thisNumHint = /\b(this|my)\s+(number|phone)\b/i.test(transcript) ||
-                      /\bcalling\s+from\b/i.test(transcript) ||
-                      /\bthis\s+one\b/i.test(transcript) ||
-                      /\bthe\s+number\s+i'?m\s+calling\s+from\b/i.test(transcript);
-
-  if (!state.slots.phone && state.lastAskedSlot === "phone" && ws.__callerFrom && thisNumHint) {
-    state.slots.phone = normalizePhone(ws.__callerFrom);
-    console.log(JSON.stringify({ event: "SLOTS_MERGE", before: {}, after: state.slots, via: "callerFrom" }));
+  // Special-case: “this number / my number” for phone, use caller number if available
+  if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
+    const filled = normalizePhone(ws.__callerFrom);
+    if (filled) {
+      const before = { ...state.slots };
+      state.slots.phone = filled;
+      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "callerFrom" }));
+    }
   }
 
   const systemPrompt = `
@@ -375,16 +381,16 @@ Return STRICT JSON:
 {
  "intent": "FAQ" | "BOOK" | "TRANSFER" | "SMALLTALK" | "UNKNOWN",
  "faq_topic": "HOURS"|"PRICES"|"SERVICES"|"LOCATION"| "",
- "service": "",
- "date": "",
- "time": "",
+ "service": "",  // "haircut" | "beard trim" | "combo" or phrase
+ "date": "",     // "today" | "tomorrow" | weekday | "YYYY-MM-DD"
+ "time": "",     // "3 PM" or "15:00"
  "name": "",
  "phone": ""
 }
 Rules:
 - Detect booking even if mixed with smalltalk.
 - If user changes service/date/time/name/phone, include only the new value.
-- If the user says "this number"/"the number I'm calling from", leave phone empty (we'll fill it from caller ID).
+- If the user says "this number", leave phone empty (we fill it from caller ID).
 - Keep values short; leave blank if unsure.
 `.trim();
 
@@ -396,108 +402,20 @@ Rules:
   console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
   const beforeMissing = nextMissing(state);
-  const { changed, changedKeys, prior } = mergeSlots(state, parsed);
+  const { changed, changedKeys } = mergeSlots(state, parsed);
 
-  // ----- Acknowledge corrections if a previously filled slot was updated
-  if (changed && state.phase !== "idle") {
-    const order = ["service","date","time","name","phone"];
-    const key = order.find(k => changedKeys.includes(k) && prior[k]); // only if it had a prior value
-    if (key) {
-      if (key === "service") await say(ws, `Updated — I’ll book the ${state.slots.service}.`);
-      else if (key === "date" && state.slots.date && !state.slots.time) await say(ws, `Updated date — ${formatDateSpoken(state.slots.date)}.`);
-      else if (key === "time" && state.slots.time && !state.slots.date) await say(ws, `Updated time — ${to12h(state.slots.time)}.`);
-      else if ((key === "date" || key === "time") && state.slots.date && state.slots.time) await say(ws, `Updated — ${humanWhen(state.slots.date, state.slots.time)}.`);
-      else if (key === "name") await say(ws, `Got it — I’ll use ${state.slots.name}.`);
-      else if (key === "phone") await say(ws, `Thanks — updated your number.`);
-    }
-  }
-
-  // ----- Booking lock (prevents two-threads): if we asked for slot X, but user didn't provide X, keep clarifying X
-  if (state.phase === "booking" && state.bookingLock) {
-    const lock = state.bookingLock;
-    const providedNow =
-      (lock === "service" && state.slots.service) ||
-      (lock === "date" && state.slots.date) ||
-      (lock === "time" && state.slots.time) ||
-      (lock === "name" && state.slots.name) ||
-      (lock === "phone" && state.slots.phone) ||
-      (lock === "datetime" && state.slots.date && state.slots.time);
-
-    if (!providedNow) {
-      // Didn’t provide the locked slot; clarify rather than starting another thread
-      state.clarify[lock] = (state.clarify[lock] || 0) + 1;
-
-      if (lock === "phone" && ws.__callerFrom && thisNumHint) {
-        state.slots.phone = normalizePhone(ws.__callerFrom);
-      }
-
-      if (state.clarify[lock] === 1) {
-        const prompt = {
-          "service": "Which service would you like — haircut, beard trim, or the combo?",
-          "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
-          "date": `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
-          "time": `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
-          "name": "Just your first name is fine.",
-          "phone": "What’s the best number to text the confirmation to?"
-        }[lock];
-        await say(ws, prompt);
-        return;
-      } else if (state.clarify[lock] === 2) {
-        const prompt = {
-          "service": "Sorry—just to confirm, is that a haircut, beard trim, or the combo?",
-          "datetime": "Just to confirm, what date and start time work best?",
-          "date": `Just the date is fine—what date works for you?`,
-          "time": `Got it—what start time should I put on ${formatDateSpoken(state.slots.date)}?`,
-          "name": "Sorry, I didn’t catch that—what’s your first name?",
-          "phone": "Please say the 10-digit phone number, with area code."
-        }[lock];
-        await say(ws, prompt);
-        return;
-      } else {
-        // failsafe after 3 misses → transfer
-        console.log(JSON.stringify({ event: "FAILSAFE_TRANSFER", slot: lock }));
-        await say(ws, "Let me transfer you to the owner to finish this up.");
-        try { ws.close(); } catch {}
-        return;
-      }
+  // If info changed after confirmation, re-confirm or resume asking
+  if (state.phase === "confirmed" && changed) {
+    const missing = nextMissing(state);
+    if (missing === "done") {
+      return triggerConfirm(ws, state, { updated: true });
     } else {
-      // Provided the locked slot — release lock
-      state.bookingLock = "";
-      state.clarify[lock] = 0;
-    }
-  }
-
-  // ----- Post-confirmation behavior: no “want to book?” prompts
-  if (state.phase === "confirmed") {
-    if (parsed.intent === "FAQ") {
-      let answer = "";
-      if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
-      else if (parsed.faq_topic === "PRICES") answer = "Haircut $30, beard trim $15, combo $40.";
-      else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
-      else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
-      await say(ws, answer || "Happy to help!");
-      return;
-    }
-    if (parsed.intent === "BOOK") {
-      // Allow a second booking explicitly if user asks
       state.phase = "booking";
-      state.slots = { service: "", date: "", time: "", name: state.slots.name || "", phone: state.slots.phone || "" };
-      state.lastAskedSlot = "";
-      state.bookingLock = "";
       return askForMissing(ws, state);
     }
-    if (parsed.intent === "TRANSFER") {
-      await say(ws, "I’m not sure about that, let me transfer you to the owner. Please hold.");
-      try { ws.close(); } catch {}
-      return;
-    }
-    // smalltalk/unknown after confirm: be polite, no booking prompts
-    const polite = "Thanks! Anything else I can help with?";
-    await say(ws, polite);
-    return;
   }
 
-  // ----- Handle FAQs (outside or during booking)
+  // FAQs
   if (parsed.intent === "FAQ") {
     let answer = "";
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, 9 AM to 5 PM, closed weekends.";
@@ -506,13 +424,11 @@ Rules:
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at 123 Blueberry Lane.";
     if (!answer) answer = "Happy to help. What else can I answer?";
 
-    if (state.phase === "booking" || beforeMissing !== "done") {
+    if (state.phase === "booking") {
       await say(ws, answer);
       return askForMissing(ws, state);
     } else {
-      // Outside booking — be helpful but don't auto-push to book if not asked
-      await say(ws, answer);
-      return;
+      return say(ws, `${answer} Would you like to book an appointment?`);
     }
   }
 
@@ -522,7 +438,7 @@ Rules:
     return;
   }
 
-  // ----- Enter or continue booking
+  // BOOK or mid-booking (single-threaded flow)
   if (parsed.intent === "BOOK" || state.phase === "booking" || beforeMissing !== "done") {
     state.phase = "booking";
 
@@ -531,15 +447,12 @@ Rules:
       return triggerConfirm(ws, state);
     }
 
-    // If they supplied exactly the missing slot, ask the next missing
-    if (changed) {
-      const newMissing = nextMissing(state);
-      if (newMissing !== missing) {
-        return askForMissing(ws, state);
-      }
+    // If the user provided exactly the missing item, be direct (no fluff)
+    if (changed && changedKeys.length === 1 && changedKeys[0] === missing) {
+      return askForMissing(ws, state);
     }
 
-    // If smalltalk while booking, acknowledge briefly then targeted ask
+    // Smalltalk/Unknown bridge during booking: ONE short line + the precise ask
     if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
       const targetAsk = {
         "service": "Which service would you like — haircut, beard trim, or the combo?",
@@ -549,22 +462,29 @@ Rules:
         "name": "Can I get your first name?",
         "phone": "What phone number should I use for confirmations?"
       }[missing];
+
       const bridgePrompt = `
-You are a friendly receptionist. Reply with ONE short natural sentence (<= 12 words) acknowledging the remark, no open-ended questions.
-Examples: "Totally!" "Got it!" "Sounds good!"
+You are a receptionist. Reply with one short, natural sentence (<=12 words) acknowledging the remark.
+Do NOT ask open-ended questions. Then we will append a targeted booking question separately.
+Examples: "Totally!" , "Got it!" , "No worries!" , "Sounds good!"
 `.trim();
-      const bridge = await askGPT(bridgePrompt, transcript) || "Got it!";
-      await say(ws, `${bridge} ${targetAsk}`);
-      return;
+
+      const bridge = (await askGPT(bridgePrompt, transcript)) || "Sure!";
+      return say(ws, `${bridge} ${targetAsk}`);
     }
 
+    // Normal path
     return askForMissing(ws, state);
   }
 
-  // ----- SMALLTALK outside booking → warm, generic redirect
+  // SMALLTALK outside booking — short, no follow-up
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    const nlg = "I’m doing well! How can I help you today?";
-    return say(ws, nlg);
+    const fallbackPrompt = `
+You are a receptionist. Reply with one short, casual sentence (<=12 words).
+No follow-up questions.
+`.trim();
+    const nlg = await askGPT(fallbackPrompt, transcript);
+    return say(ws, nlg || "Sure—how can I help?");
   }
 }
 
@@ -582,7 +502,7 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__state = newState();
-      ws.__callerFrom = (msg.start?.customParameters?.from || "").replace(/^\+1/, ""); // US normalize
+      ws.__callerFrom = msg.start?.customParameters?.from || ""; // "+1XXXXXXXXXX"
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
 
       // Start Deepgram
