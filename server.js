@@ -647,7 +647,9 @@ async function classifyAndHandle(ws, state, transcript) {
       return;
     } else if (yn === "no") {
       ws.__pendingCancel = null;
-      ws.__cancelFlow = { active: true };
+      // Resume cancel flow keeping any known date/time
+      const cf = ws.__cancelFlow && typeof ws.__cancelFlow === "object" ? ws.__cancelFlow : { dateISO: "", timeStr: "" };
+      ws.__cancelFlow = { ...cf, active: true };
       await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
       return;
     }
@@ -690,10 +692,18 @@ Rules:
 
   if (state.phase === "confirmed") clearGoodbyeTimers(ws);
 
-  /* Sticky cancel mode: treat follow-ups as cancel, even if GPT says BOOK/UNKNOWN */
+  /* Sticky cancel mode: treat follow-ups as cancel, remember date/time across turns */
   if (ws.__cancelFlow?.active) {
-    const dateISO = normalizeDate(parsed.date) || "";
-    const timeStr = parsed.time || "";
+    const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
+
+    // Merge in any new info from this turn, but keep what we already had
+    const newDate = normalizeDate(parsed.date) || "";
+    const newTime = parsed.time || "";
+    if (newDate) cf.dateISO = newDate;
+    if (newTime) cf.timeStr = newTime;
+
+    const dateISO = cf.dateISO || "";
+    const timeStr = cf.timeStr || "";
 
     if (!dateISO && !timeStr) {
       await askWithReaskAndGoodbye(ws, "Which date and time should I cancel?");
@@ -705,12 +715,13 @@ Rules:
       ({ startISO, endISO } = buildStartEndISO(dateISO, timeStr, "haircut"));
     } else if (dateISO) {
       ({ startISO, endISO } = dayBoundsISO(dateISO));
-    }
-
-    if (!startISO || !endISO) {
-      await askWithReaskAndGoodbye(ws, "Got it. What time on that date is the appointment?");
+    } else {
+      await askWithReaskAndGoodbye(ws, "Got it — what date is that appointment on?");
       return;
     }
+
+    // Persist context for subsequent turns
+    ws.__cancelFlow = cf;
 
     const read = await makeReadWindow(startISO, endISO);
     if (!read.ok) {
@@ -746,7 +757,7 @@ Rules:
 
     const spoken = describeEventForSpeech(target);
     ws.__pendingCancel = { eventId, spoken };
-    ws.__cancelFlow = { active: false };
+    ws.__cancelFlow = { ...cf, active: false };
     await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
   }
@@ -765,6 +776,21 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
+  /* Start cancel flow */
+  if (parsed.intent === "CANCEL") {
+    const d0 = normalizeDate(parsed.date) || "";
+    const t0 = parsed.time || "";
+    // Start sticky cancel context and persist any info we already have
+    ws.__cancelFlow = { active: true, dateISO: d0, timeStr: t0 };
+
+    if (!d0 && !t0) {
+      await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
+    } else {
+      await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
+    }
+    return;
+  }
+
   if (parsed.intent === "END") {
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
     setTimeout(() => { try { ws.close(); } catch {} }, 8000);
@@ -774,19 +800,6 @@ Rules:
   if (parsed.intent === "DECLINE_BOOK") {
     state.phase = "idle";
     return say(ws, "No problem. How else can I help?");
-  }
-
-  /* Start cancel flow */
-  if (parsed.intent === "CANCEL") {
-    ws.__cancelFlow = { active: true };
-    const d0 = normalizeDate(parsed.date);
-    const t0 = parsed.time || "";
-    if (!d0 && !t0) {
-      await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
-    } else {
-      await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
-    }
-    return;
   }
 
   // FAQs
