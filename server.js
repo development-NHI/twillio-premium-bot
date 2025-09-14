@@ -111,7 +111,6 @@ function parseMonthDayToISO(txt) {
   return "";
 }
 function coerceToThisYearIfLikely(isoMaybe) {
-  // If GPT supplies a past year but same month/day, bump to this year
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoMaybe || "");
   if (!m) return isoMaybe;
   const yyyyNow = new Date().getFullYear();
@@ -297,17 +296,30 @@ async function makeCreateEvent({ name, phone, email, notes, startISO, endISO, se
     return { ok: false, event: null };
   }
 }
+
+/* === FIX: Treat 2xx/typical success payloads as OK for deletes === */
 async function makeDeleteEvent(event_id) {
   if (!MAKE_DELETE_URL) return { ok: false };
   try {
     const payload = { intent: "DELETE", biz: MAKE_BIZ, source: MAKE_SOURCE, event_id };
-    const { data } = await axios.post(MAKE_DELETE_URL, payload, { timeout: 10000 });
-    return { ok: !!data?.ok || data?.ok === "true" };
+    const resp = await axios.post(MAKE_DELETE_URL, payload, { timeout: 10000 });
+    const { status, data } = resp;
+
+    // Consider HTTP 2xx with empty/any payload a success, and handle common success shapes/strings.
+    let ok =
+      (status >= 200 && status < 300) ||
+      data?.ok === true || data?.ok === "true" ||
+      data?.success === true || data?.status === "ok" ||
+      data?.deleted === true || data?.result === "deleted" ||
+      (typeof data === "string" && /^(ok|success|deleted)$/i.test(data.trim()));
+
+    return { ok: !!ok };
   } catch (e) {
     console.error("[MAKE DELETE ERROR]", e.message);
     return { ok: false };
   }
 }
+
 function eventsOverlap(aStart, aEnd, bStart, bEnd) {
   const A1 = new Date(aStart).getTime();
   const A2 = new Date(aEnd).getTime();
@@ -647,7 +659,6 @@ async function classifyAndHandle(ws, state, transcript) {
       return;
     } else if (yn === "no") {
       ws.__pendingCancel = null;
-      // Resume cancel flow keeping any known date/time
       const cf = ws.__cancelFlow && typeof ws.__cancelFlow === "object" ? ws.__cancelFlow : { dateISO: "", timeStr: "" };
       ws.__cancelFlow = { ...cf, active: true };
       await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
@@ -692,11 +703,10 @@ Rules:
 
   if (state.phase === "confirmed") clearGoodbyeTimers(ws);
 
-  /* Sticky cancel mode: treat follow-ups as cancel, remember date/time across turns */
+  /* Sticky cancel mode */
   if (ws.__cancelFlow?.active) {
     const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
 
-    // Merge in any new info from this turn, but keep what we already had
     const newDate = normalizeDate(parsed.date) || "";
     const newTime = parsed.time || "";
     if (newDate) cf.dateISO = newDate;
@@ -720,7 +730,6 @@ Rules:
       return;
     }
 
-    // Persist context for subsequent turns
     ws.__cancelFlow = cf;
 
     const read = await makeReadWindow(startISO, endISO);
@@ -733,7 +742,6 @@ Rules:
       return;
     }
 
-    // Choose best candidate
     const phone = state.slots.phone || "";
     const name = state.slots.name || "";
     let target = null;
@@ -780,7 +788,6 @@ Rules:
   if (parsed.intent === "CANCEL") {
     const d0 = normalizeDate(parsed.date) || "";
     const t0 = parsed.time || "";
-    // Start sticky cancel context and persist any info we already have
     ws.__cancelFlow = { active: true, dateISO: d0, timeStr: t0 };
 
     if (!d0 && !t0) {
