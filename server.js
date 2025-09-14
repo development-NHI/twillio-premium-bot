@@ -305,7 +305,6 @@ async function makeDeleteEvent(event_id) {
     const resp = await axios.post(MAKE_DELETE_URL, payload, { timeout: 10000 });
     const { status, data } = resp;
 
-    // Consider HTTP 2xx with empty/any payload a success, and handle common success shapes/strings.
     let ok =
       (status >= 200 && status < 300) ||
       data?.ok === true || data?.ok === "true" ||
@@ -412,6 +411,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
 }
 
 /* ----------------------- TTS ----------------------- */
+/* FIX: make say() resolve only after ElevenLabs stream finishes so we don't hang up mid-sentence */
 async function say(ws, text) {
   if (!text) return;
   const streamSid = ws.__streamSid;
@@ -431,13 +431,25 @@ async function say(ws, text) {
       { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
       { headers: { "xi-api-key": ELEVENLABS_API_KEY }, responseType: "stream" }
     );
-    resp.data.on("data", (chunk) => {
-      const b64 = Buffer.from(chunk).toString("base64");
-      ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+
+    // Stream to Twilio and resolve when the TTS is fully finished.
+    await new Promise((resolve) => {
+      resp.data.on("data", (chunk) => {
+        try {
+          const b64 = Buffer.from(chunk).toString("base64");
+          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+        } catch (_) {}
+      });
+      resp.data.on("end", () => {
+        try {
+          ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }));
+        } catch (_) {}
+        // small drain delay to ensure last audio frames are flushed
+        setTimeout(resolve, 150);
+      });
+      resp.data.on("error", () => resolve());
+      resp.data.on("close", () => resolve());
     });
-    resp.data.on("end", () =>
-      ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }))
-    );
   } catch (e) {
     console.error("[TTS ERROR]", e.message);
   }
@@ -800,7 +812,9 @@ Rules:
 
   if (parsed.intent === "END") {
     await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-    setTimeout(() => { try { ws.close(); } catch {} }, 8000);
+    // FIX: close after audio finishes (say() now resolves on stream end) with a short cushion
+    await sleep(1200);
+    try { ws.close(); } catch {}
     return;
   }
 
