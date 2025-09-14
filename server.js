@@ -829,13 +829,14 @@ Rules:
 
     const spoken = describeEventForSpeech(target);
     const startStr = target.Start_Time || target.start || target.start_time || target.startISO || "";
-    const dateISO = startStr ? String(startStr).slice(0,10) : "";
-    const timeHHMM = startStr ? String(startStr).slice(11,16) : "";
+    // FIX: avoid shadowing names used earlier in this scope
+    const apptDateISO = startStr ? String(startStr).slice(0,10) : "";
+    const apptTimeHHMM = startStr ? String(startStr).slice(11,16) : "";
     const summary = target.summary || target.Event_Name || target.name || "";
     const service = extractServiceFromSummary(summary);
     const who = target.Customer_Name || "";
 
-    ws.__pendingCancel = { eventId, spoken, dateISO, timeHHMM, service, name: who };
+    ws.__pendingCancel = { eventId, spoken, dateISO: apptDateISO, timeHHMM: apptTimeHHMM, service, name: who };
     ws.__cancelFlow = { ...cf, active: false };
     await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
