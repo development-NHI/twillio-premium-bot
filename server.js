@@ -23,6 +23,9 @@ const MAKE_DELETE_URL = process.env.MAKE_DELETE_URL || "";
 const MAKE_BIZ = process.env.MAKE_BIZ || "oldline";
 const MAKE_SOURCE = process.env.MAKE_SOURCE || "voice";
 
+/* === Biz timezone for speech (fix UTC->local) === */
+const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
+
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
 if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
@@ -614,10 +617,25 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
 }
 
 /* === Cancel helpers === */
+/* FIX: convert event ISO times to local biz timezone for speech */
+function isoToLocalParts(iso, tz = BIZ_TZ) {
+  try {
+    const d = new Date(String(iso));
+    if (isNaN(d)) return { dateISO: "", timeHHMM: "" };
+    const dateISO = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
+    }).format(d); // YYYY-MM-DD
+    const timeHHMM = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit"
+    }).format(d); // HH:mm
+    return { dateISO, timeHHMM };
+  } catch {
+    return { dateISO: "", timeHHMM: "" };
+  }
+}
 function isoToDateTimeSpeech(iso) {
-  if (!iso || typeof iso !== "string" || iso.length < 16) return "";
-  const dateISO = iso.slice(0, 10);
-  const timeHHMM = iso.slice(11, 16);
+  const { dateISO, timeHHMM } = isoToLocalParts(iso);
+  if (!dateISO || !timeHHMM) return "";
   return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
 function describeEventForSpeech(ev) {
@@ -807,17 +825,13 @@ Rules:
     }
 
     const phone = state.slots.phone || "";
-    const name = state.slots.name || "";
-    let target = null;
     for (const ev of read.events) {
       const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
       const evEnd = ev.End_Time || ev.end || ev.end_time || ev.endISO || evStart;
-      const evName = (ev.Customer_Name || ev.name || "").toString().toLowerCase();
       const evPhone = normalizePhone(ev.Customer_Phone || ev.phone || "");
       const timeMatch = evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
       const phoneMatch = phone && evPhone ? evPhone.endsWith(phone.slice(-4)) : true;
-      const nameMatch = name ? evName.includes(name.toLowerCase()) : true;
-      if (timeMatch && phoneMatch && nameMatch) { target = ev; break; }
+      if (timeMatch && phoneMatch) { var target = ev; break; }
     }
     if (!target) target = read.events[0];
 
@@ -829,9 +843,7 @@ Rules:
 
     const spoken = describeEventForSpeech(target);
     const startStr = target.Start_Time || target.start || target.start_time || target.startISO || "";
-    // FIX: avoid shadowing names used earlier in this scope
-    const apptDateISO = startStr ? String(startStr).slice(0,10) : "";
-    const apptTimeHHMM = startStr ? String(startStr).slice(11,16) : "";
+    const { dateISO: apptDateISO, timeHHMM: apptTimeHHMM } = isoToLocalParts(startStr); // <<< FIX: use local time
     const summary = target.summary || target.Event_Name || target.name || "";
     const service = extractServiceFromSummary(summary);
     const who = target.Customer_Name || "";
