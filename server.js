@@ -654,6 +654,18 @@ function parseYesNo(text) {
   return null;
 }
 
+/* === FIX A: detect caller saying they’re done after “Anything else?” === */
+function saysDone(text) {
+  const t = String(text || "").toLowerCase();
+  return /\b(that'?s (?:it|all)|that(?:'| i)ll be it|i'?m (?:good|all set)|no(?: thanks)?|nope|nah|we(?:'| a)re good|nothing else|i think i'?m good)\b/i.test(t);
+}
+/* === FIX B: graceful goodbye helper with longer drain before close === */
+async function gracefulGoodbye(ws) {
+  await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
+  await sleep(2500); // increased cushion so audio finishes before close
+  try { ws.close(); } catch {}
+}
+
 /* ----------------------- Classify & Handle ----------------------- */
 async function askForMissing(ws, state) {
   const s = state.slots;
@@ -688,6 +700,16 @@ async function askForMissing(ws, state) {
 
 async function classifyAndHandle(ws, state, transcript) {
   clearQuestionTimers(ws);
+
+  /* --- FIX A handler: after cancel “Anything else?”, treat “that’s it” as END --- */
+  if (ws.__awaitingAnythingElse) {
+    if (saysDone(transcript)) {
+      ws.__awaitingAnythingElse = false;
+      return gracefulGoodbye(ws);
+    }
+    // user wants more help; drop the flag and continue with normal handling
+    ws.__awaitingAnythingElse = false;
+  }
 
   /* --- Context-aware follow-ups BEFORE GPT --- */
 
@@ -736,8 +758,12 @@ async function classifyAndHandle(ws, state, transcript) {
       const eventId = ws.__pendingCancel.eventId;
       ws.__pendingCancel = null;
       const del = await makeDeleteEvent(eventId);
-      if (del.ok) await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
-      else await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
+      if (del.ok) {
+        await say(ws, "All set — your appointment has been canceled. Anything else I can help with?");
+        ws.__awaitingAnythingElse = true; // <<< FIX A: set flag so the next “that’s it” ends cleanly
+      } else {
+        await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?");
+      }
       return;
     } else if (yn === "no") {
       ws.__pendingCancel = null;
@@ -825,13 +851,14 @@ Rules:
     }
 
     const phone = state.slots.phone || "";
+    let target = null;
     for (const ev of read.events) {
       const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
       const evEnd = ev.End_Time || ev.end || ev.end_time || ev.endISO || evStart;
       const evPhone = normalizePhone(ev.Customer_Phone || ev.phone || "");
       const timeMatch = evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
       const phoneMatch = phone && evPhone ? evPhone.endsWith(phone.slice(-4)) : true;
-      if (timeMatch && phoneMatch) { var target = ev; break; }
+      if (timeMatch && phoneMatch) { target = ev; break; }
     }
     if (!target) target = read.events[0];
 
@@ -883,11 +910,8 @@ Rules:
   }
 
   if (parsed.intent === "END") {
-    await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
-    // FIX: close after audio finishes (say() now resolves on stream end) with a short cushion
-    await sleep(1200);
-    try { ws.close(); } catch {}
-    return;
+    // FIX B: ensure goodbye audio fully plays before close
+    return gracefulGoodbye(ws);
   }
 
   if (parsed.intent === "DECLINE_BOOK") {
@@ -906,7 +930,7 @@ Rules:
       answer = (svc && priceTable[svc]) ? `${svc} is ${priceTable[svc]}.` : "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
     } else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at one two three Blueberry Lane.";
-    else answer = "Happy to help. What else can I answer?";
+    else answer = "Happy to help. What else can I answer?"
 
     if (state.phase === "booking") { await say(ws, answer); return askForMissing(ws, state); }
     if (state.phase === "confirmed") return say(ws, answer);
@@ -975,6 +999,7 @@ wss.on("connection", (ws) => {
       ws.__callerFrom = msg.start?.customParameters?.from || "";
       ws.__pendingCancel = null;
       ws.__cancelFlow = { active: false };
+      ws.__awaitingAnythingElse = false; // <<< FIX A: init done/anything-else flag
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId }));
