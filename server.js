@@ -257,6 +257,18 @@ function dayBoundsISO(dateISO) {
   return { startISO: iso(start), endISO: iso(end) };
 }
 
+/* === Follow-up intent helpers (minimal, context-aware) === */
+function extractServiceFromSummary(summary) {
+  const m = /^([^(]+)\s*\(/.exec(String(summary || ""));
+  return m ? m[1].trim().toLowerCase() : "";
+}
+function isAskingTime(text) {
+  return /\b(what time|at what time|what's the time|what time is (it|that)|when is (it|that))\b/i.test(text || "");
+}
+function isAskingDate(text) {
+  return /\b(what (?:date|day)|which (?:date|day))\b/i.test(text || "");
+}
+
 /* === Make.com helpers (more tolerant READ) === */
 async function makeReadWindow(startISO, endISO) {
   if (!MAKE_READ_URL) return { ok: false, events: [], reason: "no_url" };
@@ -659,7 +671,47 @@ async function askForMissing(ws, state) {
 async function classifyAndHandle(ws, state, transcript) {
   clearQuestionTimers(ws);
 
-  /* Pending cancel yes/no */
+  /* --- Context-aware follow-ups BEFORE GPT --- */
+
+  // If user is clarifying during pending cancel confirmation ("Should I cancel it?")
+  if (ws.__pendingCancel && transcript) {
+    const askingTime = isAskingTime(transcript);
+    const askingDate = isAskingDate(transcript);
+    if (askingTime || askingDate) {
+      const pc = ws.__pendingCancel;
+      const dateSpoken = pc?.dateISO ? formatDateSpoken(pc.dateISO) : "";
+      const timeSpoken = pc?.timeHHMM ? to12h(pc.timeHHMM) : "";
+      let answer = "";
+      if (askingTime && timeSpoken) answer = `It’s at ${timeSpoken}.`;
+      if (askingDate && dateSpoken) answer = `It’s on ${dateSpoken}.`;
+      if (!answer && (pc?.spoken || "")) answer = pc.spoken + ".";
+      await askWithReaskAndGoodbye(ws, `${answer} Should I cancel it?`);
+      return;
+    }
+  }
+
+  // If user asks clarifying questions during booking flow, echo current slot info and continue
+  if (state.phase === "booking" && transcript) {
+    const askingTime = isAskingTime(transcript);
+    const askingDate = isAskingDate(transcript);
+    if (askingTime || askingDate) {
+      const s = state.slots;
+      const bits = [];
+      if (askingTime) {
+        if (s.time) bits.push(`We’re looking at ${to12h(s.time)}`);
+        else bits.push(`We haven’t picked a time yet`);
+      }
+      if (askingDate) {
+        if (s.date) bits.push(`on ${formatDateSpoken(s.date)}`);
+        else bits.push(`and we still need a date`);
+      }
+      const line = bits.join(" ") + ".";
+      await say(ws, line);
+      return askForMissing(ws, state);
+    }
+  }
+
+  /* Pending cancel yes/no (and keep after follow-up block) */
   if (ws.__pendingCancel && transcript) {
     const yn = parseYesNo(transcript);
     if (yn === "yes") {
@@ -776,7 +828,14 @@ Rules:
     }
 
     const spoken = describeEventForSpeech(target);
-    ws.__pendingCancel = { eventId, spoken };
+    const startStr = target.Start_Time || target.start || target.start_time || target.startISO || "";
+    const dateISO = startStr ? String(startStr).slice(0,10) : "";
+    const timeHHMM = startStr ? String(startStr).slice(11,16) : "";
+    const summary = target.summary || target.Event_Name || target.name || "";
+    const service = extractServiceFromSummary(summary);
+    const who = target.Customer_Name || "";
+
+    ws.__pendingCancel = { eventId, spoken, dateISO, timeHHMM, service, name: who };
     ws.__cancelFlow = { ...cf, active: false };
     await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
