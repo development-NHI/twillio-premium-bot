@@ -77,7 +77,32 @@ app.post("/twiml", (req, res) => {
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${host}">
+        <Stream name="dg" url="wss://${host}">
+          <Parameter name="from" value="{{From}}"/>
+          <Parameter name="callSid" value="{{CallSid}}"/>
+        </Stream>
+      </Connect>
+    </Response>
+  `.trim());
+});
+
+// Transfer TwiML: stop media stream, then dial owner
+app.post("/xfer", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  const number = OWNER_PHONE;
+  const callerId = TWILIO_CALLER_ID ? ` callerId=\"${TWILIO_CALLER_ID}\"` : "";
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Stop><Stream name="dg"/></Stop>
+  <Say>Connecting you to the owner now.</Say>
+  <Dial${callerId}><Number>${number}</Number></Dial>
+</Response>`);
+});
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  res.send(`
+    <Response>
+      <Connect>
+        <Stream name="dg" url="wss://${host}">
           <Parameter name="from" value="{{From}}"/>
           <Parameter name="callSid" value="{{CallSid}}"/>
         </Stream>
@@ -434,6 +459,21 @@ async function transferToOwner(ws) {
     await say(ws, "I’ll share your question with the owner to call you back.");
     return false;
   }
+  try {
+    const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${ws.__callSid}.json`;
+    const target = `https://${host}/xfer`;
+    const form = new URLSearchParams();
+    form.append("Url", target);
+    form.append("Method", "POST");
+    await axios.post(url, form, { auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN }, headers: { "Content-Type": "application/x-www-form-urlencoded" } });
+    return true;
+  } catch (e) {
+    console.error("[TWILIO TRANSFER ERROR]", e.message);
+    await say(ws, "I couldn’t transfer right now. I’ll have the owner call you back.");
+    return false;
+  }
+}
   try {
     const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${ws.__callSid}.json`;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>\n<Response><Say>Connecting you to the owner now.</Say><Dial${TWILIO_CALLER_ID ? ` callerId=\"${TWILIO_CALLER_ID}\"` : ""}><Number>${OWNER_PHONE}</Number></Dial></Response>`;
