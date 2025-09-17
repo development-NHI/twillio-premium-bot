@@ -72,7 +72,6 @@ app.post("/twiml", (req, res) => {
       <Connect>
         <Stream name="dg" url="wss://${host}">
           <Parameter name="from" value="{{From}}"/>
-          <Parameter name="callSid" value="{{CallSid}}"/>
         </Stream>
       </Connect>
     </Response>
@@ -1017,7 +1016,7 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || "";
-      ws.__callSid = msg.start?.customParameters?.callSid || "";
+      ws.__callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || "";
       ws.__pendingCancel = null;
       ws.__cancelFlow = { active: false };
       ws.__awaitingAnythingElse = false;
@@ -1062,4 +1061,3 @@ wss.on("connection", (ws) => {
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
-
