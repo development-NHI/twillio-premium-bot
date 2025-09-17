@@ -968,7 +968,7 @@ Rules:
   }
 
   // Booking flow
-  if (parsed.intent === "BOOK" || state.phase === "booking")) {
+  if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
     const missing = nextMissing(state);
     if (missing === "done") {
@@ -1062,3 +1062,4 @@ wss.on("connection", (ws) => {
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
 });
+
