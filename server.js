@@ -1,5 +1,5 @@
 // server.js — Old Line Barbershop AI Receptionist (Deepgram + GPT + ElevenLabs + Dashboard)
-// Targeted fixes + TEMP LOGGING for diagnosis.
+// Latency tuned, deterministic prompts, Twilio transfer, dashboard hooks, and verbose logging.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -11,114 +11,40 @@ import { v4 as uuidv4 } from "uuid";
 dotenv.config();
 
 /* =====================
-   CHANGE LOG (targeted)
-   =====================
-   [Latency]
-   - Deepgram batch lowered to 2 frames.
-   - ElevenLabs streaming latency hint 4.
-
-   [NLU]
-   - Deterministic service catch (haircut, beard, combo) before GPT.
-   - "tmr", "tmrw", "tmmrw" → tomorrow using shop TZ.
-
-   [Dates]
-   - All date math uses shop TZ to avoid off-by-one.
-
-   [Replies]
-   - No open-ended bridge lines. Deterministic and short.
-
-   [Transfer]
-   - Clean Twilio redirect to /xfer TwiML. Stops media stream before Dial.
-
-   [Dashboard]
-   - Replaced Make.com hooks with dashboard endpoints for calendar read/create/cancel.
-   - Lead upsert on confirmation.
-   - Call transcript + summary pushed at hangup.
-
-   [Logging]
-   - Boot config dump (URLs, tz, biz/source).
-   - HTTP request/response timing for calendar, leads, call logs, GPT, TTS.
-   - Payload previews (redacted phone/email tokens).
-   - WS lifecycle and slot changes already logged; kept and expanded.
-*/
-
+   ENV / CONFIG
+   ===================== */
 const PORT = process.env.PORT || 5000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-/* === Dashboard endpoints === */
+/* Dashboard endpoints */
 const DASH_CAL_READ_URL   = process.env.DASH_CAL_READ_URL   || "";
 const DASH_CAL_CREATE_URL = process.env.DASH_CAL_CREATE_URL || "";
 const DASH_CAL_CANCEL_URL = process.env.DASH_CAL_CANCEL_URL || "";
-// optional: const DASH_CAL_RESCHED_URL = process.env.DASH_CAL_RESCHED_URL || "";
-
 const DASH_LEAD_UPSERT_URL   = process.env.DASH_LEAD_UPSERT_URL   || "";
 const DASH_CALL_LOG_URL      = process.env.DASH_CALL_LOG_URL      || "";
 const DASH_CALL_SUMMARY_URL  = process.env.DASH_CALL_SUMMARY_URL  || "";
-
 const DASH_BIZ    = process.env.DASH_BIZ    || "oldline";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 
-/* === Biz timezone for speech (fix UTC->local) === */
+/* Biz timezone */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
-/* === Twilio transfer vars === */
+/* Twilio transfer */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // E.164
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional presented number
 
-/* ---------- Logging helpers (temporary) ---------- */
-const redact = (s) => {
-  if (!s || typeof s !== "string") return s;
-  // redact long tokens, emails, phones
-  if (s.startsWith("sk-") || s.length > 24) return s.slice(0, 6) + "…redacted…" + s.slice(-4);
-  const emailRE = /([A-Z0-9._%+-]+)@([A-Z0-9.-]+\.[A-Z]{2,})/ig;
-  const phoneRE = /\b(\+?\d{1,3})?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}\b/g;
-  return s.replace(emailRE, (_, a, b) => a[0] + "…@" + b)
-          .replace(phoneRE, (m) => m.slice(0, 2) + "…redacted…");
-};
-const preview = (obj) => {
-  try {
-    return JSON.stringify(obj, (k, v) => {
-      if (k === "phone" || k === "email") return redact(String(v || ""));
-      if (typeof v === "string") return redact(v);
-      return v;
-    });
-  } catch { return "[unserializable]"; }
-};
-const httpLog = async (label, fn) => {
-  const t0 = Date.now();
-  try {
-    const out = await fn();
-    const ms = Date.now() - t0;
-    console.log(`[HTTP OK] ${label} ${ms}ms`);
-    return out;
-  } catch (e) {
-    const ms = Date.now() - t0;
-    const status = e?.response?.status;
-    const body = e?.response?.data;
-    console.error(`[HTTP ERR] ${label} ${ms}ms status=${status} body=${preview(body)} msg=${e.message}`);
-    throw e;
-  }
-};
-
-/* ---------- Boot-time config dump ---------- */
-console.log("[CFG] PORT", PORT);
-console.log("[CFG] BIZ_TZ", BIZ_TZ);
-console.log("[CFG] DASH_BIZ", DASH_BIZ, "DASH_SOURCE", DASH_SOURCE);
-console.log("[CFG] CAL_READ", DASH_CAL_READ_URL);
-console.log("[CFG] CAL_CREATE", DASH_CAL_CREATE_URL);
-console.log("[CFG] CAL_CANCEL", DASH_CAL_CANCEL_URL);
-console.log("[CFG] LEAD_UPSERT", DASH_LEAD_UPSERT_URL);
-console.log("[CFG] CALL_LOG", DASH_CALL_LOG_URL);
-console.log("[CFG] CALL_SUMMARY", DASH_CALL_SUMMARY_URL);
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
 if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
 
+/* =====================
+   APP
+   ===================== */
 const app = express();
 app.use(bodyParser.json());
 
@@ -128,7 +54,6 @@ app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Recept
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  console.log("[TwiML] Using host", host);
   const twiml = `
     <Response>
       <Connect>
@@ -145,7 +70,6 @@ app.post("/twiml", (req, res) => {
 app.post("/xfer", (req, res) => {
   res.set("Content-Type", "text/xml");
   const callerAttr = TWILIO_CALLER_ID ? ` callerId="${TWILIO_CALLER_ID}"` : "";
-  console.log("[XFER] owner", redact(OWNER_PHONE), "callerId", redact(TWILIO_CALLER_ID));
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stop><Stream name="dg"/></Stop>
@@ -158,7 +82,38 @@ app.post("/xfer", (req, res) => {
 const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 const wss = new WebSocketServer({ server });
 
-/* ----------------------- Utilities ----------------------- */
+/* =====================
+   LOG HELPERS
+   ===================== */
+function preview(val, max = 240) {
+  try {
+    const s = typeof val === "string" ? val : JSON.stringify(val);
+    const red = s.replace(/("phone"\s*:\s*")(\+?1?\d{0,6})\d{2,6}(\d{2}")/gi, '$1$2…redacted…$3');
+    return red.length > max ? red.slice(0, max) + "…" : red;
+  } catch {
+    return String(val).slice(0, max);
+  }
+}
+async function httpLog(label, fn) {
+  const t0 = Date.now();
+  try {
+    const resp = await fn();
+    const dt = Date.now() - t0;
+    const status = resp?.status ?? 0;
+    console.log(`[HTTP OK] ${label} ${dt}ms`);
+    return resp;
+  } catch (e) {
+    const dt = Date.now() - t0;
+    const status = e?.response?.status;
+    const body = e?.response?.data;
+    console.error(`[HTTP ERR] ${label} ${dt}ms status=${status} body=${preview(body)} msg=${e?.message}`);
+    throw e;
+  }
+}
+
+/* =====================
+   UTILITIES
+   ===================== */
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const MONTH_LOOKUP = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,sept:9,oct:10,nov:11,dec:12 };
 
@@ -187,7 +142,7 @@ function weekdayToISO(weekday, tz = BIZ_TZ) {
   return addDaysISO(todayISO, delta);
 }
 
-/* --- Natural date parsing upgrades for cancel/booking flow --- */
+/* Natural date parsing */
 function parseMonthDayToISO(txt) {
   if (!txt) return "";
   const t = txt.trim().toLowerCase();
@@ -258,14 +213,22 @@ function formatDateSpoken(iso) {
 }
 function to12h(t) {
   if (!t) return "";
-  if (/am|pm/i.test(t)) { const up = t.toUpperCase().replace(/\s+/g, " ").trim(); return up.includes("AM") || up.includes("PM") ? up : up + " PM"; }
+  if (/am|pm/i.test(t)) {
+    const up = t.toUpperCase().replace(/\s+/g, " ").trim();
+    return up.includes("AM") || up.includes("PM") ? up : up + " PM";
+  }
   const m = /^(\d{1,2}):?(\d{2})$/.exec(t);
   if (!m) return t;
-  let hh = Number(m[1]); const mm = m[2]; const ampm = hh >= 12 ? "PM" : "AM"; if (hh === 0) hh = 12; if (hh > 12) hh -= 12; return `${hh}:${mm}`.replace(":00", "") + ` ${ampm}`;
+  let hh = Number(m[1]); const mm = m[2];
+  const ampm = hh >= 12 ? "PM" : "AM"; if (hh === 0) hh = 12; if (hh > 12) hh -= 12;
+  return `${hh}:${mm}`.replace(":00", "") + ` ${ampm}`;
 }
-function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken; }
+function humanWhen(dateISO, timeStr) {
+  const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr);
+  return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
+}
 
-/* ----- Business hours (Mon–Fri, 9–5) ----- */
+/* Business hours (Mon–Fri, 9–5) */
 function isWeekend(dateISO) { const d = new Date(dateISO + "T00:00:00Z"); const day = d.getUTCDay(); return day === 0 || day === 6; }
 function isWithinHours(timeStr) {
   if (!timeStr) return false;
@@ -287,7 +250,7 @@ function enforceBusinessWindow(state) {
   return { ok: true };
 }
 
-/* === Time helpers === */
+/* Time helpers */
 function to24h(timeStr) {
   if (!timeStr) return "";
   const s = timeStr.trim().toUpperCase();
@@ -304,6 +267,7 @@ function durationMinutesForService(service) {
   if (s === "combo") return 45;
   return 30;
 }
+/* FIX: include trailing 'Z' by using toISOString() */
 function buildStartEndISO(dateISO, timeStr, service) {
   const hhmm = to24h(timeStr);
   if (!dateISO || !hhmm) return { startISO: "", endISO: "" };
@@ -312,29 +276,31 @@ function buildStartEndISO(dateISO, timeStr, service) {
   const start = new Date(Date.UTC(Y, M - 1, D, h, m, 0));
   const mins = durationMinutesForService(service);
   const end = new Date(start.getTime() + mins * 60000);
-  const iso = (d) => `${d.toISOString().slice(0,19)}`; // keep original format
-  return { startISO: iso(start), endISO: iso(end) };
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
 }
 function dayBoundsISO(dateISO) {
   const [Y,M,D] = dateISO.split("-").map(Number);
   const start = new Date(Date.UTC(Y, M - 1, D, 0, 0, 0));
   const end = new Date(Date.UTC(Y, M - 1, D, 23, 59, 59));
-  const iso = (d) => `${d.toISOString().slice(0,19)}`;
-  return { startISO: iso(start), endISO: iso(end) };
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
 }
 
-/* === Follow-up intent helpers (minimal, context-aware) === */
+/* Follow-up helpers */
 function extractServiceFromSummary(summary) { const m = /^([^(]+)\s*\(/.exec(String(summary || "")); return m ? m[1].trim().toLowerCase() : ""; }
 function isAskingTime(text) { return /\b(what time|at what time|what's the time|what time is (it|that)|when is (it|that))\b/i.test(text || ""); }
 function isAskingDate(text) { return /\b(what (?:date|day)|which (?:date|day))\b/i.test(text || ""); }
 
-/* === Dashboard calendar + helpers === */
+/* =====================
+   DASHBOARD API
+   ===================== */
 async function dashReadWindow(startISO, endISO) {
-  if (!DASH_CAL_READ_URL) { console.error("[CAL READ] no URL"); return { ok: false, events: [], reason: "no_url" }; }
+  if (!DASH_CAL_READ_URL) return { ok: false, events: [], reason: "no_url" };
   try {
     const payload = { biz: DASH_BIZ, source: DASH_SOURCE, window: { start: startISO, end: endISO } };
     console.log("[CAL READ->]", DASH_CAL_READ_URL, preview(payload));
-    const { data } = await httpLog("CAL_READ", () => axios.post(DASH_CAL_READ_URL, payload, { timeout: 12000 }));
+    const { data } = await httpLog("CAL_READ", () =>
+      axios.post(DASH_CAL_READ_URL, payload, { timeout: 12000 })
+    );
     console.log("[CAL READ<-]", preview(data));
     let raw = data?.events ?? data?.event ?? null;
     let events = [];
@@ -347,33 +313,86 @@ async function dashReadWindow(startISO, endISO) {
     return { ok: false, events: [], reason: "exception" };
   }
 }
+
+/* FIX: be flexible on create shape and include timezone/service */
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
   if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
+
+  const e164 = phone && phone.length === 10 ? `+1${phone}` : phone || "";
+  const base = {
+    biz: DASH_BIZ,
+    source: DASH_SOURCE,
+    timezone: BIZ_TZ,
+    service: service || "appointment",
+    duration_min: durationMinutesForService(service),
+    customer: { name: name || "Guest", phone: e164, email: email || "" },
+    notes: notes || service || ""
+  };
+
+  const payloadA = {
+    ...base,
+    event: {
+      summary: `${service || "Appointment"} (${name || "Guest"})`,
+      type: service || "appointment",
+      start: startISO,
+      end: endISO,
+      timezone: BIZ_TZ,
+      customer: base.customer,
+      notes: base.notes
+    }
+  };
+  const payloadB = {
+    ...base,
+    appointment: {
+      title: `${service || "Appointment"} (${name || "Guest"})`,
+      type: service || "appointment",
+      start: startISO,
+      end: endISO,
+      timezone: BIZ_TZ,
+      customer: base.customer,
+      notes: base.notes
+    }
+  };
+  const payloadC = {
+    ...base,
+    title: `${service || "Appointment"} (${name || "Guest"})`,
+    start: startISO,
+    end: endISO
+  };
+
+  const tryPost = async (label, payload) => {
+    console.log("[CAL CREATE->]", label, DASH_CAL_CREATE_URL, preview(payload));
+    const { data } = await httpLog(`CAL_CREATE_${label}`, () =>
+      axios.post(DASH_CAL_CREATE_URL, payload, { timeout: 10000 })
+    );
+    console.log("[CAL CREATE<-]", label, preview(data));
+    return data;
+  };
+
   try {
-    const payload = {
-      biz: DASH_BIZ, source: DASH_SOURCE,
-      event: {
-        summary: `${service || "Appointment"} (${name || "Guest"})`,
-        start: startISO, end: endISO,
-        customer: { name: name || "", phone: phone || "", email: email || "" },
-        notes: notes || service || ""
+    try { return { ok: true, event: await tryPost("A", payloadA) }; }
+    catch (e1) {
+      if (e1?.response?.status !== 400) throw e1;
+      try { return { ok: true, event: await tryPost("B", payloadB) }; }
+      catch (e2) {
+        if (e2?.response?.status !== 400) throw e2;
+        return { ok: true, event: await tryPost("C", payloadC) };
       }
-    };
-    console.log("[CAL CREATE->]", DASH_CAL_CREATE_URL, preview(payload));
-    const { data } = await httpLog("CAL_CREATE", () => axios.post(DASH_CAL_CREATE_URL, payload, { timeout: 10000 }));
-    console.log("[CAL CREATE<-]", preview(data));
-    return { ok: true, event: data || null };
+    }
   } catch (e) {
     console.error("[DASH CREATE ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     return { ok: false, event: null };
   }
 }
+
 async function dashDeleteEvent(event_id) {
-  if (!DASH_CAL_CANCEL_URL) { console.error("[CAL CANCEL] no URL"); return { ok: false }; }
+  if (!DASH_CAL_CANCEL_URL) return { ok: false };
   try {
     const payload = { biz: DASH_BIZ, source: DASH_SOURCE, event_id };
     console.log("[CAL CANCEL->]", DASH_CAL_CANCEL_URL, preview(payload));
-    const resp = await httpLog("CAL_CANCEL", () => axios.post(DASH_CAL_CANCEL_URL, payload, { timeout: 10000 }));
+    const resp = await httpLog("CAL_CANCEL", () =>
+      axios.post(DASH_CAL_CANCEL_URL, payload, { timeout: 10000 })
+    );
     const { status, data } = resp;
     console.log("[CAL CANCEL<-]", status, preview(data));
     let ok =
@@ -384,10 +403,11 @@ async function dashDeleteEvent(event_id) {
       (typeof data === "string" && /^(ok|success|deleted)$/i.test(String(data).trim()));
     return { ok: !!ok };
   } catch (e) {
-    console.error("[DASH CANCEL ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
+    console.error("[DASH CANCEL ERROR]", e.message);
     return { ok: false };
   }
 }
+
 function eventsOverlap(aStart, aEnd, bStart, bEnd) {
   const A1 = new Date(aStart).getTime();
   const A2 = new Date(aEnd).getTime();
@@ -396,7 +416,9 @@ function eventsOverlap(aStart, aEnd, bStart, bEnd) {
   return A1 < B2 && B1 < A2;
 }
 
-/* ----------------------- Deepgram WS ----------------------- */
+/* =====================
+   DEEPGRAM WS
+   ===================== */
 function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -432,7 +454,7 @@ function startDeepgram({ onFinal }) {
   dg.on("close", () => console.log("[Deepgram closed]"));
 
   return {
-    sendPCM16LE(buf) { try { dg.send(buf); } catch { console.error("[Deepgram send error]"); } },
+    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
     close() { try { dg.close(); } catch {} }
   };
 }
@@ -456,7 +478,9 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
   return out;
 }
 
-/* ----------------------- GPT ----------------------- */
+/* =====================
+   GPT
+   ===================== */
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
     console.log("[GPT->] model=gpt-4o-mini format=", response_format);
@@ -475,16 +499,18 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
         { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
       )
     );
-    const content = resp.data.choices?.[0]?.message?.content?.trim() || "";
-    console.log("[GPT<-] len=", content.length);
-    return content;
+    const out = resp.data.choices[0].message.content.trim();
+    console.log("[GPT<-] len=", out.length);
+    return out;
   } catch (e) {
-    console.error("[GPT ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
+    console.error("[GPT ERROR]", e.message);
     return "";
   }
 }
 
-/* ----------------------- TTS ----------------------- */
+/* =====================
+   TTS
+   ===================== */
 async function say(ws, text) {
   if (!text) return;
   try { (ws.__lines ||= []).push({ role: "assistant", at: Date.now(), text }); } catch {}
@@ -521,7 +547,7 @@ async function say(ws, text) {
         try { ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } })); } catch (_) {}
         setTimeout(resolve, 150);
       });
-      resp.data.on("error", (err) => { console.error("[TTS stream error]", err?.message); resolve(); });
+      resp.data.on("error", () => resolve());
       resp.data.on("close", () => resolve());
     });
   } catch (e) {
@@ -529,7 +555,9 @@ async function say(ws, text) {
   }
 }
 
-/* ----------------------- Silence handling ----------------------- */
+/* =====================
+   SILENCE HANDLING
+   ===================== */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function clearQuestionTimers(ws) {
   if (ws.__qTimer1) { clearTimeout(ws.__qTimer1); ws.__qTimer1 = null; }
@@ -550,10 +578,12 @@ async function askWithReaskAndGoodbye(ws, questionText) {
   }, 20000);
 }
 
-/* ----------------------- State & Slots ----------------------- */
+/* =====================
+   STATE & SLOTS
+   ===================== */
 function newState() {
   return {
-    phase: "idle",
+    phase: "idle", // idle | booking | confirmed
     slots: { service: "", date: "", time: "", name: "", phone: "" },
     lastConfirmSnapshot: "",
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
@@ -601,7 +631,7 @@ function nextMissing(state) {
   return "done";
 }
 
-/* ------ Goodbye handling (post-confirmation) ------ */
+/* Goodbye handling */
 function clearGoodbyeTimers(ws) {
   if (ws.__goodbyeSilenceTimer) { clearTimeout(ws.__goodbyeSilenceTimer); ws.__goodbyeSilenceTimer = null; }
   if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
@@ -614,12 +644,15 @@ function armGoodbyeSilence(ws) {
   }, 7000);
 }
 
-/* === Book: verify free, then create === */
+/* =====================
+   BOOKING
+   ===================== */
 async function createViaDashIfFree(ws, state) {
   const s = state.slots;
   const { startISO, endISO } = buildStartEndISO(s.date, s.time, s.service);
-  console.log("[BOOK] computed window", { startISO, endISO, service: s.service });
   if (!startISO || !endISO) return { ok: false, reason: "bad_time" };
+
+  console.log("[BOOK] computed window", { startISO, endISO, service: s.service });
 
   const read = await dashReadWindow(startISO, endISO);
   if (!read.ok) {
@@ -632,7 +665,7 @@ async function createViaDashIfFree(ws, state) {
     const evEnd   = ev.End_Time   || ev.end   || ev.end_time   || ev.endISO || evStart;
     return evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
   });
-  console.log("[BOOK] conflict", !!conflict, "events", read.events?.length || 0);
+  console.log("[BOOK] conflict", conflict, "events", read.events?.length || 0);
   if (conflict) return { ok: false, reason: "conflict" };
 
   const created = await dashCreateEvent({
@@ -695,7 +728,9 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   await askWithReaskAndGoodbye(ws, line);
 }
 
-/* === Cancel helpers === */
+/* =====================
+   CANCEL
+   ===================== */
 function isoToLocalParts(iso, tz = BIZ_TZ) {
   try {
     const d = new Date(String(iso));
@@ -741,7 +776,9 @@ async function gracefulGoodbye(ws) {
   try { ws.close(); } catch {}
 }
 
-/* ----------------------- Twilio transfer ----------------------- */
+/* =====================
+   TRANSFER
+   ===================== */
 async function transferToOwner(ws) {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !ws.__callSid) {
     await say(ws, "I’ll share your question with the owner to call you back.");
@@ -753,8 +790,7 @@ async function transferToOwner(ws) {
     const form = new URLSearchParams();
     form.append("Url", `https://${host}/xfer`);
     form.append("Method", "POST");
-    console.log("[XFER→Twilio]", url, "Url=", `https://${host}/xfer`);
-    await httpLog("TWILIO_REDIRECT", () =>
+    await httpLog("TWILIO_TRANSFER", () =>
       axios.post(url, form, {
         auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
         headers: { "Content-Type": "application/x-www-form-urlencoded" }
@@ -762,13 +798,15 @@ async function transferToOwner(ws) {
     );
     return true;
   } catch (e) {
-    console.error("[TWILIO TRANSFER ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
+    console.error("[TWILIO TRANSFER ERROR]", e.message);
     await say(ws, "I couldn’t transfer right now. I’ll have the owner call you back.");
     return false;
   }
 }
 
-/* ----------------------- Call artifacts ----------------------- */
+/* =====================
+   CALL ARTIFACTS
+   ===================== */
 async function pushCallArtifacts(ws) {
   const payload = {
     biz: DASH_BIZ,
@@ -784,20 +822,22 @@ async function pushCallArtifacts(ws) {
   };
   try {
     if (DASH_CALL_LOG_URL) {
-      console.log("[CALL LOG->]", DASH_CALL_LOG_URL, "size=", (payload.transcript || []).length);
+      console.log("[CALL LOG->]", DASH_CALL_LOG_URL, preview(payload, 400));
       await httpLog("CALL_LOG", () => axios.post(DASH_CALL_LOG_URL, payload, { timeout: 8000 }));
     }
-  } catch (e) { console.error("[CALL LOG ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data)); }
+  } catch (e) { console.error("[CALL LOG ERROR]", e.message); }
   try {
     if (DASH_CALL_SUMMARY_URL) {
-      const sPayload = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: payload.convo_id };
-      console.log("[CALL SUMMARY->]", DASH_CALL_SUMMARY_URL, preview(sPayload));
-      await httpLog("CALL_SUMMARY", () => axios.post(DASH_CALL_SUMMARY_URL, sPayload, { timeout: 8000 }));
+      const sumPayload = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: payload.convo_id };
+      console.log("[CALL SUMMARY->]", DASH_CALL_SUMMARY_URL, preview(sumPayload));
+      await httpLog("CALL_SUMMARY", () => axios.post(DASH_CALL_SUMMARY_URL, sumPayload, { timeout: 8000 }));
     }
-  } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data)); }
+  } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message); }
 }
 
-/* ----------------------- Classify & Handle ----------------------- */
+/* =====================
+   DIALOG / NLU
+   ===================== */
 async function askForMissing(ws, state) {
   const s = state.slots;
   const missing = nextMissing(state);
@@ -842,7 +882,7 @@ async function classifyAndHandle(ws, state, transcript) {
 
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
-  /* === Deterministic pre-parse === */
+  /* Deterministic pre-parse */
   const lower = String(transcript || "").toLowerCase();
   if (!state.slots.service) {
     const svcHard = normalizeService(lower);
@@ -959,7 +999,6 @@ Rules:
   /* Sticky cancel mode */
   if (ws.__cancelFlow?.active) {
     const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
-
     const newDate = normalizeDate(parsed.date) || "";
     const newTime = parsed.time || "";
     if (newDate) cf.dateISO = newDate;
@@ -974,26 +1013,15 @@ Rules:
     }
 
     let startISO = "", endISO = "";
-    if (dateISO && timeStr) {
-      ({ startISO, endISO } = buildStartEndISO(dateISO, timeStr, "haircut"));
-    } else if (dateISO) {
-      ({ startISO, endISO } = dayBoundsISO(dateISO));
-    } else {
-      await askWithReaskAndGoodbye(ws, "Got it — what date is that appointment on?");
-      return;
-    }
+    if (dateISO && timeStr)      ({ startISO, endISO } = buildStartEndISO(dateISO, timeStr, "haircut"));
+    else if (dateISO)            ({ startISO, endISO } = dayBoundsISO(dateISO));
+    else { await askWithReaskAndGoodbye(ws, "Got it — what date is that appointment on?"); return; }
 
     ws.__cancelFlow = cf;
 
     const read = await dashReadWindow(startISO, endISO);
-    if (!read.ok) {
-      await askWithReaskAndGoodbye(ws, "I couldn’t reach the calendar just now. What date and time should I cancel?");
-      return;
-    }
-    if (!Array.isArray(read.events) || read.events.length === 0) {
-      await askWithReaskAndGoodbye(ws, "I couldn’t find that appointment. What date and time should I cancel?");
-      return;
-    }
+    if (!read.ok) { await askWithReaskAndGoodbye(ws, "I couldn’t reach the calendar just now. What date and time should I cancel?"); return; }
+    if (!Array.isArray(read.events) || read.events.length === 0) { await askWithReaskAndGoodbye(ws, "I couldn’t find that appointment. What date and time should I cancel?"); return; }
 
     const phone = state.slots.phone || "";
     let target = null;
@@ -1008,10 +1036,7 @@ Rules:
     if (!target) target = read.events[0];
 
     const eventId = target.event_id || target.id || target.eventId;
-    if (!eventId) {
-      await askWithReaskAndGoodbye(ws, "I found an appointment but couldn’t identify its ID. What’s the exact time?");
-      return;
-    }
+    if (!eventId) { await askWithReaskAndGoodbye(ws, "I found an appointment but couldn’t identify its ID. What’s the exact time?"); return; }
 
     const spoken = describeEventForSpeech(target);
     const startStr = target.Start_Time || target.start || target.start_time || target.startISO || "";
@@ -1040,30 +1065,18 @@ Rules:
     if (acks.length) await say(ws, acks.join(" "));
   }
 
-  /* Start cancel flow */
   if (parsed.intent === "CANCEL") {
     const d0 = normalizeDate(parsed.date) || "";
     const t0 = parsed.time || "";
     ws.__cancelFlow = { active: true, dateISO: d0, timeStr: t0 };
-
-    if (!d0 && !t0) {
-      await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
-    } else {
-      await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
-    }
+    if (!d0 && !t0) await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
+    else await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
     return;
   }
 
-  if (parsed.intent === "END") {
-    return gracefulGoodbye(ws);
-  }
+  if (parsed.intent === "END") return gracefulGoodbye(ws);
+  if (parsed.intent === "DECLINE_BOOK") { state.phase = "idle"; return say(ws, "No problem. How else can I help?"); }
 
-  if (parsed.intent === "DECLINE_BOOK") {
-    state.phase = "idle";
-    return say(ws, "No problem. How else can I help?");
-  }
-
-  // FAQs
   if (parsed.intent === "FAQ") {
     const priceTable = { "haircut": "thirty dollars", "beard trim": "fifteen dollars", "combo": "forty dollars" };
     let answer = "";
@@ -1086,7 +1099,6 @@ Rules:
     return;
   }
 
-  // Booking flow
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
     const missing = nextMissing(state);
@@ -1112,7 +1124,6 @@ Rules:
     return askWithReaskAndGoodbye(ws, targetAsk);
   }
 
-  // Smalltalk outside booking
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
     if (state.phase === "idle") return say(ws, `All good. Would you like to book or ask a question?`);
     if (state.phase === "confirmed") return say(ws, "Happy to help.");
@@ -1120,7 +1131,9 @@ Rules:
   }
 }
 
-/* ----------------------- WS wiring ----------------------- */
+/* =====================
+   WS WIRING
+   ===================== */
 wss.on("connection", (ws) => {
   let dg = null;
   let pendingULaw = [];
@@ -1143,7 +1156,7 @@ wss.on("connection", (ws) => {
       ws.__startedAt = Date.now();
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid, from: redact(ws.__callerFrom || "") }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid }));
 
       dg = startDeepgram({
         onFinal: async (text) => {
@@ -1170,7 +1183,6 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "stop") {
-      console.log("[CALL STOP] flushing artifacts");
       try { dg?.close(); } catch {}
       try { await pushCallArtifacts(ws); } catch {}
       try { ws.close(); } catch {}
@@ -1181,7 +1193,6 @@ wss.on("connection", (ws) => {
     clearQuestionTimers(ws);
     clearGoodbyeTimers(ws);
     try { dg?.close(); } catch {}
-    // best-effort if not already sent
     pushCallArtifacts(ws).catch(()=>{});
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
   });
