@@ -49,7 +49,7 @@ app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Recept
 
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
   const twiml = `
     <Response>
       <Connect>
@@ -76,7 +76,7 @@ app.post("/xfer", (req, res) => {
   res.send(twiml);
 });
 
-const server = app.listen(PORT, () => console.log([INFO] Server running on ${PORT}));
+const server = app.listen(PORT, () => console.log(`[INFO] Server running on ${PORT}`));
 const wss = new WebSocketServer({ server });
 
 /* ===== LOG HELPERS ===== */
@@ -91,11 +91,11 @@ async function httpLog(label, fn) {
   const t0 = Date.now();
   try {
     const resp = await fn();
-    console.log([HTTP OK] ${label} ${Date.now() - t0}ms);
+    console.log(`[HTTP OK] ${label} ${Date.now() - t0}ms`);
     return resp;
   } catch (e) {
     console.error(
-      [HTTP ERR] ${label} ${Date.now() - t0}ms status=${e?.response?.status} body=${preview(e?.response?.data)} msg=${e?.message}
+      `[HTTP ERR] ${label} ${Date.now() - t0}ms status=${e?.response?.status} body=${preview(e?.response?.data)} msg=${e?.message}`
     );
     throw e;
   }
@@ -115,7 +115,7 @@ function addDaysISO(iso, days) {
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(d.getUTCDate()).padStart(2, "0");
-  return ${yyyy}-${mm}-${dd};
+  return `${yyyy}-${mm}-${dd}`;
 }
 function dowOfISO(iso) { return new Date(iso + "T00:00:00Z").getUTCDay(); }
 function weekdayToISO(weekday, tz = BIZ_TZ) {
@@ -136,10 +136,10 @@ function parseMonthDayToISO(txt) {
   let m = /^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t);
   if (m) {
     const mm = MONTH_LOOKUP[m[1].slice(0,3)];
-       const dd = parseInt(m[2], 10);
+    const dd = parseInt(m[2], 10);
     if (mm && dd >= 1 && dd <= 31) {
       const yyyy = new Date().getFullYear();
-      return ${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")};
+      return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
     }
   }
   m = /^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/.exec(t);
@@ -149,7 +149,7 @@ function parseMonthDayToISO(txt) {
     let yyyy = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
     if (yyyy < 100) yyyy += 2000;
     if (mm >=1 && mm <=12 && dd >=1 && dd <=31) {
-      return ${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")};
+      return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
     }
   }
   return "";
@@ -159,7 +159,7 @@ function coerceToThisYearIfLikely(isoMaybe) {
   if (!m) return isoMaybe;
   const yyyyNow = new Date().getFullYear();
   const yyyy = parseInt(m[1],10);
-  if (yyyy !== yyyyNow) return ${yyyyNow}-${m[2]}-${m[3]};
+  if (yyyy !== yyyyNow) return `${yyyyNow}-${m[2]}-${m[3]}`;
   return isoMaybe;
 }
 function normalizeDate(d) {
@@ -194,7 +194,7 @@ function formatDateSpoken(iso) {
   if (!m) return iso || "";
   const mm = Number(m[2]);
   const dd = Number(m[3]);
-  return ${MONTHS[mm - 1]} ${ordinal(dd)};
+  return `${MONTHS[mm - 1]} ${ordinal(dd)}`;
 }
 function to12h(t) {
   if (!t) return "";
@@ -206,9 +206,9 @@ function to12h(t) {
   if (!m) return t;
   let hh = Number(m[1]); const mm = m[2];
   const ampm = hh >= 12 ? "PM" : "AM"; if (hh === 0) hh = 12; if (hh > 12) hh -= 12;
-  return ${hh}:${mm}.replace(":00", "") + ` ${ampm}`;
+  return `${hh}:${mm}`.replace(":00", "") + ` ${ampm}`;
 }
-function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? ${dSpoken} at ${tSpoken} : dSpoken; }
+function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken; }
 
 /* Hours */
 function isWeekend(dateISO) { const d = new Date(dateISO + "T00:00:00Z"); const day = d.getUTCDay(); return day === 0 || day === 6; }
@@ -240,7 +240,7 @@ function to24h(timeStr) {
   const m12 = /^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/.exec(s);
   if (m12) { hh = parseInt(m12[1] || "0", 10); mm = parseInt(m12[2] || "0", 10); const isPM = m12[3] === "PM"; if (hh === 12) hh = isPM ? 12 : 0; else if (isPM) hh += 12; }
   else { const m24 = /^(\d{1,2}):?(\d{2})$/.exec(s); if (!m24) return ""; hh = parseInt(m24[1] || "0", 10); mm = parseInt(m24[2] || "0", 10); }
-  return ${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")};
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
 function durationMinutesForService(service) {
   const s = (service || "").toLowerCase();
@@ -310,7 +310,7 @@ async function dashReadWindow(startISO, endISO) {
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
   if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
 
-  const e164 = phone && phone.length === 10 ? +1${phone} : phone || "";
+  const e164 = phone && phone.length === 10 ? `+1${phone}` : phone || "";
   const base = {
     biz: DASH_BIZ,
     source: DASH_SOURCE,
@@ -335,7 +335,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
   const payloadA = {
     ...base,
     event: addTimes({
-      summary: ${service || "Appointment"} (${name || "Guest"}),
+      summary: `${service || "Appointment"} (${name || "Guest"})`,
       type: service || "appointment",
       timezone: BIZ_TZ,
       customer: base.customer,
@@ -345,7 +345,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
   const payloadB = {
     ...base,
     appointment: addTimes({
-      title: ${service || "Appointment"} (${name || "Guest"}),
+      title: `${service || "Appointment"} (${name || "Guest"})`,
       type: service || "appointment",
       timezone: BIZ_TZ,
       customer: base.customer,
@@ -354,7 +354,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
   };
   const payloadC = {
     ...base,
-    title: ${service || "Appointment"} (${name || "Guest"}),
+    title: `${service || "Appointment"} (${name || "Guest"})`,
     ...addTimes({}),
     customer_name: base.customer.name,
     customer_phone: base.customer.phone,
@@ -363,7 +363,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
 
   const tryPost = async (label, payload) => {
     console.log("[CAL CREATE->]", label, DASH_CAL_CREATE_URL, preview(payload));
-    const { data } = await postJsonOrForm(DASH_CAL_CREATE_URL, payload, CAL_CREATE_${label});
+    const { data } = await postJsonOrForm(DASH_CAL_CREATE_URL, payload, `CAL_CREATE_${label}`);
     console.log("[CAL CREATE<-]", label, preview(data));
     return data;
   };
@@ -379,7 +379,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
       }
     }
   } catch (e) {
-    console.error("[DASH CREATE ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
+    console.error("[CAL CREATE ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     return { ok: false, event: null };
   }
 }
@@ -429,7 +429,7 @@ function startDeepgram({ onFinal }) {
     + "&endpointing=250";
 
   const dg = new WebSocket(url, {
-    headers: { Authorization: token ${DEEPGRAM_API_KEY} },
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
   });
 
@@ -491,7 +491,7 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
           ],
           ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
         },
-        { headers: { Authorization: Bearer ${OPENAI_API_KEY} } }
+        { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
       )
     );
     const out = resp.data.choices[0].message.content.trim();
@@ -519,7 +519,7 @@ async function say(ws, text) {
   }
 
   try {
-    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=4&output_format=ulaw_8000;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=4&output_format=ulaw_8000`;
     console.log("[TTS->]", url);
     const resp = await httpLog("TTS_STREAM", () =>
       axios.post(
@@ -560,7 +560,7 @@ async function askWithReaskAndGoodbye(ws, questionText) {
   ws.__lastQuestion = questionText;
   await say(ws, questionText);
   ws.__qTimer1 = setTimeout(async () => {
-    await say(ws, Sorry, I didn’t hear that. ${questionText});
+    await say(ws, `Sorry, I didn’t hear that. ${questionText}`);
     ws.__qTimer2 = setTimeout(async () => {
       await say(ws, "Thanks for calling Old Line Barbershop, have a great day!");
       await sleep(8000);
@@ -709,8 +709,8 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   const last4 = s.phone ? s.phone.slice(-4) : "";
   const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
   const line = updated
-    ? Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?
-    : Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?;
+    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
+    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
   await askWithReaskAndGoodbye(ws, line);
 }
 
@@ -731,16 +731,16 @@ function isoToLocalParts(iso, tz = BIZ_TZ) {
 function isoToDateTimeSpeech(iso) {
   const { dateISO, timeHHMM } = isoToLocalParts(iso);
   if (!dateISO || !timeHHMM) return "";
-  return ${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)};
+  return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
 function describeEventForSpeech(ev) {
   const start = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
   const summary = ev.summary || ev.Event_Name || ev.name || "";
   const who = ev.Customer_Name || "";
   const when = isoToDateTimeSpeech(start);
-  if (summary) return ${summary} on ${when};
-  if (who) return ${who}'s appointment on ${when};
-  return an appointment on ${when};
+  if (summary) return `${summary} on ${when}`;
+  if (who) return `${who}'s appointment on ${when}`;
+  return `an appointment on ${when}`;
 }
 function parseYesNo(text) {
   const t = (text || "").toLowerCase();
@@ -765,10 +765,10 @@ async function transferToOwner(ws) {
     return false;
   }
   try {
-    const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
-    const url = https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${ws.__callSid}.json;
+    const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${ws.__callSid}.json`;
     const form = new URLSearchParams();
-    form.append("Url", https://${host}/xfer);
+    form.append("Url", `https://${host}/xfer`);
     form.append("Method", "POST");
     await httpLog("TWILIO_TRANSFER", () =>
       axios.post(url, form, {
@@ -868,19 +868,19 @@ async function askForMissing(ws, state) {
   const missing = nextMissing(state);
   console.log(JSON.stringify({ event: "SLOTS", slots: s, missing }));
 
-  const key = ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone};
+  const key = `ask:${missing}:${s.service}:${s.date}:${s.time}:${s.name}:${s.phone}`;
   const now = Date.now();
   if (state.lastAskKey === key && (now - state.lastAskAt) < 1200) return;
   state.lastAskKey = key; state.lastAskAt = now;
 
   if (missing === "service") return askWithReaskAndGoodbye(ws, "Which service would you like — haircut, beard trim, or combo?");
   if (missing === "datetime") {
-    if (s.date && !s.time) return askWithReaskAndGoodbye(ws, What time on ${formatDateSpoken(s.date)} works for your ${s.service}?);
-    if (!s.date && s.time) return askWithReaskAndGoodbye(ws, What day works for your ${s.service} at ${to12h(s.time)}?);
-    return askWithReaskAndGoodbye(ws, What date and time would you like for your ${s.service || "appointment"}?);
+    if (s.date && !s.time) return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
+    if (!s.date && s.time) return askWithReaskAndGoodbye(ws, `What day works for your ${s.service} at ${to12h(s.time)}?`);
+    return askWithReaskAndGoodbye(ws, `What date and time would you like for your ${s.service || "appointment"}?`);
   }
   if (missing === "date") return askWithReaskAndGoodbye(ws, `What date works for your ${s.service}${s.time ? ` at ${to12h(s.time)}` : ""}?`);
-  if (missing === "time") return askWithReaskAndGoodbye(ws, What time on ${formatDateSpoken(s.date)} works for your ${s.service}?);
+  if (missing === "time") return askWithReaskAndGoodbye(ws, `What time on ${formatDateSpoken(s.date)} works for your ${s.service}?`);
   if (missing === "name") return askWithReaskAndGoodbye(ws, "Can I get your first name?");
   if (missing === "phone") return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
   if (missing === "done") {
@@ -912,11 +912,11 @@ async function classifyAndHandle(ws, state, transcript) {
   // Hard service/date shortcuts
   if (!state.slots.service) {
     const svcHard = normalizeService(lower);
-    if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, Got it: ${state.slots.service}.); return askForMissing(ws, state); }
+    if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, `Got it: ${state.slots.service}.`); return askForMissing(ws, state); }
   }
   if (!state.slots.date) {
-    if (/\b(?:tmr|tmrw|tmmrw|tomorrow)\b/.test(lower)) { state.slots.date = addDaysISO(nowInTZ(BIZ_TZ), 1); state.phase = state.phase || "booking"; await say(ws, Okay: ${formatDateSpoken(state.slots.date)}.); return askForMissing(ws, state); }
-    if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, Okay: ${formatDateSpoken(state.slots.date)}.); return askForMissing(ws, state); }
+    if (/\b(?:tmr|tmrw|tmmrw|tomorrow)\b/.test(lower)) { state.slots.date = addDaysISO(nowInTZ(BIZ_TZ), 1); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
+    if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
   }
 
   // NEW: if waiting for phone, parse it directly from the utterance
@@ -941,10 +941,10 @@ async function classifyAndHandle(ws, state, transcript) {
       const dateSpoken = pc?.dateISO ? formatDateSpoken(pc.dateISO) : "";
       const timeSpoken = pc?.timeHHMM ? to12h(pc.timeHHMM) : "";
       let answer = "";
-      if (askingTime && timeSpoken) answer = It’s at ${timeSpoken}.;
-      if (askingDate && dateSpoken) answer = It’s on ${dateSpoken}.;
+      if (askingTime && timeSpoken) answer = `It’s at ${timeSpoken}.`;
+      if (askingDate && dateSpoken) answer = `It’s on ${dateSpoken}.`;
       if (!answer && (pc?.spoken || "")) answer = pc.spoken + ".";
-      await askWithReaskAndGoodbye(ws, ${answer} Should I cancel it?);
+      await askWithReaskAndGoodbye(ws, `${answer} Should I cancel it?`);
       return;
     }
   }
@@ -954,8 +954,8 @@ async function classifyAndHandle(ws, state, transcript) {
     if (askingTime || askingDate) {
       const s = state.slots;
       const bits = [];
-      if (askingTime) bits.push(s.time ? We’re looking at ${to12h(s.time)} : We haven’t picked a time yet);
-      if (askingDate) bits.push(s.date ? on ${formatDateSpoken(s.date)} : and we still need a date);
+      if (askingTime) bits.push(s.time ? `We’re looking at ${to12h(s.time)}` : "We haven’t picked a time yet");
+      if (askingDate) bits.push(s.date ? `on ${formatDateSpoken(s.date)}` : "and we still need a date");
       await say(ws, bits.join(" ") + ".");
       return askForMissing(ws, state);
     }
@@ -1057,7 +1057,7 @@ Rules:
 
     ws.__pendingCancel = { eventId, spoken, dateISO: apptDateISO, timeHHMM: apptTimeHHMM, service, name: who };
     ws.__cancelFlow = { ...cf, active: false };
-    await askWithReaskAndGoodbye(ws, I found ${spoken}. Should I cancel it?);
+    await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
   }
 
@@ -1065,11 +1065,11 @@ Rules:
   if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
     const acks = [];
     for (const k of changedKeys) {
-      if (k === "service") acks.push(Got it: ${state.slots.service}.);
-      if (k === "date") acks.push(Okay: ${formatDateSpoken(state.slots.date)}.);
-      if (k === "time") acks.push(Noted: ${to12h(state.slots.time)}.);
-      if (k === "name") acks.push(Thanks, ${state.slots.name}.);
-      if (k === "phone") acks.push(Thanks. I’ve saved your number.);
+      if (k === "service") acks.push(`Got it: ${state.slots.service}.`);
+      if (k === "date") acks.push(`Okay: ${formatDateSpoken(state.slots.date)}.`);
+      if (k === "time") acks.push(`Noted: ${to12h(state.slots.time)}.`);
+      if (k === "name") acks.push(`Thanks, ${state.slots.name}.`);
+      if (k === "phone") acks.push("Thanks. I’ve saved your number.");
     }
     if (acks.length) await say(ws, acks.join(" "));
   }
@@ -1092,13 +1092,13 @@ Rules:
     if (parsed.faq_topic === "HOURS") answer = "We’re open Monday to Friday, nine A M to five P M. Closed weekends.";
     else if (parsed.faq_topic === "PRICES") {
       const svc = normalizeService(parsed.service || state.slots.service);
-      answer = (svc && priceTable[svc]) ? ${svc} is ${priceTable[svc]}. : "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
+      answer = (svc && priceTable[svc]) ? `${svc} is ${priceTable[svc]}.` : "Haircut is thirty dollars, beard trim is fifteen, and the combo is forty.";
     } else if (parsed.faq_topic === "SERVICES") answer = "We offer haircuts, beard trims, and the combo.";
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at one two three Blueberry Lane.";
     else answer = "Happy to help. What else can I answer?";
     if (state.phase === "booking") { await say(ws, answer); return askForMissing(ws, state); }
     if (state.phase === "confirmed") return say(ws, answer);
-    return say(ws, ${answer} Would you like to book an appointment or do you have another question?);
+    return say(ws, `${answer} Would you like to book an appointment or do you have another question?`);
   }
 
   if (parsed.intent === "TRANSFER") { const ok = await transferToOwner(ws); if (!ok) { try { ws.close(); } catch {} } return; }
@@ -1118,9 +1118,9 @@ Rules:
 
     const targetAsk = {
       "service": "Which service would you like — haircut, beard trim, or combo?",
-      "datetime": What date and time would you like for your ${state.slots.service || "appointment"}?,
+      "datetime": `What date and time would you like for your ${state.slots.service || "appointment"}?`,
       "date": `What date works for your ${state.slots.service}${state.slots.time ? ` at ${to12h(state.slots.time)}` : ""}?`,
-      "time": What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?,
+      "time": `What time on ${formatDateSpoken(state.slots.date)} works for your ${state.slots.service}?`,
       "name": "Can I get your first name?",
       "phone": "What phone number should I use for confirmations?"
     }[missing];
@@ -1129,7 +1129,7 @@ Rules:
   }
 
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    if (state.phase === "idle") return say(ws, All good. Would you like to book or ask a question?);
+    if (state.phase === "idle") return say(ws, "All good. Would you like to book or ask a question?");
     if (state.phase === "confirmed") return say(ws, "Happy to help.");
     return say(ws, "Okay.");
   }
