@@ -224,7 +224,6 @@ function isWithinHours(timeStr) {
 
 /* === TZ helpers: convert local wall time in BIZ_TZ to UTC ISO === */
 function parseShortOffset(off) {
-  // "GMT-4", "UTC+01", "GMT+00"
   const m = /(GMT|UTC)([+-])(\d{1,2})(?::?(\d{2}))?/i.exec(off || "");
   if (!m) return 0;
   const sign = m[2] === "-" ? -1 : 1;
@@ -233,29 +232,15 @@ function parseShortOffset(off) {
   return sign * (hh * 60 + mm);
 }
 function tzOffsetMinutesAt(tz, approxUtcMs) {
-  // Use timeZoneName 'shortOffset' to read the numeric GMT offset at that instant.
   const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" });
   const parts = dtf.formatToParts(new Date(approxUtcMs));
   const off = (parts.find(p => p.type === "timeZoneName") || {}).value || "GMT+00";
   return parseShortOffset(off);
 }
 function wallTimeToUtcMs({ Y, M, D, h, m }, tz) {
-  // Start from UTC guess, then adjust by the offset at that instant.
   const utcGuess = Date.UTC(Y, M - 1, D, h, m, 0);
   const offMin = tzOffsetMinutesAt(tz, utcGuess);
-  // If local = wall, then UTC = local time - offset
   return utcGuess - offMin * 60 * 1000;
-}
-function buildStartEndISO(dateISO, timeStr, service) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO || "");
-  const hhmm = to24h(timeStr);
-  if (!m || !hhmm) return { startISO: "", endISO: "" };
-  const [Y, M, D] = [parseInt(m[1],10), parseInt(m[2],10), parseInt(m[3],10)];
-  const [h, mm] = hhmm.split(":").map(Number);
-  const startMs = wallTimeToUtcMs({ Y, M, D, h, m: mm }, BIZ_TZ);
-  const mins = durationMinutesForService(service);
-  const endMs = startMs + mins * 60000;
-  return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString() };
 }
 function durationMinutesForService(service) {
   const s = (service || "").toLowerCase();
@@ -263,6 +248,26 @@ function durationMinutesForService(service) {
   if (s === "beard trim") return 15;
   if (s === "combo") return 45;
   return 30;
+}
+function to24h(timeStr) {
+  if (!timeStr) return "";
+  const s = timeStr.trim().toUpperCase();
+  let hh = 0, mm = 0;
+  const m12 = /^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/.exec(s);
+  if (m12) { hh = parseInt(m12[1] || "0", 10); mm = parseInt(m12[2] || "0", 10); const isPM = m12[3] === "PM"; if (hh === 12) hh = isPM ? 12 : 0; else if (isPM) hh += 12; }
+  else { const m24 = /^(\d{1,2}):?(\d{2})$/.exec(s); if (!m24) return ""; hh = parseInt(m24[1] || "0", 10); mm = parseInt(m24[2] || "0", 10); }
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+function buildStartEndISO(dateISO, timeStr, service) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO || "");
+  const hhmm = to24h(timeStr);
+  if (!match || !hhmm) return { startISO: "", endISO: "" };
+  const [Y, M, D] = [parseInt(match[1],10), parseInt(match[2],10), parseInt(match[3],10)];
+  const [h, mm] = hhmm.split(":").map(Number);
+  const startMs = wallTimeToUtcMs({ Y, M, D, h, m: mm }, BIZ_TZ);
+  const mins = durationMinutesForService(service);
+  const endMs = startMs + mins * 60000;
+  return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString() };
 }
 function dayBoundsISO(dateISO) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO || "");
@@ -272,7 +277,11 @@ function dayBoundsISO(dateISO) {
   const endMs   = wallTimeToUtcMs({ Y, M, D, h: 23, m: 59 }, BIZ_TZ);
   return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString() };
 }
-function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken; }
+function humanWhen(dateISO, timeStr) {
+  const dSpoken = formatDateSpoken(dateISO);
+  const tSpoken = to12h(timeStr);
+  return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken;
+}
 
 /* Follow-ups */
 function extractServiceFromSummary(summary) { const m = /^([^(]+)\s*\(/.exec(String(summary || "")); return m ? m[1].trim().toLowerCase() : ""; }
@@ -314,7 +323,7 @@ async function dashReadWindow(startISO, endISO) {
   }
 }
 
-/* create: try several shapes with time-key synonyms */
+/* create: unchanged from your last working build */
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
   if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
 
@@ -421,6 +430,17 @@ function eventsOverlap(aStart, aEnd, bStart, bEnd) {
   const B1 = new Date(bStart).getTime();
   const B2 = new Date(bEnd).getTime();
   return A1 < B2 && B1 < A2;
+}
+
+/* ===== Handle vendors that saved local wall time as Z ===== */
+function shiftAssumingZWasLocal(iso, tz) {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return "";
+  const offMin = tzOffsetMinutesAt(tz, t);
+  // if event was saved as "local" but tagged Z, true UTC should be +offset
+  const corrected = t + offMin * 60 * 1000;
+  return new Date(corrected).toISOString();
 }
 
 /* ===== DEEPGRAM ===== */
@@ -675,53 +695,6 @@ async function createViaDashIfFree(ws, state) {
   return { ok: true, startISO, endISO, eventId };
 }
 
-async function triggerConfirm(ws, state, { updated=false } = {}) {
-  const s = state.slots;
-  const when = humanWhen(s.date, s.time);
-  console.log(JSON.stringify({ event: "CONFIRM_READY", slots: s, whenSpoken: when }));
-
-  const snap = JSON.stringify(s);
-  if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
-
-  const calRes = await createViaDashIfFree(ws, state);
-  console.log("[CONFIRM] createViaDashIfFree ->", calRes);
-  if (!calRes.ok) {
-    if (calRes.reason === "conflict") {
-      await say(ws, "That time just became unavailable. What other time that day works?");
-      state.slots.time = ""; state.phase = "booking";
-      return await askForMissing(ws, state);
-    }
-    await say(ws, "I couldn’t lock that time just now. What other time works?");
-    state.slots.time = ""; state.phase = "booking";
-    return await askForMissing(ws, state);
-  }
-
-  state.phase = "confirmed";
-  state.lastConfirmSnapshot = snap;
-
-  try {
-    if (DASH_LEAD_UPSERT_URL) {
-      const lead = {
-        biz: DASH_BIZ, source: DASH_SOURCE,
-        phone: s.phone || ws.__callerFrom || "",
-        name: s.name || "",
-        intent: "book",
-        service: s.service || "",
-        last_convo_id: ws.__convoId
-      };
-      console.log("[LEAD UPSERT->]", DASH_LEAD_UPSERT_URL, preview(lead));
-      await httpLog("LEAD_UPSERT", () => axios.post(DASH_LEAD_UPSERT_URL, lead, { timeout: 6000 }));
-    }
-  } catch (e) { console.error("[LEAD UPSERT ERROR]", e.message); }
-
-  const last4 = s.phone ? s.phone.slice(-4) : "";
-  const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
-  const line = updated
-    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
-    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
-  await askWithReaskAndGoodbye(ws, line);
-}
-
 /* ===== CANCEL ===== */
 function isoToLocalParts(iso, tz = BIZ_TZ) {
   try {
@@ -742,10 +715,11 @@ function isoToDateTimeSpeech(iso) {
   return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
 function describeEventForSpeech(ev) {
-  const start = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
+  const raw = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
+  const alt = shiftAssumingZWasLocal(raw, BIZ_TZ) || raw;
   const summary = ev.summary || ev.Event_Name || ev.name || "";
   const who = ev.Customer_Name || "";
-  const when = isoToDateTimeSpeech(start);
+  const when = isoToDateTimeSpeech(alt);
   if (summary) return `${summary} on ${when}`;
   if (who) return `${who}'s appointment on ${when}`;
   return `an appointment on ${when}`;
@@ -792,7 +766,7 @@ async function transferToOwner(ws) {
   }
 }
 
-/* ===== CALL ARTIFACTS (with to_number) ===== */
+/* ===== CALL ARTIFACTS ===== */
 async function pushCallArtifacts(ws) {
   const call_id = ws.__callSid || ws.__convoId || "";
   const to_number = ws.__calledTo || DEST_NUMBER || "";
@@ -862,8 +836,6 @@ async function pushCallArtifacts(ws) {
 }
 
 /* ===== DIALOG ===== */
-
-/* capture phone numbers directly */
 function extractPhoneFromText(text) {
   if (!text) return "";
   const digits = text.replace(/[^\d]/g, "");
@@ -892,7 +864,7 @@ async function askForMissing(ws, state) {
   if (missing === "name") return askWithReaskAndGoodbye(ws, "Can I get your first name?");
   if (missing === "phone") return askWithReaskAndGoodbye(ws, "What phone number should I use for confirmations?");
   if (missing === "done") {
-    const check = enforceBusinessWindow(state);
+    const check = isWeekend(s.date) || !isWithinHours(s.time) ? { ok: false, reason: isWeekend(s.date) ? "weekend" : "hours" } : { ok: true };
     if (!check.ok) {
       if (check.reason === "weekend") return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
       if (check.reason === "hours") return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
@@ -904,106 +876,9 @@ async function askForMissing(ws, state) {
 
 async function classifyAndHandle(ws, state, transcript) {
   clearQuestionTimers(ws);
-
-  if (ws.__awaitingAnythingElse) {
-    if (saysDone(transcript)) { ws.__awaitingAnythingElse = false; return gracefulGoodbye(ws); }
-    ws.__awaitingAnythingElse = false;
-  }
-
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
-  ws.__calledTo = ws.__calledTo || (ws.__twilioTo || "");
-
-  const lower = String(transcript || "").toLowerCase();
-
-  // reschedule keyword -> treat as booking update
-  if (/\breschedul(e|ing|e\s+it)\b/.test(lower)) {
-    state.phase = "booking";
-    await say(ws, "Sure — what new date and time would you like?");
-    return;
-  }
-
-  // Hard service/date shortcuts
-  if (!state.slots.service) {
-    const svcHard = normalizeService(lower);
-    if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, `Got it: ${state.slots.service}.`); return askForMissing(ws, state); }
-  }
-  if (!state.slots.date) {
-    if (/\b(?:tmr|tmrw|tmmrw|tomorrow)\b/.test(lower)) { state.slots.date = addDaysISO(nowInTZ(BIZ_TZ), 1); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
-    if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
-  }
-
-  // When waiting for phone, parse it directly
-  const needPhone = nextMissing(state) === "phone";
-  if (needPhone) {
-    const ph = extractPhoneFromText(transcript);
-    if (ph) {
-      const before = { ...state.slots };
-      state.slots.phone = ph;
-      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "regex_phone" }));
-      await say(ws, "Thanks. I’ve saved your number.");
-      return askForMissing(ws, state);
-    }
-  }
-
-  // Cancel flow Q&A
-  if (ws.__pendingCancel && transcript) {
-    const askingTime = isAskingTime(transcript);
-    const askingDate = isAskingDate(transcript);
-    if (askingTime || askingDate) {
-      const pc = ws.__pendingCancel;
-      const dateSpoken = pc?.dateISO ? formatDateSpoken(pc.dateISO) : "";
-      const timeSpoken = pc?.timeHHMM ? to12h(pc.timeHHMM) : "";
-      let answer = "";
-      if (askingTime && timeSpoken) answer = `It’s at ${timeSpoken}.`;
-      if (askingDate && dateSpoken) answer = `It’s on ${dateSpoken}.`;
-      if (!answer && (pc?.spoken || "")) answer = pc.spoken + ".";
-      await askWithReaskAndGoodbye(ws, `${answer} Should I cancel it?`);
-      return;
-    }
-  }
-  if (state.phase === "booking" && transcript) {
-    const askingTime = isAskingTime(transcript);
-    const askingDate = isAskingDate(transcript);
-    if (askingTime || askingDate) {
-      const s = state.slots;
-      const bits = [];
-      if (askingTime) bits.push(s.time ? `We’re looking at ${to12h(s.time)}` : `We haven’t picked a time yet`);
-      if (askingDate) bits.push(s.date ? `on ${formatDateSpoken(s.date)}` : `and we still need a date`);
-      await say(ws, bits.join(" ") + ".");
-      return askForMissing(ws, state);
-    }
-  }
-
-  if (ws.__pendingCancel && transcript) {
-    const yn = parseYesNo(transcript);
-    if (yn === "yes") {
-      const eventId = ws.__pendingCancel.eventId;
-      ws.__pendingCancel = null;
-      const del = await dashDeleteEvent(eventId);
-      if (del.ok) { await say(ws, "All set — your appointment has been canceled. Anything else I can help with?"); ws.__awaitingAnythingElse = true; }
-      else { await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?"); }
-      return;
-    } else if (yn === "no") {
-      ws.__pendingCancel = null;
-      const cf = ws.__cancelFlow && typeof ws.__cancelFlow === "object" ? ws.__cancelFlow : { dateISO: "", timeStr: "" };
-      ws.__cancelFlow = { ...cf, active: true };
-      await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
-      return;
-    }
-  }
-
-  if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
-    const filled = normalizePhone(ws.__callerFrom);
-    if (filled) {
-      const before = { ...state.slots };
-      state.slots.phone = filled;
-      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "callerFrom" }));
-      await say(ws, "Got it. I’ll use this number.");
-      return askForMissing(ws, state);
-    }
-  }
-
+  // cancel flow and CANCEL intent must run BEFORE any slot-fill shortcuts
   const systemPrompt = `
 Return STRICT JSON:{
  "intent":"FAQ"|"BOOK"|"CANCEL"|"DECLINE_BOOK"|"TRANSFER"|"END"|"SMALLTALK"|"UNKNOWN",
@@ -1020,11 +895,8 @@ Rules:
     const res = await askGPT(systemPrompt, transcript, "json");
     parsed = JSON.parse(res || "{}");
   } catch {}
-  console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
 
-  if (state.phase === "confirmed") clearGoodbyeTimers(ws);
-
-  // explicit cancel intent entry-point
+  // First: explicit CANCEL intent
   if (parsed.intent === "CANCEL") {
     const d0 = normalizeDate(parsed.date) || "";
     const t0 = parsed.time || "";
@@ -1034,7 +906,7 @@ Rules:
     return;
   }
 
-  // cancel flow resolver
+  // Resolve an active cancel flow before anything else
   if (ws.__cancelFlow?.active) {
     const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
     const newDate = normalizeDate(parsed.date) || "";
@@ -1061,11 +933,18 @@ Rules:
     const phone = state.slots.phone || "";
     let target = null;
     for (const ev of read.events) {
-      const evStart = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
-      const evEnd   = ev.End_Time   || ev.end   || ev.end_time   || ev.endISO || evStart;
+      const evStartRaw = ev.Start_Time || ev.start || ev.start_time || ev.startISO;
+      const evEndRaw   = ev.End_Time   || ev.end   || ev.end_time   || ev.endISO || evStartRaw;
+      const evStartShift = shiftAssumingZWasLocal(evStartRaw, BIZ_TZ);
+      const evEndShift   = shiftAssumingZWasLocal(evEndRaw, BIZ_TZ);
       const evPhone = normalizePhone(ev.Customer_Phone || ev.phone || "");
-      const timeMatch = evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
+
+      const timeMatch =
+        (evStartRaw && evEndRaw && eventsOverlap(startISO, endISO, evStartRaw, evEndRaw)) ||
+        (evStartShift && evEndShift && eventsOverlap(startISO, endISO, evStartShift, evEndShift));
+
       const phoneMatch = phone && evPhone ? evPhone.endsWith(phone.slice(-4)) : true;
+
       if (timeMatch && phoneMatch) { target = ev; break; }
     }
     if (!target) target = read.events[0];
@@ -1074,19 +953,87 @@ Rules:
     if (!eventId) { await askWithReaskAndGoodbye(ws, "I found an appointment but couldn’t identify its ID. What’s the exact time?"); return; }
 
     const spoken = describeEventForSpeech(target);
-    const startStr = target.Start_Time || target.start || target.start_time || target.startISO || "";
-    const { dateISO: apptDateISO, timeHHMM: apptTimeHHMM } = isoToLocalParts(startStr);
-    const summary = target.summary || target.Event_Name || target.name || "";
-    const service = extractServiceFromSummary(summary);
-    const who = target.Customer_Name || "";
-
-    ws.__pendingCancel = { eventId, spoken, dateISO: apptDateISO, timeHHMM: apptTimeHHMM, service, name: who };
+    ws.__pendingCancel = { eventId, spoken };
     ws.__cancelFlow = { ...cf, active: false };
     await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
   }
 
-  const { changed, changedKeys } = mergeSlots(state, parsed);
+  // If caller asks time/date about pending cancel choice
+  if (ws.__pendingCancel && transcript) {
+    const askingTime = isAskingTime(transcript);
+    const askingDate = isAskingDate(transcript);
+    if (askingTime || askingDate) {
+      const pc = ws.__pendingCancel;
+      const answer = pc.spoken ? pc.spoken + "." : "I have it here.";
+      await askWithReaskAndGoodbye(ws, `${answer} Should I cancel it?`);
+      return;
+    }
+    const yn = parseYesNo(transcript);
+    if (yn === "yes") {
+      const eventId = ws.__pendingCancel.eventId;
+      ws.__pendingCancel = null;
+      const del = await dashDeleteEvent(eventId);
+      if (del.ok) { await say(ws, "All set — your appointment has been canceled. Anything else I can help with?"); ws.__awaitingAnythingElse = true; }
+      else { await say(ws, "I couldn’t cancel that just now. Would you like me to try again or cancel a different time?"); }
+      return;
+    } else if (yn === "no") {
+      ws.__pendingCancel = null;
+      ws.__cancelFlow = { active: true, dateISO: "", timeStr: "" };
+      await askWithReaskAndGoodbye(ws, "Okay — which date and time should I cancel?");
+      return;
+    }
+  }
+
+  // From here on: normal booking/faq/etc
+
+  const lower = String(transcript || "").toLowerCase();
+
+  // reschedule intent words
+  if (/\breschedul(e|ing|e\s+it)\b/.test(lower)) {
+    state.phase = "booking";
+    await say(ws, "Sure — what new date and time would you like?");
+    return;
+  }
+
+  // Slot-fill shortcuts (executed only if NOT in cancel flows)
+  if (!state.slots.service) {
+    const svcHard = normalizeService(lower);
+    if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, `Got it: ${state.slots.service}.`); return askForMissing(ws, state); }
+  }
+  if (!state.slots.date) {
+    if (/\b(?:tmr|tmrw|tmmrw|tomorrow)\b/.test(lower)) { state.slots.date = addDaysISO(nowInTZ(BIZ_TZ), 1); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
+    if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
+  }
+
+  // Phone capture when requested
+  const needPhone = nextMissing(state) === "phone";
+  if (needPhone) {
+    const ph = extractPhoneFromText(transcript);
+    if (ph) {
+      const before = { ...state.slots };
+      state.slots.phone = ph;
+      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "regex_phone" }));
+      await say(ws, "Thanks. I’ve saved your number.");
+      return askForMissing(ws, state);
+    }
+  }
+
+  // If they say "use this number"
+  if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
+    const filled = normalizePhone(ws.__callerFrom);
+    if (filled) {
+      const before = { ...state.slots };
+      state.slots.phone = filled;
+      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "callerFrom" }));
+      await say(ws, "Got it. I’ll use this number.");
+      return askForMissing(ws, state);
+    }
+  }
+
+  console.log(JSON.stringify({ event: "GPT_CLASSIFY", transcript, parsed }));
+  if (state.phase === "confirmed") clearGoodbyeTimers(ws);
+
   if (parsed.intent === "END") return gracefulGoodbye(ws);
   if (parsed.intent === "DECLINE_BOOK") { state.phase = "idle"; return say(ws, "No problem. How else can I help?"); }
 
@@ -1107,16 +1054,15 @@ Rules:
 
   if (parsed.intent === "TRANSFER") { const ok = await transferToOwner(ws); if (!ok) { try { ws.close(); } catch {} } return; }
 
+  const { changed, changedKeys } = mergeSlots(state, parsed);
+
   if (parsed.intent === "BOOK" || state.phase === "booking") {
     if (state.phase !== "booking") state.phase = "booking";
     const missing = nextMissing(state);
     if (missing === "done") {
-      const check = enforceBusinessWindow(state);
-      if (!check.ok) {
-        if (check.reason === "weekend") return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
-        if (check.reason === "hours") return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
-      }
-      return triggerConfirm(ws, state, { updated: /reschedul/i.test(ws.__lines?.slice(-1)[0]?.text || "") });
+      if (isWeekend(state.slots.date)) return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
+      if (!isWithinHours(state.slots.time)) return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
+      return triggerConfirm(ws, state);
     }
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) return askForMissing(ws, state);
 
@@ -1161,16 +1107,8 @@ wss.on("connection", (ws) => {
       ws.__awaitingAnythingElse = false;
       ws.__lines = [];
       ws.__startedAt = Date.now();
-      clearGoodbyeTimers(ws);
-      clearQuestionTimers(ws);
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid }));
-
-      dg = startDeepgram({
-        onFinal: async (text) => {
-          try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); }
-        }
-      });
-
+      dg = startDeepgram({ onFinal: async (text) => { try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); } } });
       await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
       return;
     }
@@ -1197,8 +1135,6 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    clearQuestionTimers(ws);
-    clearGoodbyeTimers(ws);
     try { dg?.close(); } catch {}
     pushCallArtifacts(ws).catch(()=>{});
     console.log("[INFO] WS closed", { convoId: ws.__convoId });
