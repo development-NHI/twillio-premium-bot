@@ -1,5 +1,5 @@
 // server.js — Old Line Barbershop AI Receptionist (Deepgram + GPT + ElevenLabs + Dashboard)
-// Targeted fixes: latency, service/date parsing, transfer, deterministic replies, dashboard hooks.
+// Targeted fixes + TEMP LOGGING for diagnosis.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -34,6 +34,12 @@ dotenv.config();
    - Replaced Make.com hooks with dashboard endpoints for calendar read/create/cancel.
    - Lead upsert on confirmation.
    - Call transcript + summary pushed at hangup.
+
+   [Logging]
+   - Boot config dump (URLs, tz, biz/source).
+   - HTTP request/response timing for calendar, leads, call logs, GPT, TTS.
+   - Payload previews (redacted phone/email tokens).
+   - WS lifecycle and slot changes already logged; kept and expanded.
 */
 
 const PORT = process.env.PORT || 5000;
@@ -62,8 +68,53 @@ const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // E.164
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // your Twilio number to present when transferring
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional
 
+/* ---------- Logging helpers (temporary) ---------- */
+const redact = (s) => {
+  if (!s || typeof s !== "string") return s;
+  // redact long tokens, emails, phones
+  if (s.startsWith("sk-") || s.length > 24) return s.slice(0, 6) + "…redacted…" + s.slice(-4);
+  const emailRE = /([A-Z0-9._%+-]+)@([A-Z0-9.-]+\.[A-Z]{2,})/ig;
+  const phoneRE = /\b(\+?\d{1,3})?[\s\-\.]?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}\b/g;
+  return s.replace(emailRE, (_, a, b) => a[0] + "…@" + b)
+          .replace(phoneRE, (m) => m.slice(0, 2) + "…redacted…");
+};
+const preview = (obj) => {
+  try {
+    return JSON.stringify(obj, (k, v) => {
+      if (k === "phone" || k === "email") return redact(String(v || ""));
+      if (typeof v === "string") return redact(v);
+      return v;
+    });
+  } catch { return "[unserializable]"; }
+};
+const httpLog = async (label, fn) => {
+  const t0 = Date.now();
+  try {
+    const out = await fn();
+    const ms = Date.now() - t0;
+    console.log(`[HTTP OK] ${label} ${ms}ms`);
+    return out;
+  } catch (e) {
+    const ms = Date.now() - t0;
+    const status = e?.response?.status;
+    const body = e?.response?.data;
+    console.error(`[HTTP ERR] ${label} ${ms}ms status=${status} body=${preview(body)} msg=${e.message}`);
+    throw e;
+  }
+};
+
+/* ---------- Boot-time config dump ---------- */
+console.log("[CFG] PORT", PORT);
+console.log("[CFG] BIZ_TZ", BIZ_TZ);
+console.log("[CFG] DASH_BIZ", DASH_BIZ, "DASH_SOURCE", DASH_SOURCE);
+console.log("[CFG] CAL_READ", DASH_CAL_READ_URL);
+console.log("[CFG] CAL_CREATE", DASH_CAL_CREATE_URL);
+console.log("[CFG] CAL_CANCEL", DASH_CAL_CANCEL_URL);
+console.log("[CFG] LEAD_UPSERT", DASH_LEAD_UPSERT_URL);
+console.log("[CFG] CALL_LOG", DASH_CALL_LOG_URL);
+console.log("[CFG] CALL_SUMMARY", DASH_CALL_SUMMARY_URL);
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
 if (!DEEPGRAM_API_KEY) console.warn("(!) DEEPGRAM_API_KEY missing");
 if (!ELEVENLABS_API_KEY) console.warn("(!) ELEVENLABS_API_KEY missing");
@@ -77,6 +128,7 @@ app.get("/", (_, res) => res.status(200).send("✅ Old Line Barbershop AI Recept
 app.post("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  console.log("[TwiML] Using host", host);
   const twiml = `
     <Response>
       <Connect>
@@ -93,6 +145,7 @@ app.post("/twiml", (req, res) => {
 app.post("/xfer", (req, res) => {
   res.set("Content-Type", "text/xml");
   const callerAttr = TWILIO_CALLER_ID ? ` callerId="${TWILIO_CALLER_ID}"` : "";
+  console.log("[XFER] owner", redact(OWNER_PHONE), "callerId", redact(TWILIO_CALLER_ID));
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stop><Stream name="dg"/></Stop>
@@ -259,7 +312,7 @@ function buildStartEndISO(dateISO, timeStr, service) {
   const start = new Date(Date.UTC(Y, M - 1, D, h, m, 0));
   const mins = durationMinutesForService(service);
   const end = new Date(start.getTime() + mins * 60000);
-  const iso = (d) => `${d.toISOString().slice(0,19)}`;
+  const iso = (d) => `${d.toISOString().slice(0,19)}`; // keep original format
   return { startISO: iso(start), endISO: iso(end) };
 }
 function dayBoundsISO(dateISO) {
@@ -277,16 +330,16 @@ function isAskingDate(text) { return /\b(what (?:date|day)|which (?:date|day))\b
 
 /* === Dashboard calendar + helpers === */
 async function dashReadWindow(startISO, endISO) {
-  if (!DASH_CAL_READ_URL) return { ok: false, events: [], reason: "no_url" };
+  if (!DASH_CAL_READ_URL) { console.error("[CAL READ] no URL"); return { ok: false, events: [], reason: "no_url" }; }
   try {
     const payload = { biz: DASH_BIZ, source: DASH_SOURCE, window: { start: startISO, end: endISO } };
-    const { data } = await axios.post(DASH_CAL_READ_URL, payload, { timeout: 12000 });
-
+    console.log("[CAL READ->]", DASH_CAL_READ_URL, preview(payload));
+    const { data } = await httpLog("CAL_READ", () => axios.post(DASH_CAL_READ_URL, payload, { timeout: 12000 }));
+    console.log("[CAL READ<-]", preview(data));
     let raw = data?.events ?? data?.event ?? null;
     let events = [];
     if (Array.isArray(raw)) events = raw;
     else if (raw && typeof raw === "object") { if (Array.isArray(raw.array)) events = raw.array; else events = [raw]; }
-
     const ok = (data && (data.ok === true || data.ok === "true")) || events.length >= 0;
     return { ok, events };
   } catch (e) {
@@ -295,7 +348,7 @@ async function dashReadWindow(startISO, endISO) {
   }
 }
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
-  if (!DASH_CAL_CREATE_URL) return { ok: false, event: null };
+  if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
   try {
     const payload = {
       biz: DASH_BIZ, source: DASH_SOURCE,
@@ -306,28 +359,32 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
         notes: notes || service || ""
       }
     };
-    const { data } = await axios.post(DASH_CAL_CREATE_URL, payload, { timeout: 10000 });
+    console.log("[CAL CREATE->]", DASH_CAL_CREATE_URL, preview(payload));
+    const { data } = await httpLog("CAL_CREATE", () => axios.post(DASH_CAL_CREATE_URL, payload, { timeout: 10000 }));
+    console.log("[CAL CREATE<-]", preview(data));
     return { ok: true, event: data || null };
   } catch (e) {
-    console.error("[DASH CREATE ERROR]", e.message);
+    console.error("[DASH CREATE ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     return { ok: false, event: null };
   }
 }
 async function dashDeleteEvent(event_id) {
-  if (!DASH_CAL_CANCEL_URL) return { ok: false };
+  if (!DASH_CAL_CANCEL_URL) { console.error("[CAL CANCEL] no URL"); return { ok: false }; }
   try {
     const payload = { biz: DASH_BIZ, source: DASH_SOURCE, event_id };
-    const resp = await axios.post(DASH_CAL_CANCEL_URL, payload, { timeout: 10000 });
+    console.log("[CAL CANCEL->]", DASH_CAL_CANCEL_URL, preview(payload));
+    const resp = await httpLog("CAL_CANCEL", () => axios.post(DASH_CAL_CANCEL_URL, payload, { timeout: 10000 }));
     const { status, data } = resp;
+    console.log("[CAL CANCEL<-]", status, preview(data));
     let ok =
       (status >= 200 && status < 300) ||
       data?.ok === true || data?.ok === "true" ||
       data?.success === true || data?.status === "ok" ||
       data?.deleted === true || data?.result === "deleted" ||
-      (typeof data === "string" && /^(ok|success|deleted)$/i.test(data.trim()));
+      (typeof data === "string" && /^(ok|success|deleted)$/i.test(String(data).trim()));
     return { ok: !!ok };
   } catch (e) {
-    console.error("[DASH CANCEL ERROR]", e.message);
+    console.error("[DASH CANCEL ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     return { ok: false };
   }
 }
@@ -375,7 +432,7 @@ function startDeepgram({ onFinal }) {
   dg.on("close", () => console.log("[Deepgram closed]"));
 
   return {
-    sendPCM16LE(buf) { try { dg.send(buf); } catch {} },
+    sendPCM16LE(buf) { try { dg.send(buf); } catch { console.error("[Deepgram send error]"); } },
     close() { try { dg.close(); } catch {} }
   };
 }
@@ -402,22 +459,27 @@ function ulawBufferToPCM16LEBuffer(ulawBuf) {
 /* ----------------------- GPT ----------------------- */
 async function askGPT(systemPrompt, userPrompt, response_format = "text") {
   try {
-    const resp = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
-      },
-      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    console.log("[GPT->] model=gpt-4o-mini format=", response_format);
+    const resp = await httpLog("GPT", () =>
+      axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          ...(response_format === "json" ? { response_format: { type: "json_object" } } : {}),
+        },
+        { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+      )
     );
-    return resp.data.choices[0].message.content.trim();
+    const content = resp.data.choices?.[0]?.message?.content?.trim() || "";
+    console.log("[GPT<-] len=", content.length);
+    return content;
   } catch (e) {
-    console.error("[GPT ERROR]", e.message);
+    console.error("[GPT ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     return "";
   }
 }
@@ -425,7 +487,6 @@ async function askGPT(systemPrompt, userPrompt, response_format = "text") {
 /* ----------------------- TTS ----------------------- */
 async function say(ws, text) {
   if (!text) return;
-  // capture bot line
   try { (ws.__lines ||= []).push({ role: "assistant", at: Date.now(), text }); } catch {}
 
   const streamSid = ws.__streamSid;
@@ -440,10 +501,13 @@ async function say(ws, text) {
 
   try {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=4&output_format=ulaw_8000`;
-    const resp = await axios.post(
-      url,
-      { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
-      { headers: { "xi-api-key": ELEVENLABS_API_KEY }, responseType: "stream" }
+    console.log("[TTS->]", url);
+    const resp = await httpLog("TTS_STREAM", () =>
+      axios.post(
+        url,
+        { text, voice_settings: { stability: 0.4, similarity_boost: 0.8 } },
+        { headers: { "xi-api-key": ELEVENLABS_API_KEY }, responseType: "stream" }
+      )
     );
 
     await new Promise((resolve) => {
@@ -454,12 +518,10 @@ async function say(ws, text) {
         } catch (_) {}
       });
       resp.data.on("end", () => {
-        try {
-          ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } }));
-        } catch (_) {}
+        try { ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "eos" } })); } catch (_) {}
         setTimeout(resolve, 150);
       });
-      resp.data.on("error", () => resolve());
+      resp.data.on("error", (err) => { console.error("[TTS stream error]", err?.message); resolve(); });
       resp.data.on("close", () => resolve());
     });
   } catch (e) {
@@ -491,7 +553,7 @@ async function askWithReaskAndGoodbye(ws, questionText) {
 /* ----------------------- State & Slots ----------------------- */
 function newState() {
   return {
-    phase: "idle", // idle | booking | confirmed
+    phase: "idle",
     slots: { service: "", date: "", time: "", name: "", phone: "" },
     lastConfirmSnapshot: "",
     clarify: { service:0, date:0, time:0, name:0, phone:0 },
@@ -556,6 +618,7 @@ function armGoodbyeSilence(ws) {
 async function createViaDashIfFree(ws, state) {
   const s = state.slots;
   const { startISO, endISO } = buildStartEndISO(s.date, s.time, s.service);
+  console.log("[BOOK] computed window", { startISO, endISO, service: s.service });
   if (!startISO || !endISO) return { ok: false, reason: "bad_time" };
 
   const read = await dashReadWindow(startISO, endISO);
@@ -569,12 +632,14 @@ async function createViaDashIfFree(ws, state) {
     const evEnd   = ev.End_Time   || ev.end   || ev.end_time   || ev.endISO || evStart;
     return evStart && evEnd && eventsOverlap(startISO, endISO, evStart, evEnd);
   });
+  console.log("[BOOK] conflict", !!conflict, "events", read.events?.length || 0);
   if (conflict) return { ok: false, reason: "conflict" };
 
   const created = await dashCreateEvent({
     name: s.name, phone: s.phone, email: "", notes: s.service,
     startISO, endISO, service: s.service
   });
+  console.log("[BOOK] create result ok?", created.ok);
   if (!created.ok) return { ok: false, reason: "create_failed" };
 
   const eventId = created.event?.event_id || created.event?.id || created.event?.eventId || null;
@@ -591,6 +656,7 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
   if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
 
   const calRes = await createViaDashIfFree(ws, state);
+  console.log("[CONFIRM] createViaDashIfFree ->", calRes);
   if (!calRes.ok) {
     if (calRes.reason === "conflict") {
       await say(ws, "That time just became unavailable. What other time that day works?");
@@ -616,7 +682,8 @@ async function triggerConfirm(ws, state, { updated=false } = {}) {
         service: s.service || "",
         last_convo_id: ws.__convoId
       };
-      await axios.post(DASH_LEAD_UPSERT_URL, lead, { timeout: 6000 });
+      console.log("[LEAD UPSERT->]", DASH_LEAD_UPSERT_URL, preview(lead));
+      await httpLog("LEAD_UPSERT", () => axios.post(DASH_LEAD_UPSERT_URL, lead, { timeout: 6000 }));
     }
   } catch (e) { console.error("[LEAD UPSERT ERROR]", e.message); }
 
@@ -686,13 +753,16 @@ async function transferToOwner(ws) {
     const form = new URLSearchParams();
     form.append("Url", `https://${host}/xfer`);
     form.append("Method", "POST");
-    await axios.post(url, form, {
-      auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }
-    });
+    console.log("[XFER→Twilio]", url, "Url=", `https://${host}/xfer`);
+    await httpLog("TWILIO_REDIRECT", () =>
+      axios.post(url, form, {
+        auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }
+      })
+    );
     return true;
   } catch (e) {
-    console.error("[TWILIO TRANSFER ERROR]", e.message);
+    console.error("[TWILIO TRANSFER ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data));
     await say(ws, "I couldn’t transfer right now. I’ll have the owner call you back.");
     return false;
   }
@@ -713,15 +783,18 @@ async function pushCallArtifacts(ws) {
     transcript: ws.__lines || []
   };
   try {
-    if (DASH_CALL_LOG_URL) await axios.post(DASH_CALL_LOG_URL, payload, { timeout: 8000 });
-  } catch (e) { console.error("[CALL LOG ERROR]", e.message); }
+    if (DASH_CALL_LOG_URL) {
+      console.log("[CALL LOG->]", DASH_CALL_LOG_URL, "size=", (payload.transcript || []).length);
+      await httpLog("CALL_LOG", () => axios.post(DASH_CALL_LOG_URL, payload, { timeout: 8000 }));
+    }
+  } catch (e) { console.error("[CALL LOG ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data)); }
   try {
     if (DASH_CALL_SUMMARY_URL) {
-      await axios.post(DASH_CALL_SUMMARY_URL, {
-        biz: DASH_BIZ, source: DASH_SOURCE, convo_id: payload.convo_id
-      }, { timeout: 8000 });
+      const sPayload = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: payload.convo_id };
+      console.log("[CALL SUMMARY->]", DASH_CALL_SUMMARY_URL, preview(sPayload));
+      await httpLog("CALL_SUMMARY", () => axios.post(DASH_CALL_SUMMARY_URL, sPayload, { timeout: 8000 }));
     }
-  } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message); }
+  } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message, "status=", e?.response?.status, "data=", preview(e?.response?.data)); }
 }
 
 /* ----------------------- Classify & Handle ----------------------- */
@@ -767,7 +840,6 @@ async function classifyAndHandle(ws, state, transcript) {
     ws.__awaitingAnythingElse = false;
   }
 
-  // capture user line
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
   /* === Deterministic pre-parse === */
@@ -817,14 +889,8 @@ async function classifyAndHandle(ws, state, transcript) {
     if (askingTime || askingDate) {
       const s = state.slots;
       const bits = [];
-      if (askingTime) {
-        if (s.time) bits.push(`We’re looking at ${to12h(s.time)}`);
-        else bits.push(`We haven’t picked a time yet`);
-      }
-      if (askingDate) {
-        if (s.date) bits.push(`on ${formatDateSpoken(s.date)}`);
-        else bits.push(`and we still need a date`);
-      }
+      if (askingTime) { bits.push(s.time ? `We’re looking at ${to12h(s.time)}` : `We haven’t picked a time yet`); }
+      if (askingDate) { bits.push(s.date ? `on ${formatDateSpoken(s.date)}` : `and we still need a date`); }
       const line = bits.join(" ") + ".";
       await say(ws, line);
       return askForMissing(ws, state);
@@ -1077,7 +1143,7 @@ wss.on("connection", (ws) => {
       ws.__startedAt = Date.now();
       clearGoodbyeTimers(ws);
       clearQuestionTimers(ws);
-      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid }));
+      console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid, from: redact(ws.__callerFrom || "") }));
 
       dg = startDeepgram({
         onFinal: async (text) => {
@@ -1104,6 +1170,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "stop") {
+      console.log("[CALL STOP] flushing artifacts");
       try { dg?.close(); } catch {}
       try { await pushCallArtifacts(ws); } catch {}
       try { ws.close(); } catch {}
