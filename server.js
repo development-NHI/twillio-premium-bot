@@ -26,11 +26,11 @@ const DASH_CALL_SUMMARY_URL  = process.env.DASH_CALL_SUMMARY_URL  || "";
 const DASH_BIZ    = process.env.DASH_BIZ    || "oldline";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 
-/* Biz numbers and timezone */
+/* Biz timezone and numbers */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
-const BUSINESS_NUMBER = process.env.BUSINESS_NUMBER || ""; // the shop's dialed number
+const BUSINESS_NUMBER = process.env.BUSINESS_NUMBER || "";
 const OWNER_PHONE = process.env.OWNER_PHONE || "";
-const DEST_NUMBER = BUSINESS_NUMBER || OWNER_PHONE || "";  // used for call logs
+const DEST_NUMBER = BUSINESS_NUMBER || OWNER_PHONE || "";
 
 /* Twilio transfer */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
@@ -136,7 +136,7 @@ function parseMonthDayToISO(txt) {
   let m = /^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t);
   if (m) {
     const mm = MONTH_LOOKUP[m[1].slice(0,3)];
-       const dd = parseInt(m[2], 10);
+    const dd = parseInt(m[2], 10);
     if (mm && dd >= 1 && dd <= 31) {
       const yyyy = new Date().getFullYear();
       return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
@@ -208,9 +208,6 @@ function to12h(t) {
   const ampm = hh >= 12 ? "PM" : "AM"; if (hh === 0) hh = 12; if (hh > 12) hh -= 12;
   return `${hh}:${mm}`.replace(":00", "") + ` ${ampm}`;
 }
-function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken; }
-
-/* Hours */
 function isWeekend(dateISO) { const d = new Date(dateISO + "T00:00:00Z"); const day = d.getUTCDay(); return day === 0 || day === 6; }
 function isWithinHours(timeStr) {
   if (!timeStr) return false;
@@ -224,23 +221,41 @@ function isWithinHours(timeStr) {
   } else { const m = /^(\d{1,2}):?(\d{2})$/.exec(timeStr.trim()); if (!m) return false; hh = parseInt(m[1] || "0", 10); mm = parseInt(m[2] || "0", 10); }
   const minutes = hh * 60 + mm; const start = 9 * 60; const end = 17 * 60; return minutes >= start && minutes <= end;
 }
-function enforceBusinessWindow(state) {
-  const s = state.slots;
-  if (!s.date || !s.time) return { ok: false, reason: "incomplete" };
-  if (isWeekend(s.date)) { const od = s.date; s.date = ""; return { ok: false, reason: "weekend", oldDate: od }; }
-  if (!isWithinHours(s.time)) { const ot = s.time; s.time = ""; return { ok: false, reason: "hours", oldTime: ot }; }
-  return { ok: true };
-}
 
-/* Time -> ISO with Z */
-function to24h(timeStr) {
-  if (!timeStr) return "";
-  const s = timeStr.trim().toUpperCase();
-  let hh = 0, mm = 0;
-  const m12 = /^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/.exec(s);
-  if (m12) { hh = parseInt(m12[1] || "0", 10); mm = parseInt(m12[2] || "0", 10); const isPM = m12[3] === "PM"; if (hh === 12) hh = isPM ? 12 : 0; else if (isPM) hh += 12; }
-  else { const m24 = /^(\d{1,2}):?(\d{2})$/.exec(s); if (!m24) return ""; hh = parseInt(m24[1] || "0", 10); mm = parseInt(m24[2] || "0", 10); }
-  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+/* === TZ helpers: convert local wall time in BIZ_TZ to UTC ISO === */
+function parseShortOffset(off) {
+  // "GMT-4", "UTC+01", "GMT+00"
+  const m = /(GMT|UTC)([+-])(\d{1,2})(?::?(\d{2}))?/i.exec(off || "");
+  if (!m) return 0;
+  const sign = m[2] === "-" ? -1 : 1;
+  const hh = parseInt(m[3] || "0", 10);
+  const mm = parseInt(m[4] || "0", 10);
+  return sign * (hh * 60 + mm);
+}
+function tzOffsetMinutesAt(tz, approxUtcMs) {
+  // Use timeZoneName 'shortOffset' to read the numeric GMT offset at that instant.
+  const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" });
+  const parts = dtf.formatToParts(new Date(approxUtcMs));
+  const off = (parts.find(p => p.type === "timeZoneName") || {}).value || "GMT+00";
+  return parseShortOffset(off);
+}
+function wallTimeToUtcMs({ Y, M, D, h, m }, tz) {
+  // Start from UTC guess, then adjust by the offset at that instant.
+  const utcGuess = Date.UTC(Y, M - 1, D, h, m, 0);
+  const offMin = tzOffsetMinutesAt(tz, utcGuess);
+  // If local = wall, then UTC = local time - offset
+  return utcGuess - offMin * 60 * 1000;
+}
+function buildStartEndISO(dateISO, timeStr, service) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO || "");
+  const hhmm = to24h(timeStr);
+  if (!m || !hhmm) return { startISO: "", endISO: "" };
+  const [Y, M, D] = [parseInt(m[1],10), parseInt(m[2],10), parseInt(m[3],10)];
+  const [h, mm] = hhmm.split(":").map(Number);
+  const startMs = wallTimeToUtcMs({ Y, M, D, h, m: mm }, BIZ_TZ);
+  const mins = durationMinutesForService(service);
+  const endMs = startMs + mins * 60000;
+  return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString() };
 }
 function durationMinutesForService(service) {
   const s = (service || "").toLowerCase();
@@ -249,22 +264,15 @@ function durationMinutesForService(service) {
   if (s === "combo") return 45;
   return 30;
 }
-function buildStartEndISO(dateISO, timeStr, service) {
-  const hhmm = to24h(timeStr);
-  if (!dateISO || !hhmm) return { startISO: "", endISO: "" };
-  const [Y, M, D] = dateISO.split("-").map(Number);
-  const [h, m] = hhmm.split(":").map(Number);
-  const start = new Date(Date.UTC(Y, M - 1, D, h, m, 0));
-  const mins = durationMinutesForService(service);
-  const end = new Date(start.getTime() + mins * 60000);
-  return { startISO: start.toISOString(), endISO: end.toISOString() };
-}
 function dayBoundsISO(dateISO) {
-  const [Y,M,D] = dateISO.split("-").map(Number);
-  const start = new Date(Date.UTC(Y, M - 1, D, 0, 0, 0));
-  const end = new Date(Date.UTC(Y, M - 1, D, 23, 59, 59));
-  return { startISO: start.toISOString(), endISO: end.toISOString() };
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateISO || "");
+  if (!m) return { startISO: "", endISO: "" };
+  const [Y, M, D] = [parseInt(m[1],10), parseInt(m[2],10), parseInt(m[3],10)];
+  const startMs = wallTimeToUtcMs({ Y, M, D, h: 0, m: 0 }, BIZ_TZ);
+  const endMs   = wallTimeToUtcMs({ Y, M, D, h: 23, m: 59 }, BIZ_TZ);
+  return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString() };
 }
+function humanWhen(dateISO, timeStr) { const dSpoken = formatDateSpoken(dateISO); const tSpoken = to12h(timeStr); return tSpoken ? `${dSpoken} at ${tSpoken}` : dSpoken; }
 
 /* Follow-ups */
 function extractServiceFromSummary(summary) { const m = /^([^(]+)\s*\(/.exec(String(summary || "")); return m ? m[1].trim().toLowerCase() : ""; }
@@ -784,7 +792,7 @@ async function transferToOwner(ws) {
   }
 }
 
-/* ===== CALL ARTIFACTS (multi-shape, now with to_number) ===== */
+/* ===== CALL ARTIFACTS (with to_number) ===== */
 async function pushCallArtifacts(ws) {
   const call_id = ws.__callSid || ws.__convoId || "";
   const to_number = ws.__calledTo || DEST_NUMBER || "";
@@ -796,7 +804,7 @@ async function pushCallArtifacts(ws) {
     convo_id: ws.__convoId || "",
     call_sid: ws.__callSid || "",
     from: ws.__callerFrom || "",
-    to_number,            // required by backend
+    to_number,
     started_at: ws.__startedAt || 0,
     ended_at: Date.now(),
     slots: ws.__state?.slots || {},
@@ -811,7 +819,7 @@ async function pushCallArtifacts(ws) {
       convo_id: ws.__convoId || "",
       call_sid: ws.__callSid || "",
       from: ws.__callerFrom || "",
-      to_number,          // required by backend
+      to_number,
       started_at: ws.__startedAt || 0,
       ended_at: flat.ended_at,
       slots: flat.slots,
@@ -834,7 +842,7 @@ async function pushCallArtifacts(ws) {
             biz: DASH_BIZ, source: DASH_SOURCE,
             id: call_id, callId: call_id, convoId: ws.__convoId || "",
             callSid: ws.__callSid || "", from: ws.__callerFrom || "",
-            toNumber: to_number, // camelCase alias
+            toNumber: to_number,
             startedAt: ws.__startedAt || 0, endedAt: flat.ended_at,
             slots: flat.slots, phase: flat.phase, transcript: flat.transcript
           };
@@ -855,11 +863,11 @@ async function pushCallArtifacts(ws) {
 
 /* ===== DIALOG ===== */
 
-/* NEW: robust phone capture from raw speech */
+/* capture phone numbers directly */
 function extractPhoneFromText(text) {
   if (!text) return "";
   const digits = text.replace(/[^\d]/g, "");
-  if (digits.length >= 10) return digits.slice(-10); // last 10 digits
+  if (digits.length >= 10) return digits.slice(-10);
   return "";
 }
 
@@ -904,10 +912,16 @@ async function classifyAndHandle(ws, state, transcript) {
 
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
-  // Capture called/destination if Twilio passed it
   ws.__calledTo = ws.__calledTo || (ws.__twilioTo || "");
 
   const lower = String(transcript || "").toLowerCase();
+
+  // reschedule keyword -> treat as booking update
+  if (/\breschedul(e|ing|e\s+it)\b/.test(lower)) {
+    state.phase = "booking";
+    await say(ws, "Sure — what new date and time would you like?");
+    return;
+  }
 
   // Hard service/date shortcuts
   if (!state.slots.service) {
@@ -919,7 +933,7 @@ async function classifyAndHandle(ws, state, transcript) {
     if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
   }
 
-  // NEW: if waiting for phone, parse it directly from the utterance
+  // When waiting for phone, parse it directly
   const needPhone = nextMissing(state) === "phone";
   if (needPhone) {
     const ph = extractPhoneFromText(transcript);
@@ -928,7 +942,7 @@ async function classifyAndHandle(ws, state, transcript) {
       state.slots.phone = ph;
       console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "regex_phone" }));
       await say(ws, "Thanks. I’ve saved your number.");
-      return askForMissing(ws, state); // proceed; prevents the loop
+      return askForMissing(ws, state);
     }
   }
 
@@ -996,7 +1010,7 @@ Return STRICT JSON:{
  "faq_topic":"HOURS"|"PRICES"|"SERVICES"|"LOCATION"|"",
  "service":"","date":"","time":"","name":"","phone":""}
 Rules:
-- Only BOOK if they schedule, reschedule, or give date/time.
+- BOOK if they schedule OR reschedule and give date/time.
 - CANCEL if they ask to cancel; include any date/time/name/phone.
 - If user says "this number", leave phone empty.
 - Leave blanks if unsure. Do not invent names.`.trim();
@@ -1010,6 +1024,17 @@ Rules:
 
   if (state.phase === "confirmed") clearGoodbyeTimers(ws);
 
+  // explicit cancel intent entry-point
+  if (parsed.intent === "CANCEL") {
+    const d0 = normalizeDate(parsed.date) || "";
+    const t0 = parsed.time || "";
+    ws.__cancelFlow = { active: true, dateISO: d0, timeStr: t0 };
+    if (!d0 && !t0) await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
+    else await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
+    return;
+  }
+
+  // cancel flow resolver
   if (ws.__cancelFlow?.active) {
     const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
     const newDate = normalizeDate(parsed.date) || "";
@@ -1062,27 +1087,6 @@ Rules:
   }
 
   const { changed, changedKeys } = mergeSlots(state, parsed);
-  if (changed && (state.phase === "booking" || parsed.intent === "BOOK")) {
-    const acks = [];
-    for (const k of changedKeys) {
-      if (k === "service") acks.push(`Got it: ${state.slots.service}.`);
-      if (k === "date") acks.push(`Okay: ${formatDateSpoken(state.slots.date)}.`);
-      if (k === "time") acks.push(`Noted: ${to12h(state.slots.time)}.`);
-      if (k === "name") acks.push(`Thanks, ${state.slots.name}.`);
-      if (k === "phone") acks.push(`Thanks. I’ve saved your number.`);
-    }
-    if (acks.length) await say(ws, acks.join(" "));
-  }
-
-  if (parsed.intent === "CANCEL") {
-    const d0 = normalizeDate(parsed.date) || "";
-    const t0 = parsed.time || "";
-    ws.__cancelFlow = { active: true, dateISO: d0, timeStr: t0 };
-    if (!d0 && !t0) await askWithReaskAndGoodbye(ws, "Sure — what’s the date and time of the appointment to cancel?");
-    else await askWithReaskAndGoodbye(ws, "Got it — what’s the exact date and time to cancel?");
-    return;
-  }
-
   if (parsed.intent === "END") return gracefulGoodbye(ws);
   if (parsed.intent === "DECLINE_BOOK") { state.phase = "idle"; return say(ws, "No problem. How else can I help?"); }
 
@@ -1097,7 +1101,7 @@ Rules:
     else if (parsed.faq_topic === "LOCATION") answer = "We’re at one two three Blueberry Lane.";
     else answer = "Happy to help. What else can I answer?";
     if (state.phase === "booking") { await say(ws, answer); return askForMissing(ws, state); }
-    if (state.phase === "confirmed") return say(ws, answer);
+    if (state.phase === "confirmed") return say(ws, "Happy to help.");
     return say(ws, `${answer} Would you like to book an appointment or do you have another question?`);
   }
 
@@ -1112,7 +1116,7 @@ Rules:
         if (check.reason === "weekend") return askWithReaskAndGoodbye(ws, "We’re closed on weekends. We’re open Monday to Friday, 9 AM to 5 PM. What weekday works?");
         if (check.reason === "hours") return askWithReaskAndGoodbye(ws, "We’re open 9 AM to 5 PM. What time that day works within business hours?");
       }
-      return triggerConfirm(ws, state);
+      return triggerConfirm(ws, state, { updated: /reschedul/i.test(ws.__lines?.slice(-1)[0]?.text || "") });
     }
     if (changed && changedKeys.length === 1 && changedKeys[0] === missing) return askForMissing(ws, state);
 
