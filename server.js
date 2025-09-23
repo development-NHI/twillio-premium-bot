@@ -269,6 +269,19 @@ function extractServiceFromSummary(summary) { const m = /^([^(]+)\s*\(/.exec(Str
 function isAskingTime(text) { return /\b(what time|at what time|what's the time|what time is (it|that)|when is (it|that))\b/i.test(text || ""); }
 function isAskingDate(text) { return /\b(what (?:date|day)|which (?:date|day))\b/i.test(text || ""); }
 
+/* ===== Dashboard POST fallback (JSON then form) ===== */
+async function postJsonOrForm(url, obj, label) {
+  return httpLog(label, async () => {
+    try {
+      return await axios.post(url, obj, { timeout: 10000 });
+    } catch (e) {
+      const form = new URLSearchParams();
+      for (const [k,v] of Object.entries(obj)) form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+      return await axios.post(url, form, { timeout: 10000, headers: { "Content-Type": "application/x-www-form-urlencoded" } });
+    }
+  });
+}
+
 /* ===== DASHBOARD API ===== */
 async function dashReadWindow(startISO, endISO) {
   if (!DASH_CAL_READ_URL) return { ok: false, events: [], reason: "no_url" };
@@ -291,7 +304,7 @@ async function dashReadWindow(startISO, endISO) {
   }
 }
 
-/* create: try several shapes */
+/* create: try several shapes with time-key synonyms */
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
   if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
 
@@ -306,35 +319,41 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
     notes: notes || service || ""
   };
 
+  const addTimes = (obj) => {
+    const out = { ...obj };
+    out.start      = startISO;
+    out.end        = endISO;
+    out.start_time = startISO;
+    out.end_time   = endISO;
+    out.startISO   = startISO;
+    out.endISO     = endISO;
+    return out;
+  };
+
   const payloadA = {
     ...base,
-    event: {
+    event: addTimes({
       summary: `${service || "Appointment"} (${name || "Guest"})`,
       type: service || "appointment",
-      start: startISO,
-      end: endISO,
       timezone: BIZ_TZ,
       customer: base.customer,
       notes: base.notes
-    }
+    })
   };
   const payloadB = {
     ...base,
-    appointment: {
+    appointment: addTimes({
       title: `${service || "Appointment"} (${name || "Guest"})`,
       type: service || "appointment",
-      start: startISO,
-      end: endISO,
       timezone: BIZ_TZ,
       customer: base.customer,
       notes: base.notes
-    }
+    })
   };
   const payloadC = {
     ...base,
     title: `${service || "Appointment"} (${name || "Guest"})`,
-    start: startISO,
-    end: endISO,
+    ...addTimes({}),
     customer_name: base.customer.name,
     customer_phone: base.customer.phone,
     service: base.service
@@ -342,9 +361,7 @@ async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, se
 
   const tryPost = async (label, payload) => {
     console.log("[CAL CREATE->]", label, DASH_CAL_CREATE_URL, preview(payload));
-    const { data } = await httpLog(`CAL_CREATE_${label}`, () =>
-      axios.post(DASH_CAL_CREATE_URL, payload, { timeout: 10000 })
-    );
+    const { data } = await postJsonOrForm(DASH_CAL_CREATE_URL, payload, `CAL_CREATE_${label}`);
     console.log("[CAL CREATE<-]", label, preview(data));
     return data;
   };
@@ -799,28 +816,50 @@ async function pushCallArtifacts(ws) {
 
   try {
     if (DASH_CALL_LOG_URL) {
-      // Try nested then flat.
+      // Try nested -> flat -> alt camelCase
       console.log("[CALL LOG->]", DASH_CALL_LOG_URL, preview(nested, 400));
       try {
         await httpLog("CALL_LOG_NESTED", () => axios.post(DASH_CALL_LOG_URL, nested, { timeout: 8000 }));
       } catch {
         console.log("[CALL LOG-> fallback]", DASH_CALL_LOG_URL, preview(flat, 400));
-        await httpLog("CALL_LOG_FLAT", () => axios.post(DASH_CALL_LOG_URL, flat, { timeout: 8000 }));
+        try {
+          await httpLog("CALL_LOG_FLAT", () => axios.post(DASH_CALL_LOG_URL, flat, { timeout: 8000 }));
+        } catch {
+          const alt = {
+            biz: DASH_BIZ, source: DASH_SOURCE,
+            id: call_id, callId: call_id, convoId: ws.__convoId || "",
+            callSid: ws.__callSid || "", from: ws.__callerFrom || "",
+            startedAt: ws.__startedAt || 0, endedAt: flat.ended_at,
+            slots: flat.slots, phase: flat.phase, transcript: flat.transcript
+          };
+          await postJsonOrForm(DASH_CALL_LOG_URL, alt, "CALL_LOG_ALT");
+        }
       }
     }
   } catch (e) { console.error("[CALL LOG ERROR]", e.message); }
 
   try {
     if (DASH_CALL_SUMMARY_URL) {
-      // Summary uses call_id per backend message.
       const sum1 = { biz: DASH_BIZ, source: DASH_SOURCE, call_id };
-      const sum2 = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: ws.__convoId || "" };
+      const sum2 = { biz: DASH_BIZ, source: DASH_SOURCE, id: call_id };
+      const sum3 = { biz: DASH_BIZ, source: DASH_SOURCE, callId: call_id };
+      const sum4 = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: ws.__convoId || "" };
       console.log("[CALL SUMMARY->]", DASH_CALL_SUMMARY_URL, preview(sum1));
       try {
         await httpLog("CALL_SUMMARY_CALLID", () => axios.post(DASH_CALL_SUMMARY_URL, sum1, { timeout: 8000 }));
       } catch {
-        console.log("[CALL SUMMARY-> fallback]", DASH_CALL_SUMMARY_URL, preview(sum2));
-        await httpLog("CALL_SUMMARY_CONVOID", () => axios.post(DASH_CALL_SUMMARY_URL, sum2, { timeout: 8000 }));
+        try {
+          console.log("[CALL SUMMARY-> id]", DASH_CALL_SUMMARY_URL, preview(sum2));
+          await httpLog("CALL_SUMMARY_ID", () => axios.post(DASH_CALL_SUMMARY_URL, sum2, { timeout: 8000 }));
+        } catch {
+          try {
+            console.log("[CALL SUMMARY-> callId]", DASH_CALL_SUMMARY_URL, preview(sum3));
+            await httpLog("CALL_SUMMARY_CALLID_CAMEL", () => axios.post(DASH_CALL_SUMMARY_URL, sum3, { timeout: 8000 }));
+          } catch {
+            console.log("[CALL SUMMARY-> convo_id]", DASH_CALL_SUMMARY_URL, preview(sum4));
+            await httpLog("CALL_SUMMARY_CONVOID", () => axios.post(DASH_CALL_SUMMARY_URL, sum4, { timeout: 8000 }));
+          }
+        }
       }
     }
   } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message); }
