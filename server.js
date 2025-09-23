@@ -323,7 +323,7 @@ async function dashReadWindow(startISO, endISO) {
   }
 }
 
-/* create: unchanged from your last working build */
+/* create: multi-shape */
 async function dashCreateEvent({ name, phone, email, notes, startISO, endISO, service }) {
   if (!DASH_CAL_CREATE_URL) { console.error("[CAL CREATE] no URL"); return { ok: false, event: null }; }
 
@@ -438,7 +438,6 @@ function shiftAssumingZWasLocal(iso, tz) {
   const t = new Date(iso).getTime();
   if (isNaN(t)) return "";
   const offMin = tzOffsetMinutesAt(tz, t);
-  // if event was saved as "local" but tagged Z, true UTC should be +offset
   const corrected = t + offMin * 60 * 1000;
   return new Date(corrected).toISOString();
 }
@@ -714,12 +713,30 @@ function isoToDateTimeSpeech(iso) {
   if (!dateISO || !timeHHMM) return "";
   return `${formatDateSpoken(dateISO)} at ${to12h(timeHHMM)}`;
 }
-function describeEventForSpeech(ev) {
-  const raw = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
-  const alt = shiftAssumingZWasLocal(raw, BIZ_TZ) || raw;
+function hhmm24FromTimeStr(t) {
+  const s = to24h(t || "");
+  const m = /^(\d{2}):(\d{2})$/.exec(s || "");
+  return m ? `${m[1]}:${m[2]}` : "";
+}
+function describeEventForSpeech(ev, preferredTimeStr = "") {
+  const rawISO = ev.Start_Time || ev.start || ev.start_time || ev.startISO || "";
+  const shiftedISO = shiftAssumingZWasLocal(rawISO, BIZ_TZ) || "";
+
+  const rawParts = isoToLocalParts(rawISO);
+  const shiftParts = shiftedISO ? isoToLocalParts(shiftedISO) : { dateISO: "", timeHHMM: "" };
+
+  const prefHHMM = hhmm24FromTimeStr(preferredTimeStr);
+  let pickISO = rawISO;
+  if (prefHHMM) {
+    if (shiftParts.timeHHMM === prefHHMM && rawParts.timeHHMM !== prefHHMM) pickISO = shiftedISO;
+    else pickISO = rawISO;
+  } else {
+    pickISO = rawISO;
+  }
+
+  const when = isoToDateTimeSpeech(pickISO);
   const summary = ev.summary || ev.Event_Name || ev.name || "";
   const who = ev.Customer_Name || "";
-  const when = isoToDateTimeSpeech(alt);
   if (summary) return `${summary} on ${when}`;
   if (who) return `${who}'s appointment on ${when}`;
   return `an appointment on ${when}`;
@@ -768,6 +785,9 @@ async function transferToOwner(ws) {
 
 /* ===== CALL ARTIFACTS ===== */
 async function pushCallArtifacts(ws) {
+  if (ws.__artifactsPushed) return;
+  ws.__artifactsPushed = true;
+
   const call_id = ws.__callSid || ws.__convoId || "";
   const to_number = ws.__calledTo || DEST_NUMBER || "";
 
@@ -874,11 +894,57 @@ async function askForMissing(ws, state) {
   }
 }
 
+async function triggerConfirm(ws, state, { updated=false } = {}) {
+  const s = state.slots;
+  const when = humanWhen(s.date, s.time);
+  console.log(JSON.stringify({ event: "CONFIRM_READY", slots: s, whenSpoken: when }));
+
+  const snap = JSON.stringify(s);
+  if (snap === state.lastConfirmSnapshot && state.phase === "confirmed") return;
+
+  const calRes = await createViaDashIfFree(ws, state);
+  console.log("[CONFIRM] createViaDashIfFree ->", calRes);
+  if (!calRes.ok) {
+    if (calRes.reason === "conflict") {
+      await say(ws, "That time just became unavailable. What other time that day works?");
+      state.slots.time = ""; state.phase = "booking";
+      return await askForMissing(ws, state);
+    }
+    await say(ws, "I couldn’t lock that time just now. What other time works?");
+    state.slots.time = ""; state.phase = "booking";
+    return await askForMissing(ws, state);
+  }
+
+  state.phase = "confirmed";
+  state.lastConfirmSnapshot = snap;
+
+  try {
+    if (DASH_LEAD_UPSERT_URL) {
+      const lead = {
+        biz: DASH_BIZ, source: DASH_SOURCE,
+        phone: s.phone || ws.__callerFrom || "",
+        name: s.name || "",
+        intent: "book",
+        service: s.service || "",
+        last_convo_id: ws.__convoId
+      };
+      console.log("[LEAD UPSERT->]", DASH_LEAD_UPSERT_URL, preview(lead));
+      await httpLog("LEAD_UPSERT", () => axios.post(DASH_LEAD_UPSERT_URL, lead, { timeout: 6000 }));
+    }
+  } catch (e) { console.error("[LEAD UPSERT ERROR]", e.message); }
+
+  const last4 = s.phone ? s.phone.slice(-4) : "";
+  const numLine = last4 ? ` I have your number ending in ${last4}.` : "";
+  const line = updated
+    ? `Updated — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`
+    : `Great — I’ve got a ${s.service} for ${s.name} on ${when}.${numLine} You’re all set. Anything else I can help with?`;
+  await askWithReaskAndGoodbye(ws, line);
+}
+
 async function classifyAndHandle(ws, state, transcript) {
   clearQuestionTimers(ws);
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
-  // cancel flow and CANCEL intent must run BEFORE any slot-fill shortcuts
   const systemPrompt = `
 Return STRICT JSON:{
  "intent":"FAQ"|"BOOK"|"CANCEL"|"DECLINE_BOOK"|"TRANSFER"|"END"|"SMALLTALK"|"UNKNOWN",
@@ -896,7 +962,7 @@ Rules:
     parsed = JSON.parse(res || "{}");
   } catch {}
 
-  // First: explicit CANCEL intent
+  /* Explicit CANCEL first */
   if (parsed.intent === "CANCEL") {
     const d0 = normalizeDate(parsed.date) || "";
     const t0 = parsed.time || "";
@@ -906,7 +972,7 @@ Rules:
     return;
   }
 
-  // Resolve an active cancel flow before anything else
+  /* Resolve active cancel flow */
   if (ws.__cancelFlow?.active) {
     const cf = ws.__cancelFlow || { active: true, dateISO: "", timeStr: "" };
     const newDate = normalizeDate(parsed.date) || "";
@@ -952,14 +1018,14 @@ Rules:
     const eventId = target.event_id || target.id || target.eventId;
     if (!eventId) { await askWithReaskAndGoodbye(ws, "I found an appointment but couldn’t identify its ID. What’s the exact time?"); return; }
 
-    const spoken = describeEventForSpeech(target);
+    const spoken = describeEventForSpeech(target, cf?.timeStr || "");
     ws.__pendingCancel = { eventId, spoken };
     ws.__cancelFlow = { ...cf, active: false };
     await askWithReaskAndGoodbye(ws, `I found ${spoken}. Should I cancel it?`);
     return;
   }
 
-  // If caller asks time/date about pending cancel choice
+  /* Pending cancel yes/no or info */
   if (ws.__pendingCancel && transcript) {
     const askingTime = isAskingTime(transcript);
     const askingDate = isAskingDate(transcript);
@@ -985,18 +1051,15 @@ Rules:
     }
   }
 
-  // From here on: normal booking/faq/etc
-
+  /* Normal booking/faq/etc */
   const lower = String(transcript || "").toLowerCase();
 
-  // reschedule intent words
   if (/\breschedul(e|ing|e\s+it)\b/.test(lower)) {
     state.phase = "booking";
     await say(ws, "Sure — what new date and time would you like?");
     return;
   }
 
-  // Slot-fill shortcuts (executed only if NOT in cancel flows)
   if (!state.slots.service) {
     const svcHard = normalizeService(lower);
     if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, `Got it: ${state.slots.service}.`); return askForMissing(ws, state); }
@@ -1006,7 +1069,6 @@ Rules:
     if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
   }
 
-  // Phone capture when requested
   const needPhone = nextMissing(state) === "phone";
   if (needPhone) {
     const ph = extractPhoneFromText(transcript);
@@ -1019,7 +1081,6 @@ Rules:
     }
   }
 
-  // If they say "use this number"
   if (!state.slots.phone && ws.__callerFrom && /\b(this|my)\s+(number|phone)\b/i.test(transcript)) {
     const filled = normalizePhone(ws.__callerFrom);
     if (filled) {
@@ -1078,8 +1139,11 @@ Rules:
     return askWithReaskAndGoodbye(ws, targetAsk);
   }
 
+  /* Fallback: do not stall; continue slot-filling when incomplete */
   if (parsed.intent === "SMALLTALK" || parsed.intent === "UNKNOWN") {
-    if (state.phase === "idle") return say(ws, `All good. Would you like to book or ask a question?`);
+    const missing = nextMissing(state);
+    if (missing !== "done") return askForMissing(ws, state);
+    if (state.phase === "idle") return say(ws, "All good. Would you like to book or ask a question?");
     if (state.phase === "confirmed") return say(ws, "Happy to help.");
     return say(ws, "Okay.");
   }
@@ -1100,13 +1164,14 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || "{{From}}";
-      ws.__twilioTo   = msg.start?.customParameters?.to || "";
+      ws.__calledTo   = msg.start?.customParameters?.to || DEST_NUMBER || "";
       ws.__callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || "";
       ws.__pendingCancel = null;
       ws.__cancelFlow = { active: false };
       ws.__awaitingAnythingElse = false;
       ws.__lines = [];
       ws.__startedAt = Date.now();
+      ws.__artifactsPushed = false;
       console.log(JSON.stringify({ event: "CALL_START", streamSid: ws.__streamSid, convoId: ws.__convoId, callSid: ws.__callSid }));
       dg = startDeepgram({ onFinal: async (text) => { try { await classifyAndHandle(ws, ws.__state, text); } catch (e) { console.error("[handle error]", e.message); } } });
       await say(ws, "Hi, thanks for calling Old Line Barbershop. How can I help you today?");
