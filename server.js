@@ -1,6 +1,4 @@
 // server.js — Old Line Barbershop AI Receptionist (Deepgram + GPT + ElevenLabs + Dashboard)
-// Adds ISO "Z", multi-shape payload fallbacks for calendar/create and calls/log|summary,
-// stricter logs, and summary uses call_id. Other logic unchanged.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -28,13 +26,15 @@ const DASH_CALL_SUMMARY_URL  = process.env.DASH_CALL_SUMMARY_URL  || "";
 const DASH_BIZ    = process.env.DASH_BIZ    || "oldline";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 
-/* Biz timezone */
+/* Biz numbers and timezone */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
+const BUSINESS_NUMBER = process.env.BUSINESS_NUMBER || ""; // the shop's dialed number
+const OWNER_PHONE = process.env.OWNER_PHONE || "";
+const DEST_NUMBER = BUSINESS_NUMBER || OWNER_PHONE || "";  // used for call logs
 
 /* Twilio transfer */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
 const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
 
 if (!OPENAI_API_KEY) console.warn("(!) OPENAI_API_KEY missing");
@@ -55,6 +55,8 @@ app.post("/twiml", (req, res) => {
       <Connect>
         <Stream name="dg" url="wss://${host}">
           <Parameter name="from" value="{{From}}"/>
+          <Parameter name="to" value="{{To}}"/>
+          <Parameter name="callSid" value="{{CallSid}}"/>
         </Stream>
       </Connect>
     </Response>
@@ -134,7 +136,7 @@ function parseMonthDayToISO(txt) {
   let m = /^([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t);
   if (m) {
     const mm = MONTH_LOOKUP[m[1].slice(0,3)];
-    const dd = parseInt(m[2], 10);
+       const dd = parseInt(m[2], 10);
     if (mm && dd >= 1 && dd <= 31) {
       const yyyy = new Date().getFullYear();
       return `${yyyy}-${String(mm).padStart(2,"0")}-${String(dd).padStart(2,"0")}`;
@@ -782,9 +784,11 @@ async function transferToOwner(ws) {
   }
 }
 
-/* ===== CALL ARTIFACTS (multi-shape) ===== */
+/* ===== CALL ARTIFACTS (multi-shape, now with to_number) ===== */
 async function pushCallArtifacts(ws) {
   const call_id = ws.__callSid || ws.__convoId || "";
+  const to_number = ws.__calledTo || DEST_NUMBER || "";
+
   const flat = {
     biz: DASH_BIZ,
     source: DASH_SOURCE,
@@ -792,6 +796,7 @@ async function pushCallArtifacts(ws) {
     convo_id: ws.__convoId || "",
     call_sid: ws.__callSid || "",
     from: ws.__callerFrom || "",
+    to_number,            // required by backend
     started_at: ws.__startedAt || 0,
     ended_at: Date.now(),
     slots: ws.__state?.slots || {},
@@ -806,6 +811,7 @@ async function pushCallArtifacts(ws) {
       convo_id: ws.__convoId || "",
       call_sid: ws.__callSid || "",
       from: ws.__callerFrom || "",
+      to_number,          // required by backend
       started_at: ws.__startedAt || 0,
       ended_at: flat.ended_at,
       slots: flat.slots,
@@ -816,7 +822,6 @@ async function pushCallArtifacts(ws) {
 
   try {
     if (DASH_CALL_LOG_URL) {
-      // Try nested -> flat -> alt camelCase
       console.log("[CALL LOG->]", DASH_CALL_LOG_URL, preview(nested, 400));
       try {
         await httpLog("CALL_LOG_NESTED", () => axios.post(DASH_CALL_LOG_URL, nested, { timeout: 8000 }));
@@ -829,6 +834,7 @@ async function pushCallArtifacts(ws) {
             biz: DASH_BIZ, source: DASH_SOURCE,
             id: call_id, callId: call_id, convoId: ws.__convoId || "",
             callSid: ws.__callSid || "", from: ws.__callerFrom || "",
+            toNumber: to_number, // camelCase alias
             startedAt: ws.__startedAt || 0, endedAt: flat.ended_at,
             slots: flat.slots, phase: flat.phase, transcript: flat.transcript
           };
@@ -841,31 +847,22 @@ async function pushCallArtifacts(ws) {
   try {
     if (DASH_CALL_SUMMARY_URL) {
       const sum1 = { biz: DASH_BIZ, source: DASH_SOURCE, call_id };
-      const sum2 = { biz: DASH_BIZ, source: DASH_SOURCE, id: call_id };
-      const sum3 = { biz: DASH_BIZ, source: DASH_SOURCE, callId: call_id };
-      const sum4 = { biz: DASH_BIZ, source: DASH_SOURCE, convo_id: ws.__convoId || "" };
       console.log("[CALL SUMMARY->]", DASH_CALL_SUMMARY_URL, preview(sum1));
-      try {
-        await httpLog("CALL_SUMMARY_CALLID", () => axios.post(DASH_CALL_SUMMARY_URL, sum1, { timeout: 8000 }));
-      } catch {
-        try {
-          console.log("[CALL SUMMARY-> id]", DASH_CALL_SUMMARY_URL, preview(sum2));
-          await httpLog("CALL_SUMMARY_ID", () => axios.post(DASH_CALL_SUMMARY_URL, sum2, { timeout: 8000 }));
-        } catch {
-          try {
-            console.log("[CALL SUMMARY-> callId]", DASH_CALL_SUMMARY_URL, preview(sum3));
-            await httpLog("CALL_SUMMARY_CALLID_CAMEL", () => axios.post(DASH_CALL_SUMMARY_URL, sum3, { timeout: 8000 }));
-          } catch {
-            console.log("[CALL SUMMARY-> convo_id]", DASH_CALL_SUMMARY_URL, preview(sum4));
-            await httpLog("CALL_SUMMARY_CONVOID", () => axios.post(DASH_CALL_SUMMARY_URL, sum4, { timeout: 8000 }));
-          }
-        }
-      }
+      await httpLog("CALL_SUMMARY_CALLID", () => axios.post(DASH_CALL_SUMMARY_URL, sum1, { timeout: 8000 }));
     }
   } catch (e) { console.error("[CALL SUMMARY ERROR]", e.message); }
 }
 
 /* ===== DIALOG ===== */
+
+/* NEW: robust phone capture from raw speech */
+function extractPhoneFromText(text) {
+  if (!text) return "";
+  const digits = text.replace(/[^\d]/g, "");
+  if (digits.length >= 10) return digits.slice(-10); // last 10 digits
+  return "";
+}
+
 async function askForMissing(ws, state) {
   const s = state.slots;
   const missing = nextMissing(state);
@@ -907,7 +904,12 @@ async function classifyAndHandle(ws, state, transcript) {
 
   try { (ws.__lines ||= []).push({ role: "user", at: Date.now(), text: transcript }); } catch {}
 
+  // Capture called/destination if Twilio passed it
+  ws.__calledTo = ws.__calledTo || (ws.__twilioTo || "");
+
   const lower = String(transcript || "").toLowerCase();
+
+  // Hard service/date shortcuts
   if (!state.slots.service) {
     const svcHard = normalizeService(lower);
     if (svcHard) { state.slots.service = svcHard; state.phase = state.phase || "booking"; await say(ws, `Got it: ${state.slots.service}.`); return askForMissing(ws, state); }
@@ -917,6 +919,20 @@ async function classifyAndHandle(ws, state, transcript) {
     if (/\b(?:today)\b/.test(lower)) { state.slots.date = nowInTZ(BIZ_TZ); state.phase = state.phase || "booking"; await say(ws, `Okay: ${formatDateSpoken(state.slots.date)}.`); return askForMissing(ws, state); }
   }
 
+  // NEW: if waiting for phone, parse it directly from the utterance
+  const needPhone = nextMissing(state) === "phone";
+  if (needPhone) {
+    const ph = extractPhoneFromText(transcript);
+    if (ph) {
+      const before = { ...state.slots };
+      state.slots.phone = ph;
+      console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "regex_phone" }));
+      await say(ws, "Thanks. I’ve saved your number.");
+      return askForMissing(ws, state); // proceed; prevents the loop
+    }
+  }
+
+  // Cancel flow Q&A
   if (ws.__pendingCancel && transcript) {
     const askingTime = isAskingTime(transcript);
     const askingDate = isAskingDate(transcript);
@@ -969,6 +985,8 @@ async function classifyAndHandle(ws, state, transcript) {
       const before = { ...state.slots };
       state.slots.phone = filled;
       console.log(JSON.stringify({ event: "SLOTS_MERGE", before, after: state.slots, via: "callerFrom" }));
+      await say(ws, "Got it. I’ll use this number.");
+      return askForMissing(ws, state);
     }
   }
 
@@ -1132,6 +1150,7 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__state = newState();
       ws.__callerFrom = msg.start?.customParameters?.from || "{{From}}";
+      ws.__twilioTo   = msg.start?.customParameters?.to || "";
       ws.__callSid = msg.start?.callSid || msg.start?.customParameters?.callSid || "";
       ws.__pendingCancel = null;
       ws.__cancelFlow = { active: false };
