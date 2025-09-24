@@ -82,7 +82,7 @@ app.post("/twiml", (req, res) => {
   const xml = `
     <Response>
       <Connect>
-        <Stream url="wss://${host}">
+        <Stream url="wss://${host}" track="inbound_audio">
           <Parameter name="from" value="{{From}}"/>
           <Parameter name="callSid" value="{{CallSid}}"/>
         </Stream>
@@ -100,7 +100,15 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /* === Deepgram ASR === */
 function startDeepgram({ onFinal }) {
-  const url = "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=250";
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=mulaw" // changed from linear16
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&endpointing=250";
   log.info("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -123,17 +131,13 @@ function startDeepgram({ onFinal }) {
   dg.on("error", e => log.err("[Deepgram error]", e.message));
   dg.on("close", () => log.info("[Deepgram] closed"));
   return {
-    sendPCM16LE(buf){
-      log.info(`[Deepgram] send PCM len=${buf.length}`);
+    sendRaw(buf){
+      log.info(`[Deepgram] send ULaw len=${buf.length}`);
       try { dg.send(buf); } catch(e){ log.err("[Deepgram send error]", e.message); }
     },
     close(){ try { dg.close(); } catch {} }
   };
 }
-
-/* μ-law decode for Twilio media -> PCM16LE -> Deepgram */
-function ulawByteToPcm16(u){u=~u&255;const s=u&128,e=u>>4&7,m=u&15;let x=((m<<3)+132)<<(e+2)-132*4; if(s)x=-x; return Math.max(-32768,Math.min(32767,x));}
-function ulawToPcm(ulawBuf){const out=Buffer.alloc(ulawBuf.length*2);for(let i=0;i<ulawBuf.length;i++){out.writeInt16LE(ulawByteToPcm16(ulawBuf[i]),i*2);}return out;}
 
 /* === ElevenLabs TTS === */
 async function say(ws, text) {
@@ -339,7 +343,16 @@ wss.on("connection", (ws) => {
   log.info("[WS] connection from Twilio");
   let dg = null;
   let pendingULaw = [];
-  const BATCH = 1; // flush every frame so short words like "hi" are captured
+  const BATCH = 5; // ~100ms @ 8kHz (5×20ms frames)
+  let flushTimer = null;
+  function flushULaw() {
+    if (!pendingULaw.length || !dg) return;
+    const ulawChunk = Buffer.concat(pendingULaw);
+    pendingULaw = [];
+    log.info("[MEDIA] flush", { frames: ulawChunk.length / 160, bytes: ulawChunk.length });
+    dg.sendRaw(ulawChunk);
+  }
+
   ws.__mem = newMemory();
 
   ws.on("message", async raw => {
@@ -377,21 +390,18 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       if (!dg) return;
-      const ulaw = Buffer.from(msg.media?.payload || "", "base64");
+      const ulaw = Buffer.from(msg.media?.payload || "", "base64"); // 160 bytes typical
       log.info("[MEDIA] frame", { len: ulaw.length });
       pendingULaw.push(ulaw);
-      if (pendingULaw.length >= BATCH) {
-        const ulawChunk = Buffer.concat(pendingULaw);
-        const pcm = ulawToPcm(ulawChunk);
-        log.info("[MEDIA] flush", { frames: pendingULaw.length, pcmLen: pcm.length });
-        pendingULaw = [];
-        dg.sendPCM16LE(pcm);
-      }
+      if (pendingULaw.length >= BATCH) flushULaw();
+      clearTimeout(flushTimer);
+      flushTimer = setTimeout(flushULaw, 120); // tail flush
       return;
     }
 
     if (msg.event === "stop") {
       log.info("[CALL_STOP]", { convoId: ws.__convoId });
+      try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
     }
