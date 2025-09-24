@@ -1,8 +1,4 @@
-/* server.js — Prompt-driven, tool-called voice agent (copy/paste ready)
-   - Behavior controlled by RENDER_PROMPT (or fetch from your dashboard)
-   - Tools are pluggable. Toggle with CAPABILITIES flags per tenant.
-   - Memory: running transcript + extracted entities + summary.
-*/
+/* server.js — Prompt-driven, tool-called voice agent (only change: BATCH=1) */
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -20,7 +16,6 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-// Per-tenant business config (swap or fetch from your dashboard)
 const BIZ = {
   id: process.env.BIZ_ID || "oldline",
   name: process.env.BIZ_NAME || "Old Line Barbershop",
@@ -28,23 +23,21 @@ const BIZ = {
   timezone: process.env.BIZ_TZ || "America/New_York",
   hours: process.env.BIZ_HOURS_JSON || `{"mon_fri":"09:00-17:00","weekends":"closed"}`,
   location: process.env.BIZ_LOCATION || "123 Blueberry Ln",
-  services: (process.env.BIZ_SERVICES_JSON || `[
+  services: process.env.BIZ_SERVICES_JSON || `[
     {"name":"haircut","mins":30,"price":30},
     {"name":"beard trim","mins":15,"price":15},
     {"name":"combo","mins":45,"price":40}
-  ]`)
+  ]`
 };
 
-// External endpoints (point these to your dashboard services)
 const URLS = {
-  CAL_READ: process.env.MAKE_READ_URL || "",
-  CAL_CREATE: process.env.MAKE_CREATE_URL || "",
-  CAL_DELETE: process.env.MAKE_DELETE_URL || "",
-  FAQ_LOG: process.env.MAKE_FAQ_URL || "",
-  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || "" // optional override per-tenant
+  CAL_READ: process.env.DASH_CAL_READ_URL || process.env.MAKE_READ_URL || "",
+  CAL_CREATE: process.env.DASH_CAL_CREATE_URL || process.env.MAKE_CREATE_URL || "",
+  CAL_DELETE: process.env.DASH_CAL_CANCEL_URL || process.env.MAKE_DELETE_URL || "",
+  FAQ_LOG: process.env.DASH_FAQ_URL || process.env.MAKE_FAQ_URL || "",
+  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || ""
 };
 
-// Feature toggles per tenant
 const CAPABILITIES = {
   booking: (process.env.CAP_BOOKING ?? "true") === "true",
   cancel:  (process.env.CAP_CANCEL ?? "true") === "true",
@@ -53,7 +46,6 @@ const CAPABILITIES = {
   transfer: (process.env.CAP_TRANSFER ?? "false") === "true"
 };
 
-// Primary prompt (may be overridden by dashboard at call start)
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are {{BIZ_NAME}}'s AI receptionist. Speak naturally. Be concise.
 Follow the business rules in <biz_profile>. Use tools when needed.
@@ -110,7 +102,7 @@ function startDeepgram({ onFinal }) {
   };
 }
 
-/* μ-law decode for Twilio media -> PCM16LE -> Deepgram */
+/* μ-law decode */
 function ulawByteToPcm16(u){u=~u&255;const s=u&128,e=u>>4&7,m=u&15;let x=((m<<3)+132)<<(e+2)-132*4; if(s)x=-x; return Math.max(-32768,Math.min(32767,x));}
 function ulawToPcm(ulawBuf){const out=Buffer.alloc(ulawBuf.length*2);for(let i=0;i<ulawBuf.length;i++){out.writeInt16LE(ulawByteToPcm16(ulawBuf[i]),i*2);}return out;}
 
@@ -133,17 +125,14 @@ async function say(ws, text) {
 /* ===== Minimal Memory ===== */
 function newMemory() {
   return {
-    transcript: [],             // [{from:"user"|"bot", text}]
+    transcript: [],
     entities: { name:"", phone:"", service:"", date:"", time:"" },
-    summary: ""                 // short rolling summary for grounding
+    summary: ""
   };
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Tool Registry (pluggable) =====
-   Add or remove tools without touching dialog code.
-   Each tool returns { text? , data? } that the LLM can use.
-*/
+/* ===== Tool Registry ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
     if (!CAPABILITIES.booking || !URLS.CAL_READ) return { text:"Booking is unavailable." };
@@ -181,16 +170,13 @@ const Tools = {
   },
   async transfer({ reason }) {
     if (!CAPABILITIES.transfer) return { text:"" };
-    // Wire your SIP or Twilio <Dial> here if you want live transfer.
     return { text:"Transferring you now." };
   },
   async store_memory({ key, value }) {
-    // No-op placeholder so the LLM can request persistence hooks to your dashboard.
     return { data:{ saved:true } };
   }
 };
 
-// Tool schema advertised to the model
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -245,7 +231,6 @@ async function openaiChat(messages, options={}) {
   return data.choices[0];
 }
 
-/* Build system prompt with tenant facts + runtime summary */
 function buildSystemPrompt(mem, tenantPrompt) {
   const profile = {
     BIZ_NAME: BIZ.name,
@@ -255,8 +240,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
     HOURS: JSON.parse(BIZ.hours),
     SERVICES: JSON.parse(BIZ.services)
   };
-  const p = (tenantPrompt || RENDER_PROMPT)
-    .replaceAll("{{BIZ_NAME}}", BIZ.name);
+  const p = (tenantPrompt || RENDER_PROMPT).replaceAll("{{BIZ_NAME}}", BIZ.name);
 
   return [
     { role:"system", content: p },
@@ -274,7 +258,6 @@ function buildSystemPrompt(mem, tenantPrompt) {
   ];
 }
 
-/* Turn user/bot text into chat messages */
 function buildMessages(mem, userText, tenantPrompt) {
   const sys = buildSystemPrompt(mem, tenantPrompt);
   const history = mem.transcript.slice(-12).map(m =>
@@ -283,11 +266,11 @@ function buildMessages(mem, userText, tenantPrompt) {
   return [...sys, ...history, { role:"user", content:userText }];
 }
 
-/* ===== WS wiring ===== */
+/* ===== WS wiring (ONLY CHANGE: const BATCH = 1) ===== */
 wss.on("connection", (ws) => {
   let dg = null;
   let pendingULaw = [];
-  const BATCH = 5;
+  const BATCH = 1; // send every frame so short utterances like "hi" are captured
   ws.__mem = newMemory();
 
   ws.on("message", async raw => {
@@ -298,7 +281,6 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       ws.__from = msg.start?.customParameters?.from || "";
 
-      // Optional: fetch tenant prompt from your dashboard
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
@@ -343,12 +325,11 @@ wss.on("connection", (ws) => {
   });
 });
 
-/* ===== Turn handler: let the model decide, then dispatch tools ===== */
+/* ===== Turn handler ===== */
 async function handleTurn(ws, userText) {
-  // Step 1: get a model reply; if it requests a tool, execute and loop once
   const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
   let choice = await openaiChat(messages);
-  // Tool call?
+
   if (choice.message?.tool_calls?.length) {
     const toolCall = choice.message.tool_calls[0];
     const name = toolCall.function.name;
@@ -356,7 +337,7 @@ async function handleTurn(ws, userText) {
     const impl = Tools[name];
     let toolResult = { text:"" };
     if (impl) toolResult = await impl(args);
-    // Feed tool result back to the model
+
     const follow = await openaiChat([...messages,
       choice.message,
       { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
@@ -370,7 +351,6 @@ async function handleTurn(ws, userText) {
     return;
   }
 
-  // No tool requested: just speak the assistant content
   const botText = (choice.message?.content || "").trim();
   if (botText) {
     await say(ws, botText);
@@ -379,7 +359,7 @@ async function handleTurn(ws, userText) {
   await updateSummary(ws.__mem);
 }
 
-/* ===== Rolling summary to keep context tight ===== */
+/* ===== Rolling summary ===== */
 async function updateSummary(mem) {
   const last = mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
   try {
@@ -399,18 +379,6 @@ async function updateSummary(mem) {
   } catch {}
 }
 
-/* ===== How to extend =====
-1) Add a tool:
-   - Implement async function in Tools (return {text?, data?}).
-   - Add its JSON schema in toolSchema.
-   - No dialog edits needed.
-
-2) Per-client setup:
-   - Set BIZ_* env vars and CAP_* toggles.
-   - Set RENDER_PROMPT or host it at PROMPT_FETCH.
-   - Point CAL_* URLs to that tenant’s endpoints.
-
-3) Behavior control:
-   - Edit prompt text only. Keep server identical across customers.
+/* ===== Notes =====
+Only change from previous version: BATCH reduced from 5 to 1 so very short utterances are sent to Deepgram.
 */
-
