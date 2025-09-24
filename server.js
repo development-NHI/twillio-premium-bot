@@ -2,6 +2,7 @@
    - Behavior controlled by RENDER_PROMPT (or fetch from your dashboard)
    - Tools are pluggable. Toggle with CAPABILITIES flags per tenant.
    - Memory: running transcript + extracted entities + summary.
+   - NOW with verbose logs + Twilio track fix + Deepgram μ-law passthrough.
 */
 
 import express from "express";
@@ -47,10 +48,10 @@ const URLS = {
 // Feature toggles per tenant
 const CAPABILITIES = {
   booking: (process.env.CAP_BOOKING ?? "true") === "true",
-  cancel:  (process.env.CAP_CANCEL ?? "true") === "true",
-  faq:     (process.env.CAP_FAQ ?? "true") === "true",
+  cancel:  (process.env.CAP_CANCEL  ?? "true") === "true",
+  faq:     (process.env.CAP_FAQ     ?? "true") === "true",
   smalltalk: (process.env.CAP_SMALLTALK ?? "true") === "true",
-  transfer: (process.env.CAP_TRANSFER ?? "false") === "true"
+  transfer:  (process.env.CAP_TRANSFER  ?? "false") === "true"
 };
 
 // Primary prompt (may be overridden by dashboard at call start)
@@ -62,34 +63,51 @@ Never guess facts: ask briefly or call a tool. Confirm before booking.
 
 /* ===== HTTP + TwiML ===== */
 const app = express();
+// Twilio posts x-www-form-urlencoded by default:
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 app.get("/", (_, res) => res.status(200).send("OK: AI Voice Agent up"));
 
 app.post("/twiml", (req, res) => {
+  const from = req.body?.From || "";
+  const callSid = req.body?.CallSid || "";
+  console.log("[HTTP] /twiml", { from, callSid });
+
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  // *** IMPORTANT: track must be one of inbound_track|outbound_track|both_tracks ***
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${host}">
-          <Parameter name="from" value="{{From}}"/>
-          <Parameter name="callSid" value="{{CallSid}}"/>
+        <Stream url="wss://${host}" track="inbound_track">
+          <Parameter name="from" value="${from}"/>
+          <Parameter name="callSid" value="${callSid}"/>
         </Stream>
       </Connect>
     </Response>
   `.trim());
+  console.log("[HTTP] TwiML served with host", host);
 });
 
-const server = app.listen(PORT, () => console.log(`listening on ${PORT}`));
+const server = app.listen(PORT, () => console.log(`[INIT] listening on ${PORT}`));
 const wss = new WebSocketServer({ server });
 
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* === Deepgram ASR === */
+/* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
-  const url = "wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=250";
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=mulaw"
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&endpointing=250";
+  console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
@@ -101,24 +119,32 @@ function startDeepgram({ onFinal }) {
     const alt = ev.channel?.alternatives?.[0];
     const text = (alt?.transcript || "").trim();
     if (!text) return;
-    if (ev.is_final || ev.speech_final) onFinal?.(text);
+    if (ev.is_final || ev.speech_final) {
+      console.log(`[ASR FINAL] ${text}`);
+      onFinal?.(text);
+    } else {
+      console.log(`[ASR interim] ${text}`);
+    }
   });
-  dg.on("error", e => console.error("[Deepgram]", e.message));
+  dg.on("error", e => console.error("[Deepgram error]", e.message));
+  dg.on("close", () => console.log("[Deepgram] closed"));
   return {
-    sendPCM16LE(buf){ try { dg.send(buf); } catch {} },
+    sendULaw(buf){
+      try { dg.send(buf); console.log("[Deepgram] >> μ-law bytes", buf.length); }
+      catch(e){ console.error("[Deepgram send error]", e.message); }
+    },
     close(){ try { dg.close(); } catch {} }
   };
 }
-
-/* μ-law decode for Twilio media -> PCM16LE -> Deepgram */
-function ulawByteToPcm16(u){u=~u&255;const s=u&128,e=u>>4&7,m=u&15;let x=((m<<3)+132)<<(e+2)-132*4; if(s)x=-x; return Math.max(-32768,Math.min(32767,x));}
-function ulawToPcm(ulawBuf){const out=Buffer.alloc(ulawBuf.length*2);for(let i=0;i<ulawBuf.length;i++){out.writeInt16LE(ulawByteToPcm16(ulawBuf[i]),i*2);}return out;}
 
 /* === ElevenLabs TTS === */
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   console.log(JSON.stringify({ event:"BOT_SAY", reply:text }));
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return;
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    console.warn("[TTS] missing ElevenLabs credentials");
+    return;
+  }
   try {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await axios.post(url, { text, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
@@ -127,7 +153,8 @@ async function say(ws, text) {
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
-  } catch(e){ console.error("[TTS]", e.message); }
+    resp.data.on("end", () => console.log("[TTS] stream end"));
+  } catch(e){ console.error("[TTS ERROR]", e.message); }
 }
 
 /* ===== Minimal Memory ===== */
@@ -140,20 +167,21 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Tool Registry (pluggable) =====
-   Add or remove tools without touching dialog code.
-   Each tool returns { text? , data? } that the LLM can use.
-*/
+/* ===== Tool Registry (pluggable) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
+    console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!CAPABILITIES.booking || !URLS.CAL_READ) return { text:"Booking is unavailable." };
     try {
       const payload = { intent:"READ", biz:BIZ.id, source:"voice", window:{ start:startISO||`${dateISO}T00:00:00`, end:endISO||`${dateISO}T23:59:59` } };
+      const t0 = Date.now();
       const { data } = await axios.post(URLS.CAL_READ, payload, { timeout:12000 });
+      console.log("[TOOL] read_availability ok", { ms: Date.now()-t0 });
       return { data };
-    } catch(e){ return { text:"I could not reach the calendar." }; }
+    } catch(e){ console.error("[TOOL] read_availability error", e.message); return { text:"I could not reach the calendar." }; }
   },
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
+    console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
     if (!CAPABILITIES.booking || !URLS.CAL_CREATE) return { text:"Booking is unavailable." };
     try {
       const payload = {
@@ -162,30 +190,36 @@ const Tools = {
         Customer_Name: name||"", Customer_Phone: phone||"", Customer_Email: "",
         Notes: notes||service||""
       };
+      const t0 = Date.now();
       const { data } = await axios.post(URLS.CAL_CREATE, payload, { timeout:12000 });
+      console.log("[TOOL] book_appointment ok", { ms: Date.now()-t0 });
       return { data, text:"Booked." };
-    } catch(e){ return { text:"I couldn't book that just now." }; }
+    } catch(e){ console.error("[TOOL] book_appointment error", e.message); return { text:"I couldn't book that just now." }; }
   },
   async cancel_appointment({ event_id }) {
+    console.log("[TOOL] cancel_appointment", { event_id });
     if (!CAPABILITIES.cancel || !URLS.CAL_DELETE) return { text:"Cancellation is unavailable." };
     try {
+      const t0 = Date.now();
       const { data, status } = await axios.post(URLS.CAL_DELETE, { intent:"DELETE", biz:BIZ.id, source:"voice", event_id }, { timeout:12000 });
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
+      console.log("[TOOL] cancel_appointment result", { ms: Date.now()-t0, ok });
       return { text: ok ? "Canceled." : "Could not cancel." , data };
-    } catch(e){ return { text:"I couldn't cancel that." }; }
+    } catch(e){ console.error("[TOOL] cancel_appointment error", e.message); return { text:"I couldn't cancel that." }; }
   },
   async faq({ topic, service }) {
+    console.log("[TOOL] faq", { topic, service });
     if (!CAPABILITIES.faq) return { text:"" };
     try { if (URLS.FAQ_LOG) await axios.post(URLS.FAQ_LOG, { topic, service }); } catch {}
     return { data:{ topic, service } };
   },
   async transfer({ reason }) {
+    console.log("[TOOL] transfer", { reason });
     if (!CAPABILITIES.transfer) return { text:"" };
-    // Wire your SIP or Twilio <Dial> here if you want live transfer.
     return { text:"Transferring you now." };
   },
   async store_memory({ key, value }) {
-    // No-op placeholder so the LLM can request persistence hooks to your dashboard.
+    console.log("[TOOL] store_memory", { key });
     return { data:{ saved:true } };
   }
 };
@@ -231,6 +265,7 @@ const toolSchema = [
 
 /* ===== LLM ===== */
 async function openaiChat(messages, options={}) {
+  console.log("[GPT] request", { msgs: messages.length });
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
     model: "gpt-4o-mini",
@@ -241,8 +276,15 @@ async function openaiChat(messages, options={}) {
     response_format: { type: "text" },
     ...options
   };
+  const t0 = Date.now();
   const { data } = await axios.post("https://api.openai.com/v1/chat/completions", body, { headers });
-  return data.choices[0];
+  const choice = data.choices?.[0];
+  console.log("[GPT] ok", {
+    ms: Date.now()-t0,
+    toolCalls: choice?.message?.tool_calls?.length || 0,
+    hasText: !!(choice?.message?.content || "").trim()
+  });
+  return choice;
 }
 
 /* Build system prompt with tenant facts + runtime summary */
@@ -255,8 +297,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
     HOURS: JSON.parse(BIZ.hours),
     SERVICES: JSON.parse(BIZ.services)
   };
-  const p = (tenantPrompt || RENDER_PROMPT)
-    .replaceAll("{{BIZ_NAME}}", BIZ.name);
+  const p = (tenantPrompt || RENDER_PROMPT).replaceAll("{{BIZ_NAME}}", BIZ.name);
 
   return [
     { role:"system", content: p },
@@ -285,9 +326,20 @@ function buildMessages(mem, userText, tenantPrompt) {
 
 /* ===== WS wiring ===== */
 wss.on("connection", (ws) => {
+  console.log("[WS] connection from Twilio");
   let dg = null;
   let pendingULaw = [];
-  const BATCH = 5;
+  const BATCH = 1;               // flush every frame to catch short utterances like "hi"
+  let tailTimer = null;
+
+  function flushULaw() {
+    if (!pendingULaw.length || !dg) return;
+    const chunk = Buffer.concat(pendingULaw);
+    pendingULaw = [];
+    console.log("[MEDIA] flush", { frames: chunk.length / 160, bytes: chunk.length });
+    dg.sendULaw(chunk);
+  }
+
   ws.__mem = newMemory();
 
   ws.on("message", async raw => {
@@ -297,6 +349,7 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__from = msg.start?.customParameters?.from || "";
+      console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from });
 
       // Optional: fetch tenant prompt from your dashboard
       ws.__tenantPrompt = "";
@@ -304,16 +357,19 @@ wss.on("connection", (ws) => {
         try {
           const { data } = await axios.get(`${URLS.PROMPT_FETCH}?biz=${encodeURIComponent(BIZ.id)}`);
           if (data?.prompt) ws.__tenantPrompt = data.prompt;
-        } catch {}
+          console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
+        } catch(e){
+          console.warn("[PROMPT_FETCH] error", e.message);
+        }
       }
 
-      console.log(JSON.stringify({ event:"CALL_START", convoId:ws.__convoId }));
       dg = startDeepgram({
         onFinal: async (text) => {
           remember(ws.__mem, "user", text);
           await handleTurn(ws, text);
         }
       });
+
       await say(ws, `Hi, thanks for calling ${BIZ.name}. How can I help?`);
       remember(ws.__mem, "bot", `Hi, thanks for calling ${BIZ.name}. How can I help?`);
       return;
@@ -321,17 +377,17 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       if (!dg) return;
-      const ulaw = Buffer.from(msg.media?.payload || "", "base64");
+      const ulaw = Buffer.from(msg.media?.payload || "", "base64"); // ~160 bytes/20ms
       pendingULaw.push(ulaw);
-      if (pendingULaw.length >= BATCH) {
-        const pcm = ulawToPcm(Buffer.concat(pendingULaw));
-        pendingULaw = [];
-        dg.sendPCM16LE(pcm);
-      }
+      if (pendingULaw.length >= BATCH) flushULaw();
+      clearTimeout(tailTimer);
+      tailTimer = setTimeout(flushULaw, 120); // tail flush to avoid stuck audio
       return;
     }
 
     if (msg.event === "stop") {
+      console.log("[CALL_STOP]", { convoId: ws.__convoId });
+      try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
     }
@@ -339,29 +395,52 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
-    console.log(JSON.stringify({ event:"CALL_END", convoId:ws.__convoId }));
+    console.log("[WS] closed", { convoId: ws.__convoId });
   });
 });
 
 /* ===== Turn handler: let the model decide, then dispatch tools ===== */
 async function handleTurn(ws, userText) {
-  // Step 1: get a model reply; if it requests a tool, execute and loop once
+  console.log("[TURN] user >", userText);
   const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-  let choice = await openaiChat(messages);
+  let choice;
+  try {
+    choice = await openaiChat(messages);
+  } catch(e){
+    console.error("[GPT] fatal", e.message);
+    return;
+  }
+
   // Tool call?
-  if (choice.message?.tool_calls?.length) {
+  if (choice?.message?.tool_calls?.length) {
     const toolCall = choice.message.tool_calls[0];
     const name = toolCall.function.name;
-    const args = JSON.parse(toolCall.function.arguments || "{}");
+    let args = {};
+    try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
+    console.log("[TOOL] call ->", name, args);
+
     const impl = Tools[name];
     let toolResult = { text:"" };
-    if (impl) toolResult = await impl(args);
+    if (impl) {
+      try { toolResult = await impl(args); }
+      catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+    } else {
+      console.warn("[TOOL] missing impl", name);
+    }
+
     // Feed tool result back to the model
-    const follow = await openaiChat([...messages,
-      choice.message,
-      { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
-    ]);
-    const botText = (follow.message?.content || "").trim() || toolResult.text || "";
+    let follow;
+    try {
+      follow = await openaiChat([...messages,
+        choice.message,
+        { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
+      ]);
+    } catch(e){
+      console.error("[GPT] follow error", e.message);
+      return;
+    }
+    const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
+    console.log("[TURN] bot (tool-follow) >", botText);
     if (botText) {
       await say(ws, botText);
       remember(ws.__mem, "bot", botText);
@@ -371,7 +450,8 @@ async function handleTurn(ws, userText) {
   }
 
   // No tool requested: just speak the assistant content
-  const botText = (choice.message?.content || "").trim();
+  const botText = (choice?.message?.content || "").trim();
+  console.log("[TURN] bot >", botText);
   if (botText) {
     await say(ws, botText);
     remember(ws.__mem, "bot", botText);
@@ -383,6 +463,7 @@ async function handleTurn(ws, userText) {
 async function updateSummary(mem) {
   const last = mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
   try {
+    const t0 = Date.now();
     const { data } = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -396,14 +477,16 @@ async function updateSummary(mem) {
       { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } }
     );
     mem.summary = data.choices[0].message.content.trim().slice(0, 500);
-  } catch {}
+    console.log("[SUMMARY] len", mem.summary.length, "ms", Date.now()-t0);
+  } catch(e){
+    console.warn("[SUMMARY] error", e.message);
+  }
 }
 
 /* ===== How to extend =====
 1) Add a tool:
    - Implement async function in Tools (return {text?, data?}).
    - Add its JSON schema in toolSchema.
-   - No dialog edits needed.
 
 2) Per-client setup:
    - Set BIZ_* env vars and CAP_* toggles.
