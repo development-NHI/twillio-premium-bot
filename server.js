@@ -71,20 +71,24 @@ Never guess facts: ask briefly or call a tool. Confirm before booking.
 
 /* ===== HTTP + TwiML ===== */
 const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));   // Twilio sends form-encoded
 app.use(bodyParser.json());
 
 app.get("/", (_, res) => res.status(200).send("OK: AI Voice Agent up"));
 
 app.post("/twiml", (req, res) => {
-  log.info("[HTTP] /twiml hit", { from: req.body?.From, callSid: req.body?.CallSid });
+  const from = req.body?.From || "";
+  const callSid = req.body?.CallSid || "";
+  log.info("[HTTP] /twiml hit", { from, callSid });
+
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
   const xml = `
     <Response>
       <Connect>
-        <Stream url="wss://${host}" track="inbound_audio">
-          <Parameter name="from" value="{{From}}"/>
-          <Parameter name="callSid" value="{{CallSid}}"/>
+        <Stream url="wss://${host}" track="inbound_track">
+          <Parameter name="from" value="${from}"/>
+          <Parameter name="callSid" value="${callSid}"/>
         </Stream>
       </Connect>
     </Response>`.trim();
