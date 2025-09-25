@@ -20,6 +20,10 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+/* NEW (for transfer) */
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
+const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
 
 // Per-tenant business config (swap or fetch from your dashboard)
 const BIZ = {
@@ -88,6 +92,20 @@ app.post("/twiml", (req, res) => {
     </Response>
   `.trim());
   console.log("[HTTP] TwiML served with host", host);
+});
+
+/* NEW: TwiML handoff target used during live transfer */
+app.post("/handoff", (req, res) => {
+  const from = req.body?.From || BIZ.phone || "";
+  console.log("[HTTP] /handoff", { from, owner: OWNER_PHONE });
+  res.type("text/xml").send(`
+    <Response>
+      <Say voice="alice">Transferring you now.</Say>
+      <Dial callerId="${from || BIZ.phone || ""}">
+        <Number>${OWNER_PHONE}</Number>
+      </Dial>
+    </Response>
+  `.trim());
 });
 
 const server = app.listen(PORT, () => console.log(`[INIT] listening on ${PORT}`));
@@ -213,10 +231,35 @@ const Tools = {
     try { if (URLS.FAQ_LOG) await axios.post(URLS.FAQ_LOG, { topic, service }); } catch {}
     return { data:{ topic, service } };
   },
-  async transfer({ reason }) {
-    console.log("[TOOL] transfer", { reason });
+  /* UPDATED: live transfer via Twilio Redirect */
+  async transfer({ reason, callSid }) {
+    console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!CAPABILITIES.transfer) return { text:"" };
-    return { text:"Transferring you now." };
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
+      console.warn("[TOOL] transfer missing config or callSid");
+      return { text:"Sorry, I can’t transfer right now." };
+    }
+    try {
+      const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+      const handoffUrl = `https://${host}/handoff`;
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
+      const params = new URLSearchParams({ Url: handoffUrl, Method: "POST" }); // redirect to /handoff TwiML
+      const auth = {
+        username: TWILIO_ACCOUNT_SID,
+        password: TWILIO_AUTH_TOKEN
+      };
+      const t0 = Date.now();
+      const resp = await axios.post(url, params, {
+        auth,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 10000
+      });
+      console.log("[TOOL] transfer redirect ok", { ms: Date.now()-t0, status: resp.status });
+      return { text:"Transferring you now." };
+    } catch(e){
+      console.error("[TOOL] transfer redirect error", e.message);
+      return { text:"Sorry, transfer failed." };
+    }
   },
   async store_memory({ key, value }) {
     console.log("[TOOL] store_memory", { key });
@@ -254,7 +297,7 @@ const toolSchema = [
   { type:"function", function:{
       name:"transfer",
       description:"Transfer the caller to a human",
-      parameters:{ type:"object", properties:{ reason:{type:"string"} }, required:[] }
+      parameters:{ type:"object", properties:{ reason:{type:"string"}, callSid:{type:"string"} }, required:[] }
   }},
   { type:"function", function:{
       name:"store_memory",
@@ -349,7 +392,9 @@ wss.on("connection", (ws) => {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
       ws.__from = msg.start?.customParameters?.from || "";
-      console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from });
+      /* NEW: capture CallSid from Twilio stream params */
+      ws.__callSid = msg.start?.customParameters?.callSid || "";
+      console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
       // Optional: fetch tenant prompt from your dashboard
       ws.__tenantPrompt = "";
@@ -417,6 +462,8 @@ async function handleTurn(ws, userText) {
     const name = toolCall.function.name;
     let args = {};
     try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
+    /* NEW: pass CallSid into transfer tool automatically */
+    if (name === "transfer" && !args.callSid) args.callSid = ws.__callSid || "";
     console.log("[TOOL] call ->", name, args);
 
     const impl = Tools[name];
