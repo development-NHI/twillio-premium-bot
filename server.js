@@ -291,7 +291,6 @@ const Tools = {
       return { text:"" };
     }
     try {
-      // Fast hangup by completing the call
       const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Status: "completed" });
       const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
@@ -425,10 +424,17 @@ wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
   let dg = null;
   let pendingULaw = [];
-  // Reduce log flood by batching frames (~200ms @ 8kHz)
-  const BATCH = 10;
+  const BATCH = 10; // ~200ms @ 8kHz
   let tailTimer = null;
   let lastMediaLog = 0;
+
+  // NEW: per-call state to prevent early hangups & double-turns
+  ws.__askedCloseConfirm = false;
+  ws.__closeIntentCount = 0;
+  ws.__handling = false;
+  ws.__queuedTurn = null;
+  ws.__lastUserText = "";
+  ws.__lastUserAt = 0;
 
   function flushULaw() {
     if (!pendingULaw.length || !dg) return;
@@ -452,11 +458,9 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       const cp = msg.start?.customParameters || {};
       ws.__from = cp.from || "";
-      // Capture either CallSid or callSid (logs showed both work)
       ws.__callSid = cp.CallSid || cp.callSid || "";
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-      // Optional: fetch tenant prompt from your dashboard
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
@@ -470,8 +474,34 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
+          // NEW: debounce duplicate finals (fixes “double response”)
+          const now = Date.now();
+          if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
+            console.log("[TURN] dropped duplicate final");
+            return;
+          }
+          ws.__lastUserText = text;
+          ws.__lastUserAt = now;
+
+          // NEW: serialize turns to avoid overlapping LLM calls
+          if (ws.__handling) {
+            ws.__queuedTurn = text; // keep the last one
+            return;
+          }
+          ws.__handling = true;
           remember(ws.__mem, "user", text);
           await handleTurn(ws, text);
+          ws.__handling = false;
+
+          // drain one queued turn (latest)
+          if (ws.__queuedTurn) {
+            const next = ws.__queuedTurn;
+            ws.__queuedTurn = null;
+            ws.__handling = true;
+            remember(ws.__mem, "user", next);
+            await handleTurn(ws, next);
+            ws.__handling = false;
+          }
         }
       });
 
@@ -486,7 +516,7 @@ wss.on("connection", (ws) => {
       pendingULaw.push(ulaw);
       if (pendingULaw.length >= BATCH) flushULaw();
       clearTimeout(tailTimer);
-      tailTimer = setTimeout(flushULaw, 120); // tail flush to avoid stuck audio
+      tailTimer = setTimeout(flushULaw, 120);
       return;
     }
 
@@ -508,13 +538,28 @@ wss.on("connection", (ws) => {
 async function handleTurn(ws, userText) {
   console.log("[TURN] user >", userText);
 
-  // Lightweight “farewell guard”: if caller says they’re fine, confirm once.
-  const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'm fine|all set|im fine|im good)\b/i;
-  if (byeHint.test(userText) && !ws.__askedCloseConfirm) {
-    ws.__askedCloseConfirm = true;
-    const line = "Got it. Anything else I can help with before I let you go?";
-    await say(ws, line);
-    remember(ws.__mem, "bot", line);
+  // NEW: “farewell guard” requiring two clear declines before hangup
+  const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope\.? that'?s it|bye|goodbye|see you)\b/i;
+
+  if (byeHint.test(userText)) {
+    ws.__closeIntentCount += 1;
+
+    if (ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
+      ws.__askedCloseConfirm = true;
+      const line = "Got it. Anything else I can help with before I let you go?";
+      await say(ws, line);
+      remember(ws.__mem, "bot", line);
+      await updateSummary(ws.__mem);
+      return;
+    }
+
+    // Second clear decline (or explicit bye) — we handle the goodbye ourselves
+    const farewell = "Alright — thanks for calling. Have a great day! Bye.";
+    await say(ws, farewell);
+    remember(ws.__mem, "bot", farewell);
+    await sleep(1500); // longer grace so it never feels abrupt
+    try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
+    try { ws.close(); } catch {}
     await updateSummary(ws.__mem);
     return;
   }
@@ -539,12 +584,12 @@ async function handleTurn(ws, userText) {
     if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
     console.log("[TOOL] call ->", name, args);
 
-    // Special graceful path for end_call: say goodbye first, then complete the call
+    // Graceful path if model asks to end_call anyway
     if (name === "end_call") {
       const farewell = "Alright — thanks for calling. Have a great day! Bye.";
       await say(ws, farewell);
       remember(ws.__mem, "bot", farewell);
-      await sleep(900); // let a bit of audio buffer out
+      await sleep(1500);
       try { await Tools.end_call(args); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
       try { ws.close(); } catch {}
       await updateSummary(ws.__mem);
