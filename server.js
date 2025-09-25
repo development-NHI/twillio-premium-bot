@@ -60,10 +60,22 @@ const CAPABILITIES = {
 
 // Primary prompt (may be overridden by dashboard at call start)
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are {{BIZ_NAME}}'s AI receptionist. Speak naturally. Be concise.
-Follow the business rules in <biz_profile>. Use tools when needed.
-Never guess facts: ask briefly or call a tool. Confirm before booking.
-If the caller says bye / done / hang up, call the end_call tool immediately.
+You are {{BIZ_NAME}}'s AI receptionist.
+
+Tone & style:
+- Sound friendly and human. Use short, natural sentences; it's ok to say “sure”, “got it”, “no worries”.
+- Acknowledge what the caller just said (“mirroring”) before asking the next question.
+- Avoid repeating the same sentence more than once.
+
+Behavior:
+- Follow the business rules in <biz_profile>. Use tools for availability, booking, canceling, FAQs, transfer, and hangup. Never fabricate tool results.
+- Confirm key details before booking. Offer nearby alternatives if there’s a conflict.
+- For small talk, respond briefly then steer back to helping.
+- Keep replies under ~25 words unless reading back details.
+
+Hangup etiquette:
+- Do NOT end the call on the first “that’s all”/“I’m good”. First ask: “Anything else I can help with?”
+- If the caller then clearly declines (e.g., “no”, “that’s all”, “bye”), say a warm goodbye and then call end_call.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -276,7 +288,7 @@ const Tools = {
     console.log("[TOOL] end_call", { callSid, reason });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) {
       console.warn("[TOOL] end_call missing config or callSid");
-      return { text:"Sorry, I can’t hang up right now." };
+      return { text:"" };
     }
     try {
       // Fast hangup by completing the call
@@ -290,10 +302,10 @@ const Tools = {
         timeout: 10000
       });
       console.log("[TOOL] end_call ok", { ms: Date.now()-t0, status: resp.status });
-      return { text:"Goodbye." };
+      return { text:"" };
     } catch(e){
       console.error("[TOOL] end_call error", e.message);
-      return { text:"Sorry, I couldn’t end the call." };
+      return { text:"" };
     }
   },
   async store_memory({ key, value }) {
@@ -388,12 +400,13 @@ function buildSystemPrompt(mem, tenantPrompt) {
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` },
     { role:"system", content:
 `Rules:
-- Speak like a real person. One or two sentences max per turn.
-- Use tools for availability, booking, canceling, FAQs, transfer, and hangup.
-- Do not fabricate tool results.
-- If caller requests a transfer, call the transfer tool.
-- If caller says bye / hang up / no more help, call end_call.
-- Keep replies under 25 words unless reading back details.
+- Sound human and conversational. Acknowledge, then move things forward.
+- Use tools for availability, booking, canceling, FAQs, transfer, and hangup. Do not fabricate.
+- Extract and reuse caller details you learn: name, phone, service, date, time.
+- Confirm key details before booking. Offer alternatives if conflict.
+- On first hint of “I’m good / that’s all / bye”: ask “Anything else I can help with?”.
+- If they then decline clearly, say a warm goodbye, then end the call.
+- Keep replies under ~25 words unless reading back details.
 ` }
   ];
 }
@@ -494,6 +507,18 @@ wss.on("connection", (ws) => {
 /* ===== Turn handler: let the model decide, then dispatch tools ===== */
 async function handleTurn(ws, userText) {
   console.log("[TURN] user >", userText);
+
+  // Lightweight “farewell guard”: if caller says they’re fine, confirm once.
+  const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'm fine|all set|im fine|im good)\b/i;
+  if (byeHint.test(userText) && !ws.__askedCloseConfirm) {
+    ws.__askedCloseConfirm = true;
+    const line = "Got it. Anything else I can help with before I let you go?";
+    await say(ws, line);
+    remember(ws.__mem, "bot", line);
+    await updateSummary(ws.__mem);
+    return;
+  }
+
   const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
   let choice;
   try {
@@ -509,10 +534,24 @@ async function handleTurn(ws, userText) {
     const name = toolCall.function.name;
     let args = {};
     try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
+
     // Auto-pass CallSid into transfer / end_call tools
     if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
     console.log("[TOOL] call ->", name, args);
 
+    // Special graceful path for end_call: say goodbye first, then complete the call
+    if (name === "end_call") {
+      const farewell = "Alright — thanks for calling. Have a great day! Bye.";
+      await say(ws, farewell);
+      remember(ws.__mem, "bot", farewell);
+      await sleep(900); // let a bit of audio buffer out
+      try { await Tools.end_call(args); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
+      try { ws.close(); } catch {}
+      await updateSummary(ws.__mem);
+      return;
+    }
+
+    // Normal tool flow
     const impl = Tools[name];
     let toolResult = { text:"" };
     if (impl) {
@@ -540,8 +579,8 @@ async function handleTurn(ws, userText) {
       remember(ws.__mem, "bot", botText);
     }
 
-    // If we just ended the call or redirected to transfer, close local resources promptly
-    if (name === "end_call" || name === "transfer") {
+    // If we just redirected to transfer, close local resources promptly
+    if (name === "transfer") {
       try { ws.close(); } catch {}
     }
 
