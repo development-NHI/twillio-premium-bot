@@ -20,7 +20,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
-/* NEW (for transfer) */
+/* Twilio (transfer + hangup) */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
@@ -63,11 +63,11 @@ const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are {{BIZ_NAME}}'s AI receptionist. Speak naturally. Be concise.
 Follow the business rules in <biz_profile>. Use tools when needed.
 Never guess facts: ask briefly or call a tool. Confirm before booking.
+If the caller says bye / done / hang up, call the end_call tool immediately.
 `;
 
 /* ===== HTTP + TwiML ===== */
 const app = express();
-// Twilio posts x-www-form-urlencoded by default:
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
@@ -80,14 +80,15 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  // *** IMPORTANT: track must be one of inbound_track|outbound_track|both_tracks ***
+  // track must be inbound_track|outbound_track|both_tracks
   res.send(`
     <Response>
       <Connect>
         <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
-          <!-- Use CallSid casing so it's easy to read later -->
+          <!-- Provide both casings; Twilio forwards exactly -->
           <Parameter name="CallSid" value="${callSid}"/>
+          <Parameter name="callSid" value="${callSid}"/>
         </Stream>
       </Connect>
     </Response>
@@ -95,7 +96,7 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* NEW: TwiML handoff target used during live transfer */
+/* TwiML handoff target used during live transfer */
 app.post("/handoff", (req, res) => {
   const from = req.body?.From || BIZ.phone || "";
   console.log("[HTTP] /handoff", { from, owner: OWNER_PHONE });
@@ -107,6 +108,11 @@ app.post("/handoff", (req, res) => {
       </Dial>
     </Response>
   `.trim());
+});
+
+/* Optional: simple goodbye TwiML (not required when completing the call) */
+app.post("/goodbye", (_req, res) => {
+  res.type("text/xml").send(`<Response><Say voice="alice">Goodbye.</Say><Hangup/></Response>`);
 });
 
 const server = app.listen(PORT, () => console.log(`[INIT] listening on ${PORT}`));
@@ -133,7 +139,7 @@ function startDeepgram({ onFinal }) {
   });
   dg.on("open", () => console.log("[Deepgram] open"));
 
-  // Throttle noisy interim logs
+  // Throttle interim logs (reduce flood seen in live tail)
   let lastInterimLog = 0;
   dg.on("message", (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
@@ -203,7 +209,7 @@ const Tools = {
       const { data } = await axios.post(URLS.CAL_READ, payload, { timeout:12000 });
       console.log("[TOOL] read_availability ok", { ms: Date.now()-t0 });
       return { data };
-    } catch(e){ console.error("[TOOL] read_availability error]", e.message); return { text:"I could not reach the calendar." }; }
+    } catch(e){ console.error("[TOOL] read_availability error", e.message); return { text:"I could not reach the calendar." }; }
   },
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
@@ -219,7 +225,7 @@ const Tools = {
       const { data } = await axios.post(URLS.CAL_CREATE, payload, { timeout:12000 });
       console.log("[TOOL] book_appointment ok", { ms: Date.now()-t0 });
       return { data, text:"Booked." };
-    } catch(e){ console.error("[TOOL] book_appointment error]", e.message); return { text:"I couldn't book that just now." }; }
+    } catch(e){ console.error("[TOOL] book_appointment error", e.message); return { text:"I couldn't book that just now." }; }
   },
   async cancel_appointment({ event_id }) {
     console.log("[TOOL] cancel_appointment", { event_id });
@@ -230,7 +236,7 @@ const Tools = {
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
       console.log("[TOOL] cancel_appointment result", { ms: Date.now()-t0, ok });
       return { text: ok ? "Canceled." : "Could not cancel." , data };
-    } catch(e){ console.error("[TOOL] cancel_appointment error]", e.message); return { text:"I couldn't cancel that." }; }
+    } catch(e){ console.error("[TOOL] cancel_appointment error", e.message); return { text:"I couldn't cancel that." }; }
   },
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
@@ -238,7 +244,7 @@ const Tools = {
     try { if (URLS.FAQ_LOG) await axios.post(URLS.FAQ_LOG, { topic, service }); } catch {}
     return { data:{ topic, service } };
   },
-  /* UPDATED: live transfer via Twilio Redirect */
+  /* Live transfer via Twilio Redirect */
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!CAPABILITIES.transfer) return { text:"" };
@@ -263,6 +269,31 @@ const Tools = {
     } catch(e){
       console.error("[TOOL] transfer redirect error", e.message);
       return { text:"Sorry, transfer failed." };
+    }
+  },
+  /* Explicit hangup */
+  async end_call({ callSid, reason }) {
+    console.log("[TOOL] end_call", { callSid, reason });
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) {
+      console.warn("[TOOL] end_call missing config or callSid");
+      return { text:"Sorry, I can’t hang up right now." };
+    }
+    try {
+      // Fast hangup by completing the call
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
+      const params = new URLSearchParams({ Status: "completed" });
+      const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
+      const t0 = Date.now();
+      const resp = await axios.post(url, params, {
+        auth,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 10000
+      });
+      console.log("[TOOL] end_call ok", { ms: Date.now()-t0, status: resp.status });
+      return { text:"Goodbye." };
+    } catch(e){
+      console.error("[TOOL] end_call error", e.message);
+      return { text:"Sorry, I couldn’t end the call." };
     }
   },
   async store_memory({ key, value }) {
@@ -302,6 +333,11 @@ const toolSchema = [
       name:"transfer",
       description:"Transfer the caller to a human",
       parameters:{ type:"object", properties:{ reason:{type:"string"}, callSid:{type:"string"} }, required:[] }
+  }},
+  { type:"function", function:{
+      name:"end_call",
+      description:"Politely end the call immediately",
+      parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] }
   }},
   { type:"function", function:{
       name:"store_memory",
@@ -353,11 +389,11 @@ function buildSystemPrompt(mem, tenantPrompt) {
     { role:"system", content:
 `Rules:
 - Speak like a real person. One or two sentences max per turn.
-- Use tools for availability, booking, canceling, FAQs. Do not fabricate.
-- Extract and reuse caller details you learn: name, phone, service, date, time.
-- Confirm key details before booking. Offer nearby alternatives if conflict.
-- If a capability is unavailable, apologize briefly and offer what is available.
-- Always keep replies under 25 words unless reading back details.
+- Use tools for availability, booking, canceling, FAQs, transfer, and hangup.
+- Do not fabricate tool results.
+- If caller requests a transfer, call the transfer tool.
+- If caller says bye / hang up / no more help, call end_call.
+- Keep replies under 25 words unless reading back details.
 ` }
   ];
 }
@@ -373,7 +409,7 @@ function buildMessages(mem, userText, tenantPrompt) {
 
 /* ===== WS wiring ===== */
 wss.on("connection", (ws) => {
-  console.log("[WS] connection from Twilio");
+  console.log("[WS] connection from Twilio]");
   let dg = null;
   let pendingULaw = [];
   // Reduce log flood by batching frames (~200ms @ 8kHz)
@@ -403,7 +439,7 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       const cp = msg.start?.customParameters || {};
       ws.__from = cp.from || "";
-      // Capture either CallSid or callSid
+      // Capture either CallSid or callSid (logs showed both work)
       ws.__callSid = cp.CallSid || cp.callSid || "";
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
@@ -473,8 +509,8 @@ async function handleTurn(ws, userText) {
     const name = toolCall.function.name;
     let args = {};
     try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
-    // Auto-pass CallSid into transfer tool
-    if (name === "transfer" && !args.callSid) args.callSid = ws.__callSid || "";
+    // Auto-pass CallSid into transfer / end_call tools
+    if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
     console.log("[TOOL] call ->", name, args);
 
     const impl = Tools[name];
@@ -503,6 +539,12 @@ async function handleTurn(ws, userText) {
       await say(ws, botText);
       remember(ws.__mem, "bot", botText);
     }
+
+    // If we just ended the call or redirected to transfer, close local resources promptly
+    if (name === "end_call" || name === "transfer") {
+      try { ws.close(); } catch {}
+    }
+
     await updateSummary(ws.__mem);
     return;
   }
