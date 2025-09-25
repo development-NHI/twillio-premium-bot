@@ -86,7 +86,8 @@ app.post("/twiml", (req, res) => {
       <Connect>
         <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
-          <Parameter name="callSid" value="${callSid}"/>
+          <!-- Use CallSid casing so it's easy to read later -->
+          <Parameter name="CallSid" value="${callSid}"/>
         </Stream>
       </Connect>
     </Response>
@@ -131,6 +132,9 @@ function startDeepgram({ onFinal }) {
     perMessageDeflate: false
   });
   dg.on("open", () => console.log("[Deepgram] open"));
+
+  // Throttle noisy interim logs
+  let lastInterimLog = 0;
   dg.on("message", (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
     if (ev.type !== "Results") return;
@@ -141,15 +145,18 @@ function startDeepgram({ onFinal }) {
       console.log(`[ASR FINAL] ${text}`);
       onFinal?.(text);
     } else {
-      console.log(`[ASR interim] ${text}`);
+      const now = Date.now();
+      if (now - lastInterimLog > 1500) {
+        console.log(`[ASR interim] ${text}`);
+        lastInterimLog = now;
+      }
     }
   });
   dg.on("error", e => console.error("[Deepgram error]", e.message));
   dg.on("close", () => console.log("[Deepgram] closed"));
   return {
     sendULaw(buf){
-      try { dg.send(buf); console.log("[Deepgram] >> μ-law bytes", buf.length); }
-      catch(e){ console.error("[Deepgram send error]", e.message); }
+      try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
     close(){ try { dg.close(); } catch {} }
   };
@@ -196,7 +203,7 @@ const Tools = {
       const { data } = await axios.post(URLS.CAL_READ, payload, { timeout:12000 });
       console.log("[TOOL] read_availability ok", { ms: Date.now()-t0 });
       return { data };
-    } catch(e){ console.error("[TOOL] read_availability error", e.message); return { text:"I could not reach the calendar." }; }
+    } catch(e){ console.error("[TOOL] read_availability error]", e.message); return { text:"I could not reach the calendar." }; }
   },
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
@@ -212,7 +219,7 @@ const Tools = {
       const { data } = await axios.post(URLS.CAL_CREATE, payload, { timeout:12000 });
       console.log("[TOOL] book_appointment ok", { ms: Date.now()-t0 });
       return { data, text:"Booked." };
-    } catch(e){ console.error("[TOOL] book_appointment error", e.message); return { text:"I couldn't book that just now." }; }
+    } catch(e){ console.error("[TOOL] book_appointment error]", e.message); return { text:"I couldn't book that just now." }; }
   },
   async cancel_appointment({ event_id }) {
     console.log("[TOOL] cancel_appointment", { event_id });
@@ -223,7 +230,7 @@ const Tools = {
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
       console.log("[TOOL] cancel_appointment result", { ms: Date.now()-t0, ok });
       return { text: ok ? "Canceled." : "Could not cancel." , data };
-    } catch(e){ console.error("[TOOL] cancel_appointment error", e.message); return { text:"I couldn't cancel that." }; }
+    } catch(e){ console.error("[TOOL] cancel_appointment error]", e.message); return { text:"I couldn't cancel that." }; }
   },
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
@@ -244,10 +251,7 @@ const Tools = {
       const handoffUrl = `https://${host}/handoff`;
       const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Url: handoffUrl, Method: "POST" }); // redirect to /handoff TwiML
-      const auth = {
-        username: TWILIO_ACCOUNT_SID,
-        password: TWILIO_AUTH_TOKEN
-      };
+      const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
       const t0 = Date.now();
       const resp = await axios.post(url, params, {
         auth,
@@ -255,7 +259,7 @@ const Tools = {
         timeout: 10000
       });
       console.log("[TOOL] transfer redirect ok", { ms: Date.now()-t0, status: resp.status });
-      return { text:"Transferring you now." };
+      return { text:"Transferring you now. Please hold." };
     } catch(e){
       console.error("[TOOL] transfer redirect error", e.message);
       return { text:"Sorry, transfer failed." };
@@ -372,14 +376,20 @@ wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio");
   let dg = null;
   let pendingULaw = [];
-  const BATCH = 1;               // flush every frame to catch short utterances like "hi"
+  // Reduce log flood by batching frames (~200ms @ 8kHz)
+  const BATCH = 10;
   let tailTimer = null;
+  let lastMediaLog = 0;
 
   function flushULaw() {
     if (!pendingULaw.length || !dg) return;
     const chunk = Buffer.concat(pendingULaw);
     pendingULaw = [];
-    console.log("[MEDIA] flush", { frames: chunk.length / 160, bytes: chunk.length });
+    const now = Date.now();
+    if (now - lastMediaLog > 2000) {
+      console.log("[MEDIA] flush", { frames: Math.round(chunk.length / 160), bytes: chunk.length });
+      lastMediaLog = now;
+    }
     dg.sendULaw(chunk);
   }
 
@@ -391,9 +401,10 @@ wss.on("connection", (ws) => {
     if (msg.event === "start") {
       ws.__streamSid = msg.start.streamSid;
       ws.__convoId = uuidv4();
-      ws.__from = msg.start?.customParameters?.from || "";
-      /* NEW: capture CallSid from Twilio stream params */
-      ws.__callSid = msg.start?.customParameters?.callSid || "";
+      const cp = msg.start?.customParameters || {};
+      ws.__from = cp.from || "";
+      // Capture either CallSid or callSid
+      ws.__callSid = cp.CallSid || cp.callSid || "";
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
       // Optional: fetch tenant prompt from your dashboard
@@ -462,7 +473,7 @@ async function handleTurn(ws, userText) {
     const name = toolCall.function.name;
     let args = {};
     try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
-    /* NEW: pass CallSid into transfer tool automatically */
+    // Auto-pass CallSid into transfer tool
     if (name === "transfer" && !args.callSid) args.callSid = ws.__callSid || "";
     console.log("[TOOL] call ->", name, args);
 
