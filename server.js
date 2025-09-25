@@ -248,7 +248,7 @@ const Tools = {
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
       console.log("[TOOL] cancel_appointment result", { ms: Date.now()-t0, ok });
       return { text: ok ? "Canceled." : "Could not cancel." , data };
-    } catch(e){ console.error("[TOOL] cancel_appointment error", e.message); return { text:"I couldn't cancel that." }; }
+    } catch(e){ console.error("[TOOL] cancel_appointment error]", e.message); return { text:"I couldn't cancel that." }; }
   },
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
@@ -268,7 +268,7 @@ const Tools = {
       const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
       const handoffUrl = `https://${host}/handoff`;
       const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
-      const params = new URLSearchParams({ Url: handoffUrl, Method: "POST" }); // redirect to /handoff TwiML
+      const params = new URLSearchParams({ Url: handoffUrl, Method: "POST" });
       const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
       const t0 = Date.now();
       const resp = await axios.post(url, params, {
@@ -428,13 +428,31 @@ wss.on("connection", (ws) => {
   let tailTimer = null;
   let lastMediaLog = 0;
 
-  // NEW: per-call state to prevent early hangups & double-turns
+  // Per-call state
   ws.__askedCloseConfirm = false;
   ws.__closeIntentCount = 0;
   ws.__handling = false;
   ws.__queuedTurn = null;
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
+
+  // NEW: graceful hangup window (prevents early cut-offs)
+  ws.__hangTimer = null;
+  ws.__pendingHangupUntil = 0;
+
+  function clearHangTimer() {
+    if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+    ws.__pendingHangupUntil = 0;
+  }
+
+  function scheduleHangup(ms = 2500) {
+    clearHangTimer();
+    ws.__pendingHangupUntil = Date.now() + ms;
+    ws.__hangTimer = setTimeout(async () => {
+      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
+      try { ws.close(); } catch {}
+    }, ms);
+  }
 
   function flushULaw() {
     if (!pendingULaw.length || !dg) return;
@@ -474,7 +492,16 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          // NEW: debounce duplicate finals (fixes “double response”)
+          // If user speaks during the hangup grace window, cancel hangup and continue
+          if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
+            console.log("[HANG] user spoke during grace window — cancel hangup");
+            clearHangTimer();
+            // Reset close intents so we don't immediately try again
+            ws.__closeIntentCount = 0;
+            ws.__askedCloseConfirm = false;
+          }
+
+          // Debounce duplicate finals
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
@@ -483,9 +510,9 @@ wss.on("connection", (ws) => {
           ws.__lastUserText = text;
           ws.__lastUserAt = now;
 
-          // NEW: serialize turns to avoid overlapping LLM calls
+          // Serialize turns
           if (ws.__handling) {
-            ws.__queuedTurn = text; // keep the last one
+            ws.__queuedTurn = text; // keep latest
             return;
           }
           ws.__handling = true;
@@ -493,7 +520,7 @@ wss.on("connection", (ws) => {
           await handleTurn(ws, text);
           ws.__handling = false;
 
-          // drain one queued turn (latest)
+          // Drain one queued turn
           if (ws.__queuedTurn) {
             const next = ws.__queuedTurn;
             ws.__queuedTurn = null;
@@ -530,118 +557,116 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     try { dg?.close(); } catch {}
+    clearHangTimer();
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
-});
 
-/* ===== Turn handler: let the model decide, then dispatch tools ===== */
-async function handleTurn(ws, userText) {
-  console.log("[TURN] user >", userText);
+  /* ===== Turn handler: let the model decide, then dispatch tools ===== */
+  async function handleTurn(ws, userText) {
+    console.log("[TURN] user >", userText);
 
-  // NEW: “farewell guard” requiring two clear declines before hangup
-  const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope\.? that'?s it|bye|goodbye|see you)\b/i;
+    // “farewell guard”: two clear declines before scheduling hangup
+    const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope\.?\s*that'?s it|bye|goodbye|see you)\b/i;
 
-  if (byeHint.test(userText)) {
-    ws.__closeIntentCount += 1;
+    if (byeHint.test(userText)) {
+      ws.__closeIntentCount += 1;
 
-    if (ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
-      ws.__askedCloseConfirm = true;
-      const line = "Got it. Anything else I can help with before I let you go?";
-      await say(ws, line);
-      remember(ws.__mem, "bot", line);
-      await updateSummary(ws.__mem);
-      return;
-    }
+      if (ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
+        ws.__askedCloseConfirm = true;
+        const line = "Got it. Anything else I can help with before I let you go?";
+        await say(ws, line);
+        remember(ws.__mem, "bot", line);
+        await updateSummary(ws.__mem);
+        return;
+      }
 
-    // Second clear decline (or explicit bye) — we handle the goodbye ourselves
-    const farewell = "Alright — thanks for calling. Have a great day! Bye.";
-    await say(ws, farewell);
-    remember(ws.__mem, "bot", farewell);
-    await sleep(1500); // longer grace so it never feels abrupt
-    try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
-    try { ws.close(); } catch {}
-    await updateSummary(ws.__mem);
-    return;
-  }
-
-  const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-  let choice;
-  try {
-    choice = await openaiChat(messages);
-  } catch(e){
-    console.error("[GPT] fatal", e.message);
-    return;
-  }
-
-  // Tool call?
-  if (choice?.message?.tool_calls?.length) {
-    const toolCall = choice.message.tool_calls[0];
-    const name = toolCall.function.name;
-    let args = {};
-    try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
-
-    // Auto-pass CallSid into transfer / end_call tools
-    if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-    console.log("[TOOL] call ->", name, args);
-
-    // Graceful path if model asks to end_call anyway
-    if (name === "end_call") {
+      // Second clear decline (or explicit bye) — say goodbye, then schedule hangup
       const farewell = "Alright — thanks for calling. Have a great day! Bye.";
       await say(ws, farewell);
       remember(ws.__mem, "bot", farewell);
-      await sleep(1500);
-      try { await Tools.end_call(args); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
-      try { ws.close(); } catch {}
+      await updateSummary(ws.__mem);
+      // Give a grace window; if user talks, we cancel
+      scheduleHangup(2500);
+      return;
+    }
+
+    const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
+    let choice;
+    try {
+      choice = await openaiChat(messages);
+    } catch(e){
+      console.error("[GPT] fatal", e.message);
+      return;
+    }
+
+    // Tool call?
+    if (choice?.message?.tool_calls?.length) {
+      const toolCall = choice.message.tool_calls[0];
+      const name = toolCall.function.name;
+      let args = {};
+      try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
+
+      // Auto-pass CallSid into transfer / end_call tools
+      if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+      console.log("[TOOL] call ->", name, args);
+
+      // If model asks to end_call anyway, still use grace window
+      if (name === "end_call") {
+        const farewell = "Alright — thanks for calling. Have a great day! Bye.";
+        await say(ws, farewell);
+        remember(ws.__mem, "bot", farewell);
+        await updateSummary(ws.__mem);
+        scheduleHangup(2500);
+        return;
+      }
+
+      // Normal tool flow
+      const impl = Tools[name];
+      let toolResult = { text:"" };
+      if (impl) {
+        try { toolResult = await impl(args); }
+        catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+      } else {
+        console.warn("[TOOL] missing impl", name);
+      }
+
+      // Feed tool result back to the model
+      let follow;
+      try {
+        follow = await openaiChat([...messages,
+          choice.message,
+          { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
+        ]);
+      } catch(e){
+        console.error("[GPT] follow error", e.message);
+        return;
+      }
+      const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
+      console.log("[TURN] bot (tool-follow) >", botText);
+      if (botText) {
+        await say(ws, botText);
+        remember(ws.__mem, "bot", botText);
+      }
+
+      // If we just redirected to transfer, close local resources promptly
+      if (name === "transfer") {
+        try { ws.close(); } catch {}
+      }
+
       await updateSummary(ws.__mem);
       return;
     }
 
-    // Normal tool flow
-    const impl = Tools[name];
-    let toolResult = { text:"" };
-    if (impl) {
-      try { toolResult = await impl(args); }
-      catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
-    } else {
-      console.warn("[TOOL] missing impl", name);
-    }
-
-    // Feed tool result back to the model
-    let follow;
-    try {
-      follow = await openaiChat([...messages,
-        choice.message,
-        { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
-      ]);
-    } catch(e){
-      console.error("[GPT] follow error", e.message);
-      return;
-    }
-    const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
-    console.log("[TURN] bot (tool-follow) >", botText);
+    // No tool requested: just speak the assistant content
+    const botText = (choice?.message?.content || "").trim();
+    console.log("[TURN] bot >", botText);
     if (botText) {
       await say(ws, botText);
       remember(ws.__mem, "bot", botText);
     }
-
-    // If we just redirected to transfer, close local resources promptly
-    if (name === "transfer") {
-      try { ws.close(); } catch {}
-    }
-
     await updateSummary(ws.__mem);
-    return;
   }
-
-  // No tool requested: just speak the assistant content
-  const botText = (choice?.message?.content || "").trim();
-  console.log("[TURN] bot >", botText);
-  if (botText) {
-    await say(ws, botText);
-    remember(ws.__mem, "bot", botText);
-  }
-  await updateSummary(ws.__mem);
-}
+});
 
 /* ===== Rolling summary to keep context tight ===== */
 async function updateSummary(mem) {
