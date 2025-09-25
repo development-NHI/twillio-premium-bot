@@ -25,7 +25,7 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
 
-// Per-tenant business config (swap or fetch from your dashboard)
+/* Per-tenant business config */
 const BIZ = {
   id: process.env.BIZ_ID || "oldline",
   name: process.env.BIZ_NAME || "Old Line Barbershop",
@@ -40,25 +40,25 @@ const BIZ = {
   ]`)
 };
 
-// External endpoints (point these to your dashboard services)
+/* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
-  CAL_READ: process.env.MAKE_READ_URL || "",
-  CAL_CREATE: process.env.MAKE_CREATE_URL || "",
-  CAL_DELETE: process.env.MAKE_DELETE_URL || "",
-  FAQ_LOG: process.env.MAKE_FAQ_URL || "",
-  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || "" // optional override per-tenant
+  CAL_READ:   process.env.REPLIT_READ_URL   || process.env.DASH_CAL_READ_URL   || "",
+  CAL_CREATE: process.env.REPLIT_CREATE_URL || process.env.DASH_CAL_CREATE_URL || "",
+  CAL_DELETE: process.env.REPLIT_DELETE_URL || process.env.DASH_CAL_CANCEL_URL || "",
+  FAQ_LOG:    process.env.REPLIT_FAQ_URL    || process.env.DASH_CALL_LOG_URL   || "",
+  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || ""
 };
 
-// Feature toggles per tenant
+/* Feature toggles per tenant */
 const CAPABILITIES = {
-  booking: (process.env.CAP_BOOKING ?? "true") === "true",
-  cancel:  (process.env.CAP_CANCEL  ?? "true") === "true",
-  faq:     (process.env.CAP_FAQ     ?? "true") === "true",
+  booking:   (process.env.CAP_BOOKING   ?? "true") === "true",
+  cancel:    (process.env.CAP_CANCEL    ?? "true") === "true",
+  faq:       (process.env.CAP_FAQ       ?? "true") === "true",
   smalltalk: (process.env.CAP_SMALLTALK ?? "true") === "true",
   transfer:  (process.env.CAP_TRANSFER  ?? "false") === "true"
 };
 
-// Primary prompt (may be overridden by dashboard at call start)
+/* Primary prompt (may be overridden by dashboard at call start) */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are {{BIZ_NAME}}'s AI receptionist.
 
@@ -92,13 +92,11 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  // track must be inbound_track|outbound_track|both_tracks
   res.send(`
     <Response>
       <Connect>
         <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
-          <!-- Provide both casings; Twilio forwards exactly -->
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
@@ -122,7 +120,7 @@ app.post("/handoff", (req, res) => {
   `.trim());
 });
 
-/* Optional: simple goodbye TwiML (not required when completing the call) */
+/* Optional: simple goodbye TwiML */
 app.post("/goodbye", (_req, res) => {
   res.type("text/xml").send(`<Response><Say voice="alice">Goodbye.</Say><Hangup/></Response>`);
 });
@@ -151,7 +149,6 @@ function startDeepgram({ onFinal }) {
   });
   dg.on("open", () => console.log("[Deepgram] open"));
 
-  // Throttle interim logs (reduce flood seen in live tail)
   let lastInterimLog = 0;
   dg.on("message", (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
@@ -203,9 +200,9 @@ async function say(ws, text) {
 /* ===== Minimal Memory ===== */
 function newMemory() {
   return {
-    transcript: [],             // [{from:"user"|"bot", text}]
+    transcript: [],
     entities: { name:"", phone:"", service:"", date:"", time:"" },
-    summary: ""                 // short rolling summary for grounding
+    summary: ""
   };
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
@@ -256,12 +253,11 @@ const Tools = {
     try { if (URLS.FAQ_LOG) await axios.post(URLS.FAQ_LOG, { topic, service }); } catch {}
     return { data:{ topic, service } };
   },
-  /* Live transfer via Twilio Redirect */
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!CAPABILITIES.transfer) return { text:"" };
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
-      console.warn("[TOOL] transfer missing config or callSid");
+      console.warn("[TOOL] transfer missing config or callSid]");
       return { text:"Sorry, I can’t transfer right now." };
     }
     try {
@@ -283,7 +279,6 @@ const Tools = {
       return { text:"Sorry, transfer failed." };
     }
   },
-  /* Explicit hangup */
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) {
@@ -313,7 +308,7 @@ const Tools = {
   }
 };
 
-// Tool schema advertised to the model
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -436,7 +431,7 @@ wss.on("connection", (ws) => {
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
 
-  // NEW: graceful hangup window (prevents early cut-offs)
+  // Graceful hangup window
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
 
@@ -492,16 +487,13 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          // If user speaks during the hangup grace window, cancel hangup and continue
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — cancel hangup");
             clearHangTimer();
-            // Reset close intents so we don't immediately try again
             ws.__closeIntentCount = 0;
             ws.__askedCloseConfirm = false;
           }
 
-          // Debounce duplicate finals
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
@@ -510,9 +502,8 @@ wss.on("connection", (ws) => {
           ws.__lastUserText = text;
           ws.__lastUserAt = now;
 
-          // Serialize turns
           if (ws.__handling) {
-            ws.__queuedTurn = text; // keep latest
+            ws.__queuedTurn = text;
             return;
           }
           ws.__handling = true;
@@ -520,7 +511,6 @@ wss.on("connection", (ws) => {
           await handleTurn(ws, text);
           ws.__handling = false;
 
-          // Drain one queued turn
           if (ws.__queuedTurn) {
             const next = ws.__queuedTurn;
             ws.__queuedTurn = null;
@@ -539,7 +529,7 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "media") {
       if (!dg) return;
-      const ulaw = Buffer.from(msg.media?.payload || "", "base64"); // ~160 bytes/20ms
+      const ulaw = Buffer.from(msg.media?.payload || "", "base64");
       pendingULaw.push(ulaw);
       if (pendingULaw.length >= BATCH) flushULaw();
       clearTimeout(tailTimer);
@@ -561,11 +551,10 @@ wss.on("connection", (ws) => {
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
-  /* ===== Turn handler: let the model decide, then dispatch tools ===== */
+  /* ===== Turn handler ===== */
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    // “farewell guard”: two clear declines before scheduling hangup
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope\.?\s*that'?s it|bye|goodbye|see you)\b/i;
 
     if (byeHint.test(userText)) {
@@ -580,12 +569,10 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // Second clear decline (or explicit bye) — say goodbye, then schedule hangup
       const farewell = "Alright — thanks for calling. Have a great day! Bye.";
       await say(ws, farewell);
       remember(ws.__mem, "bot", farewell);
       await updateSummary(ws.__mem);
-      // Give a grace window; if user talks, we cancel
       scheduleHangup(2500);
       return;
     }
@@ -599,18 +586,15 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // Tool call?
     if (choice?.message?.tool_calls?.length) {
       const toolCall = choice.message.tool_calls[0];
       const name = toolCall.function.name;
       let args = {};
       try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
 
-      // Auto-pass CallSid into transfer / end_call tools
       if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
       console.log("[TOOL] call ->", name, args);
 
-      // If model asks to end_call anyway, still use grace window
       if (name === "end_call") {
         const farewell = "Alright — thanks for calling. Have a great day! Bye.";
         await say(ws, farewell);
@@ -620,7 +604,6 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      // Normal tool flow
       const impl = Tools[name];
       let toolResult = { text:"" };
       if (impl) {
@@ -630,7 +613,6 @@ wss.on("connection", (ws) => {
         console.warn("[TOOL] missing impl", name);
       }
 
-      // Feed tool result back to the model
       let follow;
       try {
         follow = await openaiChat([...messages,
@@ -648,7 +630,6 @@ wss.on("connection", (ws) => {
         remember(ws.__mem, "bot", botText);
       }
 
-      // If we just redirected to transfer, close local resources promptly
       if (name === "transfer") {
         try { ws.close(); } catch {}
       }
@@ -657,7 +638,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // No tool requested: just speak the assistant content
     const botText = (choice?.message?.content || "").trim();
     console.log("[TURN] bot >", botText);
     if (botText) {
@@ -668,7 +648,7 @@ wss.on("connection", (ws) => {
   }
 });
 
-/* ===== Rolling summary to keep context tight ===== */
+/* ===== Rolling summary ===== */
 async function updateSummary(mem) {
   const last = mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
   try {
@@ -696,12 +676,10 @@ async function updateSummary(mem) {
 1) Add a tool:
    - Implement async function in Tools (return {text?, data?}).
    - Add its JSON schema in toolSchema.
-
 2) Per-client setup:
    - Set BIZ_* env vars and CAP_* toggles.
    - Set RENDER_PROMPT or host it at PROMPT_FETCH.
-   - Point CAL_* URLs to that tenant’s endpoints.
-
+   - Point REPLIT_* URLs to that tenant’s endpoints.
 3) Behavior control:
    - Edit prompt text only. Keep server identical across customers.
 */
