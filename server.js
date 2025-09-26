@@ -194,10 +194,10 @@ function cleanTTS(s=""){
     .trim();
 }
 
-/* Dedupe identical bot speech within a short window */
-function shouldSpeak(ws, text){
+/* Dedupe identical bot speech within a short window (use normalized text) */
+function shouldSpeak(ws, normalized = ""){
   const now = Date.now();
-  return !(ws.__lastBotText === text && now - (ws.__lastBotAt || 0) < 4000);
+  return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
 
 /* Ensure phone numbers are read digit-by-digit */
@@ -216,8 +216,11 @@ function speakifyPhoneNumbers(s=""){
 
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  if (!shouldSpeak(ws, text)) return;
+
+  // Normalize BEFORE dedupe
   const speak = speakifyPhoneNumbers(cleanTTS(text));
+  if (!shouldSpeak(ws, speak)) return;
+
   ws.__lastBotText = speak;
   ws.__lastBotAt = Date.now();
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
@@ -393,7 +396,7 @@ const toolSchema = [
 ];
 
 /* ===== LLM ===== */
-async function openaiChat(messages, options={}) {
+async function openaiChat(messages, options={}){
   console.log("[GPT] request", { msgs: messages.length });
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
