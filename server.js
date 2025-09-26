@@ -110,7 +110,7 @@ app.post("/twiml", (req, res) => {
 /* TwiML handoff target used during live transfer */
 app.post("/handoff", (req, res) => {
   const from = req.body?.From || BIZ.phone || "";
-  console.log("[HTTP] /handoff", { from, owner: OWNER_PHONE });
+  console.log("[HTTP] /handoff]", { from, owner: OWNER_PHONE });
   res.type("text/xml").send(`
     <Response>
       <Say voice="alice">Transferring you now.</Say>
@@ -194,11 +194,10 @@ function cleanTTS(s=""){
     .trim();
 }
 
-/* NEW: ensure phone numbers are read digit-by-digit */
+/* Ensure phone numbers are read digit-by-digit */
 function speakifyPhoneNumbers(s=""){
   const toDigits = str => str.replace(/\D+/g, "");
   const spaceDigits = digits => digits.split("").join(" ");
-
   return s
     .replace(/\+?1?[\s.-]*\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/g, (m) => {
       let d = toDigits(m);
@@ -211,7 +210,7 @@ function speakifyPhoneNumbers(s=""){
 
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  const speak = speakifyPhoneNumbers(cleanTTS(text)); // <-- phone clarity fix
+  const speak = speakifyPhoneNumbers(cleanTTS(text));
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[TTS] missing ElevenLabs credentials");
@@ -419,9 +418,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
     SERVICES: JSON.parse(BIZ.services)
   };
   const p = (tenantPrompt || RENDER_PROMPT).replaceAll("{{BIZ_NAME}}", BIZ.name);
-
-  const todayISO = new Date().toISOString().slice(0,10); // YYYY-MM-DD
-
+  const todayISO = new Date().toISOString().slice(0,10);
   return [
     { role:"system", content: `Today is ${todayISO} and the business timezone is ${BIZ.timezone}. Resolve relative dates like "today" and "tomorrow" in this timezone.` },
     { role:"system", content: p },
@@ -465,6 +462,8 @@ wss.on("connection", (ws) => {
   ws.__queuedTurn = null;
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
+  ws.__closing = false;       // NEW
+  ws.__saidFarewell = false;  // NEW
 
   // For logging
   ws.__postedLog = false;
@@ -478,7 +477,7 @@ wss.on("connection", (ws) => {
     ws.__pendingHangupUntil = 0;
   }
 
-  // NEW: force hangup completion and ignore late speech
+  // Force hangup completion and ignore late speech
   function scheduleHangup(ms = 2500) {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
@@ -556,7 +555,10 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          // NEW: if farewell already scheduled, ignore any late speech
+          // If closing, ignore further ASR turns
+          if (ws.__closing) return;
+
+          // If farewell window active, ignore late speech
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -609,7 +611,6 @@ wss.on("connection", (ws) => {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
-      // post transcript + summary when Twilio ends the stream
       await postCallLogOnce(ws, "twilio stop");
       try { ws.close(); } catch {}
     }
@@ -618,7 +619,6 @@ wss.on("connection", (ws) => {
   ws.on("close", async () => {
     try { dg?.close(); } catch {}
     clearHangTimer();
-    // guard-post in case stop wasn’t received
     await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
@@ -641,11 +641,15 @@ wss.on("connection", (ws) => {
         return;
       }
 
-      const farewell = "Alright — thanks for calling. Have a great day! Bye.";
-      await say(ws, farewell);
-      remember(ws.__mem, "bot", farewell);
-      await updateSummary(ws.__mem);
-      scheduleHangup(2500); // will now ignore late speech
+      if (!ws.__saidFarewell) {
+        ws.__saidFarewell = true;
+        ws.__closing = true;
+        scheduleHangup(2500);
+        const farewell = "Alright — thanks for calling. Have a great day! Bye.";
+        await say(ws, farewell);
+        remember(ws.__mem, "bot", farewell);
+        await updateSummary(ws.__mem);
+      }
       return;
     }
 
@@ -668,11 +672,15 @@ wss.on("connection", (ws) => {
       console.log("[TOOL] call ->", name, args);
 
       if (name === "end_call") {
-        const farewell = "Alright — thanks for calling. Have a great day! Bye.";
-        await say(ws, farewell);
-        remember(ws.__mem, "bot", farewell);
-        await updateSummary(ws.__mem);
-        scheduleHangup(2500);
+        if (!ws.__saidFarewell) {
+          ws.__saidFarewell = true;
+          ws.__closing = true;
+          scheduleHangup(2500);
+          const farewell = "Alright — thanks for calling. Have a great day! Bye.";
+          await say(ws, farewell);
+          remember(ws.__mem, "bot", farewell);
+          await updateSummary(ws.__mem);
+        }
         return;
       }
 
@@ -697,7 +705,7 @@ wss.on("connection", (ws) => {
       }
       const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
       console.log("[TURN] bot (tool-follow) >", botText);
-      if (botText) {
+      if (botText && !ws.__closing) {
         await say(ws, botText);
         remember(ws.__mem, "bot", botText);
       }
@@ -712,7 +720,7 @@ wss.on("connection", (ws) => {
 
     const botText = (choice?.message?.content || "").trim();
     console.log("[TURN] bot >", botText);
-    if (botText) {
+    if (botText && !ws.__closing) {
       await say(ws, botText);
       remember(ws.__mem, "bot", botText);
     }
