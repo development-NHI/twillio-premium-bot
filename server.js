@@ -179,16 +179,32 @@ function startDeepgram({ onFinal }) {
 }
 
 /* === ElevenLabs TTS === */
+/* Strip markdown/formatting before TTS to avoid garbled speech */
+function cleanTTS(s=""){
+  return String(s)
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+    .replace(/^-+\s*/gm, "")
+    .replace(/^\d+\.\s*/gm, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, ", ")
+    .trim();
+}
+
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  console.log(JSON.stringify({ event:"BOT_SAY", reply:text }));
+  const speak = cleanTTS(text);
+  console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[TTS] missing ElevenLabs credentials");
     return;
   }
   try {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-    const resp = await axios.post(url, { text, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
+    const resp = await axios.post(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY }, responseType:"stream" });
     resp.data.on("data", chunk => {
       const b64 = Buffer.from(chunk).toString("base64");
