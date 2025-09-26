@@ -194,6 +194,12 @@ function cleanTTS(s=""){
     .trim();
 }
 
+/* Dedupe identical bot speech within a short window */
+function shouldSpeak(ws, text){
+  const now = Date.now();
+  return !(ws.__lastBotText === text && now - (ws.__lastBotAt || 0) < 4000);
+}
+
 /* Ensure phone numbers are read digit-by-digit */
 function speakifyPhoneNumbers(s=""){
   const toDigits = str => str.replace(/\D+/g, "");
@@ -210,7 +216,11 @@ function speakifyPhoneNumbers(s=""){
 
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
+  // prevent duplicate farewell or repeated lines
+  if (!shouldSpeak(ws, text)) return;
   const speak = speakifyPhoneNumbers(cleanTTS(text));
+  ws.__lastBotText = speak;
+  ws.__lastBotAt = Date.now();
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[TTS] missing ElevenLabs credentials");
@@ -464,6 +474,8 @@ wss.on("connection", (ws) => {
   ws.__lastUserAt = 0;
   ws.__closing = false;       // NEW
   ws.__saidFarewell = false;  // NEW
+  ws.__lastBotText = "";      // NEW
+  ws.__lastBotAt = 0;         // NEW
 
   // For logging
   ws.__postedLog = false;
@@ -482,7 +494,7 @@ wss.on("connection", (ws) => {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
-      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
+      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error]", e.message); }
       try { ws.close(); } catch {}
       setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
@@ -644,6 +656,8 @@ wss.on("connection", (ws) => {
       if (!ws.__saidFarewell) {
         ws.__saidFarewell = true;
         ws.__closing = true;
+        ws.__queuedTurn = null;   // drop any pending work
+        ws.__handling = false;    // stop in-flight turn
         scheduleHangup(2500);
         const farewell = "Alright — thanks for calling. Have a great day! Bye.";
         await say(ws, farewell);
@@ -675,6 +689,8 @@ wss.on("connection", (ws) => {
         if (!ws.__saidFarewell) {
           ws.__saidFarewell = true;
           ws.__closing = true;
+          ws.__queuedTurn = null;
+          ws.__handling = false;
           scheduleHangup(2500);
           const farewell = "Alright — thanks for calling. Have a great day! Bye.";
           await say(ws, farewell);
@@ -700,7 +716,7 @@ wss.on("connection", (ws) => {
           { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
         ]);
       } catch(e){
-        console.error("[GPT] follow error", e.message);
+        console.error("[GPT] follow error]", e.message);
         return;
       }
       const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
