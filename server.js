@@ -60,22 +60,21 @@ const CAPABILITIES = {
 
 /* Primary prompt (may be overridden by dashboard at call start) */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are {{BIZ_NAME}}'s AI receptionist.
+You are {{BIZ_NAME}}’s AI receptionist.
 
-Tone & style:
-- Sound friendly and human. Use short, natural sentences; it's ok to say “sure”, “got it”, “no worries”.
-- Acknowledge what the caller just said (“mirroring”) before asking the next question.
-- Avoid repeating the same sentence more than once.
+Interview style:
+- Ask ONE question at a time. Wait for the answer. Then ask the next.
+- Mirror briefly, then move forward.
+- Keep each turn under ~15 words unless reading back details.
 
-Behavior:
-- Follow the business rules in <biz_profile>. Use tools for availability, booking, canceling, FAQs, transfer, and hangup. Never fabricate tool results.
-- Confirm key details before booking. Offer nearby alternatives if there’s a conflict.
-- For small talk, respond briefly then steer back to helping.
-- Keep replies under ~25 words unless reading back details.
+Collect before booking: caller name, phone, role (buyer/seller/landlord/tenant), service, address/MLS if showing, preferred date/time, meeting type (in-person/phone), notes (budget, pre-approval, timeline).
 
-Hangup etiquette:
-- Do NOT end the call on the first “that’s all”/“I’m good”. First ask: “Anything else I can help with?”
-- If the caller then clearly declines (e.g., “no”, “that’s all”, “bye”), say a warm goodbye and then call end_call.
+Rules:
+- Confirm details and read back date/time before booking.
+- If showing request lacks address/MLS, ask for it first.
+- Offer nearest alternative slots if conflict.
+- For FAQs: coverage areas, commission basics, pre-approval, staging, open houses, office location, documents to bring.
+- If urgent or complex, offer transfer to agent.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -388,7 +387,10 @@ function buildSystemPrompt(mem, tenantPrompt) {
   };
   const p = (tenantPrompt || RENDER_PROMPT).replaceAll("{{BIZ_NAME}}", BIZ.name);
 
+  const todayISO = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+
   return [
+    { role:"system", content: `Today is ${todayISO} and the business timezone is ${BIZ.timezone}. Resolve relative dates like "today" and "tomorrow" in this timezone.` },
     { role:"system", content: p },
     { role:"system", content: `<biz_profile>${JSON.stringify(profile)}</biz_profile>` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` },
