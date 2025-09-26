@@ -194,9 +194,24 @@ function cleanTTS(s=""){
     .trim();
 }
 
+/* NEW: ensure phone numbers are read digit-by-digit */
+function speakifyPhoneNumbers(s=""){
+  const toDigits = str => str.replace(/\D+/g, "");
+  const spaceDigits = digits => digits.split("").join(" ");
+
+  return s
+    .replace(/\+?1?[\s.-]*\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/g, (m) => {
+      let d = toDigits(m);
+      if (d.length === 11 && d.startsWith("1")) d = d.slice(1);
+      if (d.length === 10) return spaceDigits(d);
+      return spaceDigits(toDigits(m));
+    })
+    .replace(/\d{7,}/g, (m) => spaceDigits(m));
+}
+
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  const speak = cleanTTS(text);
+  const speak = speakifyPhoneNumbers(cleanTTS(text)); // <-- phone clarity fix
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[TTS] missing ElevenLabs credentials");
@@ -463,12 +478,14 @@ wss.on("connection", (ws) => {
     ws.__pendingHangupUntil = 0;
   }
 
+  // NEW: force hangup completion and ignore late speech
   function scheduleHangup(ms = 2500) {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
       try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
       try { ws.close(); } catch {}
+      setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
   }
 
@@ -539,11 +556,10 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
+          // NEW: if farewell already scheduled, ignore any late speech
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
-            console.log("[HANG] user spoke during grace window — cancel hangup");
-            clearHangTimer();
-            ws.__closeIntentCount = 0;
-            ws.__askedCloseConfirm = false;
+            console.log("[HANG] user spoke during grace window — ignoring");
+            return;
           }
 
           const now = Date.now();
@@ -629,7 +645,7 @@ wss.on("connection", (ws) => {
       await say(ws, farewell);
       remember(ws.__mem, "bot", farewell);
       await updateSummary(ws.__mem);
-      scheduleHangup(2500);
+      scheduleHangup(2500); // will now ignore late speech
       return;
     }
 
