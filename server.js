@@ -77,6 +77,11 @@ Rules:
 - Offer nearest alternative slots if conflict.
 - For FAQs: coverage areas, commission basics, pre-approval, staging, open houses, office location, documents to bring.
 - If urgent or complex, offer transfer to agent.
+
+Closing behavior:
+- When the caller hints they’re done, ASK: “Anything else I can help with?”
+- If they say no, SAY a brief single goodbye (one line) and then END the call.
+- Do not say goodbye more than once. Keep it concise and natural.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -194,13 +199,13 @@ function cleanTTS(s=""){
     .trim();
 }
 
-/* Dedupe identical bot speech within a short window (use normalized text) */
-function shouldSpeak(ws, normalized = ""){
+/* Normalize + dedupe speech (prevents double farewell) */
+function shouldSpeak(ws, normalized=""){
   const now = Date.now();
   return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
 
-/* Ensure phone numbers are read digit-by-digit */
+/* Read phone numbers digit-by-digit */
 function speakifyPhoneNumbers(s=""){
   const toDigits = str => str.replace(/\D+/g, "");
   const spaceDigits = digits => digits.split("").join(" ");
@@ -216,8 +221,6 @@ function speakifyPhoneNumbers(s=""){
 
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-
-  // Normalize BEFORE dedupe
   const speak = speakifyPhoneNumbers(cleanTTS(text));
   if (!shouldSpeak(ws, speak)) return;
 
@@ -442,10 +445,10 @@ function buildSystemPrompt(mem, tenantPrompt) {
 - Use tools for availability, booking, canceling, FAQs, transfer, and hangup. Do not fabricate.
 - Extract and reuse caller details you learn: name, phone, service, date, time.
 - Confirm key details before booking. Offer alternatives if conflict.
-- On first hint of “I’m good / that’s all / bye”: ask “Anything else I can help with?”.
-- If they then decline clearly, say a warm goodbye, then end the call.
-- Keep replies under ~25 words unless reading back details.
-` }
+- When caller hints they’re done, ask: “Anything else I can help with?”
+- If they say no, say ONE brief goodbye line, then end the call.
+- Keep replies under ~25 words unless reading back details.`
+    }
   ];
 }
 
@@ -468,18 +471,22 @@ wss.on("connection", (ws) => {
   let lastMediaLog = 0;
 
   // Per-call state
-  ws.__askedCloseConfirm = false;
-  ws.__closeIntentCount = 0;
   ws.__handling = false;
   ws.__queuedTurn = null;
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
-  ws.__closing = false;       // NEW
-  ws.__saidFarewell = false;  // NEW
-  ws.__lastBotText = "";      // NEW
-  ws.__lastBotAt = 0;         // NEW
 
-  // For logging
+  // Closing state (for goodbye once + clean hangup)
+  ws.__closeIntentCount = 0;   // how many times user hinted they’re done
+  ws.__awaitingCloseConfirm = false; // AI should be asking “anything else?”
+  ws.__closing = false;        // once true, we’re in goodbye window
+  ws.__saidFarewell = false;   // we already spoke the goodbye
+
+  // Dedup speech
+  ws.__lastBotText = "";
+  ws.__lastBotAt = 0;
+
+  // Logging
   ws.__postedLog = false;
 
   // Graceful hangup window
@@ -491,12 +498,11 @@ wss.on("connection", (ws) => {
     ws.__pendingHangupUntil = 0;
   }
 
-  // Force hangup completion and ignore late speech
   function scheduleHangup(ms = 2500) {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
-      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error]", e.message); }
+      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
       try { ws.close(); } catch {}
       setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
@@ -569,7 +575,7 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          if (ws.__closing) return;
+          // Ignore speech during hangup grace
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -638,42 +644,17 @@ wss.on("connection", (ws) => {
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    // Broad hint list
+    // Soft intent to end
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
-    // Strong-close detector: goodbye OR refusal+closure in one utterance
-    const strongClose = (txt) => {
-      const t = String(txt).toLowerCase();
-      const hasGoodbye = /\b(goodbye|bye|hang\s?up)\b/.test(t);
-      const hasRefusal = /\b(no|nope|nah|nothing else|all set|i('?m)? good|i('?m)? fine)\b/.test(t);
-      const hasClosure = /\b(that('|\s)?s it|that('|\s)?ll be it|we('| )?re done)\b/.test(t);
-      return hasGoodbye || (hasRefusal && hasClosure);
-    };
 
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
-
-      // Skip confirmation if the turn already clearly ends the call
-      if (!strongClose(userText) && ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
-        ws.__askedCloseConfirm = true;
-        const line = "Got it. Anything else I can help with before I let you go?";
-        await say(ws, line);
-        remember(ws.__mem, "bot", line);
-        await updateSummary(ws.__mem);
-        return;
-      }
-
-      if (!ws.__saidFarewell) {
-        ws.__saidFarewell = true;
+      ws.__awaitingCloseConfirm = ws.__closeIntentCount === 1;  // AI should ask “Anything else…?”
+      if (ws.__closeIntentCount >= 2) {
+        // Caller declined again — allow AI to say goodbye once,
+        // then we hang up after we send AI's reply.
         ws.__closing = true;
-        ws.__queuedTurn = null;   // drop any pending work
-        ws.__handling = false;    // stop in-flight turn
-        scheduleHangup(2500);
-        const farewell = "Alright — thanks for calling. Have a great day! Bye.";
-        await say(ws, farewell);
-        remember(ws.__mem, "bot", farewell);
-        await updateSummary(ws.__mem);
       }
-      return;
     }
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
@@ -685,6 +666,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    /* Tool flow */
     if (choice?.message?.tool_calls?.length) {
       const toolCall = choice.message.tool_calls[0];
       const name = toolCall.function.name;
@@ -693,21 +675,6 @@ wss.on("connection", (ws) => {
 
       if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
       console.log("[TOOL] call ->", name, args);
-
-      if (name === "end_call") {
-        if (!ws.__saidFarewell) {
-          ws.__saidFarewell = true;
-          ws.__closing = true;
-          ws.__queuedTurn = null;
-          ws.__handling = false;
-          scheduleHangup(2500);
-          const farewell = "Alright — thanks for calling. Have a great day! Bye.";
-          await say(ws, farewell);
-          remember(ws.__mem, "bot", farewell);
-          await updateSummary(ws.__mem);
-        }
-        return;
-      }
 
       const impl = Tools[name];
       let toolResult = { text:"" };
@@ -725,30 +692,40 @@ wss.on("connection", (ws) => {
           { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
         ]);
       } catch(e){
-        console.error("[GPT] follow error]", e.message);
+        console.error("[GPT] follow error", e.message);
         return;
       }
+
       const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
-      console.log("[TURN] bot (tool-follow) >", botText);
-      if (botText && !ws.__closing) {
+      if (botText) {
         await say(ws, botText);
         remember(ws.__mem, "bot", botText);
       }
 
-      if (name === "transfer") {
-        try { ws.close(); } catch {}
+      // If AI explicitly used end_call tool, don't send any more lines; close cleanly
+      if (name === "end_call") {
+        ws.__saidFarewell = true; // assume AI just said a farewell
+        ws.__closing = true;
+        scheduleHangup(2000);
       }
 
       await updateSummary(ws.__mem);
       return;
     }
 
+    /* Normal AI reply */
     const botText = (choice?.message?.content || "").trim();
-    console.log("[TURN] bot >", botText);
-    if (botText && !ws.__closing) {
+    if (botText) {
       await say(ws, botText);
       remember(ws.__mem, "bot", botText);
     }
+
+    // If we are in closing mode, assume the just-spoken botText is the single farewell.
+    if (ws.__closing && !ws.__saidFarewell) {
+      ws.__saidFarewell = true;
+      scheduleHangup(2000);
+    }
+
     await updateSummary(ws.__mem);
   }
 });
