@@ -216,7 +216,6 @@ function speakifyPhoneNumbers(s=""){
 
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  // prevent duplicate farewell or repeated lines
   if (!shouldSpeak(ws, text)) return;
   const speak = speakifyPhoneNumbers(cleanTTS(text));
   ws.__lastBotText = speak;
@@ -567,10 +566,7 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          // If closing, ignore further ASR turns
           if (ws.__closing) return;
-
-          // If farewell window active, ignore late speech
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -639,12 +635,22 @@ wss.on("connection", (ws) => {
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope\.?\s*that'?s it|bye|goodbye|see you)\b/i;
+    // Broad hint list
+    const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
+    // Strong-close detector: goodbye OR refusal+closure in one utterance
+    const strongClose = (txt) => {
+      const t = String(txt).toLowerCase();
+      const hasGoodbye = /\b(goodbye|bye|hang\s?up)\b/.test(t);
+      const hasRefusal = /\b(no|nope|nah|nothing else|all set|i('?m)? good|i('?m)? fine)\b/.test(t);
+      const hasClosure = /\b(that('|\s)?s it|that('|\s)?ll be it|we('| )?re done)\b/.test(t);
+      return hasGoodbye || (hasRefusal && hasClosure);
+    };
 
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
 
-      if (ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
+      // Skip confirmation if the turn already clearly ends the call
+      if (!strongClose(userText) && ws.__closeIntentCount === 1 && !ws.__askedCloseConfirm) {
         ws.__askedCloseConfirm = true;
         const line = "Got it. Anything else I can help with before I let you go?";
         await say(ws, line);
