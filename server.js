@@ -46,7 +46,9 @@ const URLS = {
   CAL_CREATE: process.env.REPLIT_CREATE_URL || process.env.DASH_CAL_CREATE_URL || "",
   CAL_DELETE: process.env.REPLIT_DELETE_URL || process.env.DASH_CAL_CANCEL_URL || "",
   FAQ_LOG:    process.env.REPLIT_FAQ_URL    || process.env.DASH_CALL_LOG_URL   || "",
-  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || ""
+  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || "",
+  CALL_LOG: process.env.DASH_CALL_LOG_URL || "",
+  CALL_SUMMARY: process.env.DASH_CALL_SUMMARY_URL || ""
 };
 
 /* Feature toggles per tenant */
@@ -433,6 +435,9 @@ wss.on("connection", (ws) => {
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
 
+  // For logging
+  ws.__postedLog = false;
+
   // Graceful hangup window
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
@@ -461,6 +466,35 @@ wss.on("connection", (ws) => {
       lastMediaLog = now;
     }
     dg.sendULaw(chunk);
+  }
+
+  async function postCallLogOnce(ws, reason) {
+    if (ws.__postedLog) return;
+    ws.__postedLog = true;
+    try {
+      const payload = {
+        biz: BIZ.id,
+        source: "voice",
+        convoId: ws.__convoId || "",
+        callSid: ws.__callSid || "",
+        from: ws.__from || "",
+        summary: ws.__mem?.summary || "",
+        transcript: ws.__mem?.transcript || [],
+        ended_reason: reason || ""
+      };
+      if (URLS.CALL_LOG) {
+        const t0 = Date.now();
+        await axios.post(URLS.CALL_LOG, payload, { timeout: 10000 });
+        console.log("[CALL_LOG] posted", { ms: Date.now()-t0 });
+      }
+      if (URLS.CALL_SUMMARY) {
+        const t1 = Date.now();
+        await axios.post(URLS.CALL_SUMMARY, { ...payload, transcript: undefined }, { timeout: 8000 });
+        console.log("[CALL_SUMMARY] posted", { ms: Date.now()-t1 });
+      }
+    } catch (e) {
+      console.warn("[CALL_LOG] post error", e.message);
+    }
   }
 
   ws.__mem = newMemory();
@@ -543,13 +577,17 @@ wss.on("connection", (ws) => {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
+      // post transcript + summary when Twilio ends the stream
+      await postCallLogOnce(ws, "twilio stop");
       try { ws.close(); } catch {}
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", async () => {
     try { dg?.close(); } catch {}
     clearHangTimer();
+    // guard-post in case stop wasn’t received
+    await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
