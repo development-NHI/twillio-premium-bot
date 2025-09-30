@@ -1,8 +1,9 @@
-/* server.js — Prompt-driven, tool-called voice agent (copy/paste ready)
-   - Behavior controlled by RENDER_PROMPT (or fetch from your dashboard)
-   - Tools are pluggable. Toggle with CAPABILITIES flags per tenant.
-   - Memory: running transcript + extracted entities + summary.
-   - NOW with verbose logs + Twilio track fix + Deepgram μ-law passthrough.
+/* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
+   - Single prompt controls behavior and policy (RENDER_PROMPT or fetched)
+   - Tools are generic; model decides when to call them
+   - Minimal env: API keys, Twilio, URLs; everything else lives in the prompt
+   - Deepgram μ-law passthrough + ElevenLabs TTS
+   - Verbose per-request logging for debugging external calls
 */
 
 import express from "express";
@@ -16,72 +17,145 @@ dotenv.config();
 
 /* ===== Env / Config ===== */
 const PORT = process.env.PORT || 5000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+
+/* Keys */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+
 /* Twilio (transfer + hangup) */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional outbound callerId
+const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transfer target
 
-/* Per-tenant business config */
-const BIZ = {
-  id: process.env.BIZ_ID || "oldline",
-  name: process.env.BIZ_NAME || "Old Line Barbershop",
-  phone: process.env.BIZ_PHONE || "",
-  timezone: process.env.BIZ_TZ || "America/New_York",
-  hours: process.env.BIZ_HOURS_JSON || `{"mon_fri":"09:00-17:00","weekends":"closed"}`,
-  location: process.env.BIZ_LOCATION || "123 Blueberry Ln",
-  services: (process.env.BIZ_SERVICES_JSON || `[
-    {"name":"haircut","mins":30,"price":30},
-    {"name":"beard trim","mins":15,"price":15},
-    {"name":"combo","mins":45,"price":40}
-  ]`)
-};
+/* Business / routing identifiers (kept minimal) */
+const DASH_BIZ    = process.env.DASH_BIZ || "";     // tenant id string for logs
+const DASH_SOURCE = process.env.DASH_SOURCE || "voice"; // e.g., "voice"
+
+/* Optional timezone to resolve relative dates. If omitted, model must infer from prompt. */
+const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
 /* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
-  CAL_READ:   process.env.REPLIT_READ_URL   || process.env.DASH_CAL_READ_URL   || "",
-  CAL_CREATE: process.env.REPLIT_CREATE_URL || process.env.DASH_CAL_CREATE_URL || "",
-  CAL_DELETE: process.env.REPLIT_DELETE_URL || process.env.DASH_CAL_CANCEL_URL || "",
-  FAQ_LOG:    process.env.REPLIT_FAQ_URL    || process.env.DASH_CALL_LOG_URL   || "",
-  PROMPT_FETCH: process.env.PROMPT_FETCH_URL || "",
-  CALL_LOG: process.env.DASH_CALL_LOG_URL || "",
-  CALL_SUMMARY: process.env.DASH_CALL_SUMMARY_URL || ""
+  CAL_READ:     process.env.REPLIT_READ_URL     || process.env.DASH_CAL_READ_URL     || "",
+  CAL_CREATE:   process.env.REPLIT_CREATE_URL   || process.env.DASH_CAL_CREATE_URL   || "",
+  CAL_DELETE:   process.env.REPLIT_DELETE_URL   || process.env.DASH_CAL_CANCEL_URL   || "",
+  LEAD_UPSERT:  process.env.REPLIT_LEAD_URL     || process.env.DASH_LEAD_UPSERT_URL  || "",
+  FAQ_LOG:      process.env.REPLIT_FAQ_URL      || process.env.DASH_CALL_LOG_URL     || "",
+  CALL_LOG:     process.env.DASH_CALL_LOG_URL   || "",
+  CALL_SUMMARY: process.env.DASH_CALL_SUMMARY_URL || "",
+  PROMPT_FETCH: process.env.PROMPT_FETCH_URL    || ""
 };
 
-/* Feature toggles per tenant */
-const CAPABILITIES = {
-  booking:   (process.env.CAP_BOOKING   ?? "true") === "true",
-  cancel:    (process.env.CAP_CANCEL    ?? "true") === "true",
-  faq:       (process.env.CAP_FAQ       ?? "true") === "true",
-  smalltalk: (process.env.CAP_SMALLTALK ?? "true") === "true",
-  transfer:  (process.env.CAP_TRANSFER  ?? "false") === "true"
-};
+/* ===== HTTP debug wrappers ===== */
+const DEBUG_HTTP = (process.env.DEBUG_HTTP ?? "true") === "true";
+function rid() { return Math.random().toString(36).slice(2, 8); }
+function isWatched(url) {
+  if (!url) return false;
+  if (url.startsWith("https://api.twilio.com/2010-04-01/Accounts")) return true;
+  for (const u of Object.values(URLS)) if (u && url.startsWith(u)) return true;
+  return url.startsWith("https://api.openai.com/");
+}
+function preview(obj, max=320) {
+  try {
+    const s = typeof obj === "string" ? obj : JSON.stringify(obj);
+    return s.length > max ? s.slice(0, max) + "…" : s;
+  } catch { return ""; }
+}
+async function httpPost(url, data, { headers={}, timeout=12000, auth, tag, trace } = {}) {
+  const t = Date.now(), id = rid(), watched = isWatched(url);
+  if (DEBUG_HTTP && watched) {
+    console.log(JSON.stringify({ evt:"HTTP_REQ", id, tag, method:"POST", url, timeout, trace,
+      payload_len: Buffer.byteLength(preview(data, 1<<20), "utf8"), at: new Date().toISOString() }));
+  }
+  try {
+    const resp = await axios.post(url, data, { headers, timeout, auth, responseType: headers.acceptStream ? "stream" : undefined });
+    if (DEBUG_HTTP && watched) {
+      console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"POST", url,
+        status: resp.status, ms: Date.now()-t, resp_preview: headers.acceptStream ? "[stream]" : preview(resp.data),
+        at: new Date().toISOString(), trace }));
+    }
+    return resp;
+  } catch (e) {
+    const status = e.response?.status || 0;
+    const bodyPrev = e.response ? preview(e.response.data) : "";
+    console.warn(JSON.stringify({ evt:"HTTP_ERR", id, tag, method:"POST", url, status, ms: Date.now()-t,
+      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString(), trace }));
+    throw e;
+  }
+}
+async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trace } = {}) {
+  const t = Date.now(), id = rid(), watched = isWatched(url);
+  if (DEBUG_HTTP && watched) {
+    console.log(JSON.stringify({ evt:"HTTP_REQ", id, tag, method:"GET", url, timeout, params, trace, at: new Date().toISOString() }));
+  }
+  try {
+    const resp = await axios.get(url, { headers, timeout, params, auth });
+    if (DEBUG_HTTP && watched) {
+      console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"GET", url,
+        status: resp.status, ms: Date.now()-t, resp_preview: preview(resp.data), at: new Date().toISOString(), trace }));
+    }
+    return resp;
+  } catch (e) {
+    const status = e.response?.status || 0;
+    const bodyPrev = e.response ? preview(e.response.data) : "";
+    console.warn(JSON.stringify({ evt:"HTTP_ERR", id, tag, method:"GET", url, status, ms: Date.now()-t,
+      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString(), trace }));
+    throw e;
+  }
+}
 
-/* Primary prompt (may be overridden by dashboard at call start) */
+/* ===== Brain prompt (single source of truth) =====
+   Put ALL behavior, policies, business profile, hours, services, pricing ranges,
+   cancellation rules, transfer criteria, recap rules, and tone in this string.
+   You can also host it and set PROMPT_FETCH to return { prompt } for per-tenant control.
+*/
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are {{BIZ_NAME}}’s AI receptionist.
+You are an AI phone receptionist for a professional services company.
+You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
 
 Interview style:
-- Ask ONE question at a time. Wait for the answer. Then ask the next.
-- Mirror briefly, then move forward.
-- Keep each turn under ~15 words unless reading back details.
+- Ask one question at a time. Wait for the answer. Mirror briefly, then move on.
+- Keep turns under ~15 words unless reading back details.
+- Speak clearly and concisely.
 
-Collect before booking: caller name, phone, role (buyer/seller/landlord/tenant), service, address/MLS if showing, preferred date/time, meeting type (in-person/phone), notes (budget, pre-approval, timeline).
+Collect before booking:
+- Full name, phone, role, service, address/MLS if showing, preferred date/time, meeting type, notes.
 
-Rules:
-- Confirm details and read back date/time before booking.
-- If showing request lacks address/MLS, ask for it first.
-- Offer nearest alternative slots if conflict.
-- For FAQs: coverage areas, commission basics, pre-approval, staging, open houses, office location, documents to bring.
-- If urgent or complex, offer transfer to agent.
+Scheduling policy:
+- Read availability with the calendar tool.
+- Confirm details and read back date/time once before booking.
+- Never double-book a slot.
+- If slot is taken, offer the 2–3 closest valid alternatives. Do not repeat “requested time not available” more than once.
+- Send reminders a day before the appointment (assume downstream system handles reminders).
+- Allow adjustments only up to 20 hours before start.
 
-Closing behavior:
-- When the caller hints they’re done, ASK: “Anything else I can help with?”
-- If they say no, SAY a brief single goodbye (one line) and then END the call.
-- Do not say goodbye more than once. Keep it concise and natural.
+Cancellation policy:
+- Do not cancel unless caller provides the full name on the booking or calls from the number that booked.
+- If policy not met, offer transfer.
+
+FAQs you can answer briefly:
+- Service areas, pricing ranges, commission basics, pre-approval, staging, open houses, office location, documents to bring, hours, contact methods.
+
+Escalation policy:
+- If urgent, complex, or user asks for a human, offer transfer-to-agent.
+
+Closing policy:
+- When caller signals completion, ask: “Anything else I can help with?”
+- If they say no, deliver one brief goodbye line, then end the call. Do not say goodbye more than once.
+
+Behavioral constraints:
+- Do not hallucinate bookings. Use tools.
+- Use calendar tools for availability, booking, and canceling.
+- Use lead capture tool when a new contact appears.
+- Use logging tools to record calls and FAQs when available.
+- Keep responses natural but concise.
+- Resolve relative dates like “today/tomorrow” in the business timezone if known; otherwise ask.
+
+Output:
+- Short, natural voice responses.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -114,12 +188,12 @@ app.post("/twiml", (req, res) => {
 
 /* TwiML handoff target used during live transfer */
 app.post("/handoff", (req, res) => {
-  const from = req.body?.From || BIZ.phone || "";
+  const from = req.body?.From || TWILIO_CALLER_ID || "";
   console.log("[HTTP] /handoff]", { from, owner: OWNER_PHONE });
   res.type("text/xml").send(`
     <Response>
       <Say voice="alice">Transferring you now.</Say>
-      <Dial callerId="${from || BIZ.phone || ""}">
+      <Dial callerId="${from}">
         <Number>${OWNER_PHONE}</Number>
       </Dial>
     </Response>
@@ -131,7 +205,11 @@ app.post("/goodbye", (_req, res) => {
   res.type("text/xml").send(`<Response><Say voice="alice">Goodbye.</Say><Hangup/></Response>`);
 });
 
-const server = app.listen(PORT, () => console.log(`[INIT] listening on ${PORT}`));
+const server = app.listen(PORT, () => {
+  console.log(`[INIT] listening on ${PORT}`);
+  console.log("[INIT] URLS", URLS);
+  console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
+});
 const wss = new WebSocketServer({ server });
 
 /* ===== Utilities ===== */
@@ -184,7 +262,6 @@ function startDeepgram({ onFinal }) {
 }
 
 /* === ElevenLabs TTS === */
-/* Strip markdown/formatting before TTS to avoid garbled speech */
 function cleanTTS(s=""){
   return String(s)
     .replace(/\*\*(.*?)\*\*/g, "$1")
@@ -198,14 +275,10 @@ function cleanTTS(s=""){
     .replace(/\n/g, ", ")
     .trim();
 }
-
-/* Normalize + dedupe speech (prevents double farewell) */
 function shouldSpeak(ws, normalized=""){
   const now = Date.now();
   return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
-
-/* Read phone numbers digit-by-digit */
 function speakifyPhoneNumbers(s=""){
   const toDigits = str => str.replace(/\D+/g, "");
   const spaceDigits = digits => digits.split("").join(" ");
@@ -218,7 +291,6 @@ function speakifyPhoneNumbers(s=""){
     })
     .replace(/\d{7,}/g, (m) => spaceDigits(m));
 }
-
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   const speak = speakifyPhoneNumbers(cleanTTS(text));
@@ -233,8 +305,8 @@ async function say(ws, text) {
   }
   try {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-    const resp = await axios.post(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
-      { headers:{ "xi-api-key":ELEVENLABS_API_KEY }, responseType:"stream" });
+    const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
+      { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
     resp.data.on("data", chunk => {
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
@@ -253,114 +325,110 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Tool Registry (pluggable) ===== */
+/* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
-    if (!CAPABILITIES.booking || !URLS.CAL_READ) return { text:"Booking is unavailable." };
+    if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
-      const payload = { intent:"READ", biz:BIZ.id, source:"voice", window:{ start:startISO||`${dateISO}T00:00:00`, end:endISO||`${dateISO}T23:59:59` } };
-      const t0 = Date.now();
-      const { data } = await axios.post(URLS.CAL_READ, payload, { timeout:12000 });
-      console.log("[TOOL] read_availability ok", { ms: Date.now()-t0 });
+      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE,
+        window:{ start:startISO || `${dateISO||""}T00:00:00`, end:endISO || `${dateISO||""}T23:59:59` } };
+      const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
-    } catch(e){ console.error("[TOOL] read_availability error", e.message); return { text:"I could not reach the calendar." }; }
+    } catch(e){ return { text:"Could not read availability." }; }
   },
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
-    if (!CAPABILITIES.booking || !URLS.CAL_CREATE) return { text:"Booking is unavailable." };
+    if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
       const payload = {
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
         Start_Time: startISO, End_Time: endISO,
         Customer_Name: name||"", Customer_Phone: phone||"", Customer_Email: "",
-        Notes: notes||service||""
+        Notes: notes||service||"", biz: DASH_BIZ, source: DASH_SOURCE
       };
-      const t0 = Date.now();
-      const { data } = await axios.post(URLS.CAL_CREATE, payload, { timeout:12000 });
-      console.log("[TOOL] book_appointment ok", { ms: Date.now()-t0 });
+      const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000, tag:"CAL_CREATE",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data, text:"Booked." };
-    } catch(e){ console.error("[TOOL] book_appointment error", e.message); return { text:"I couldn't book that just now." }; }
+    } catch(e){ return { text:"Booking failed." }; }
   },
-  async cancel_appointment({ event_id }) {
+  async cancel_appointment({ event_id, name, phone }) {
     console.log("[TOOL] cancel_appointment", { event_id });
-    if (!CAPABILITIES.cancel || !URLS.CAL_DELETE) return { text:"Cancellation is unavailable." };
+    if (!URLS.CAL_DELETE) return { text:"Cancellation unavailable." };
     try {
-      const t0 = Date.now();
-      const { data, status } = await axios.post(URLS.CAL_DELETE, { intent:"DELETE", biz:BIZ.id, source:"voice", event_id }, { timeout:12000 });
+      const { data, status } = await httpPost(URLS.CAL_DELETE,
+        { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone },
+        { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
-      console.log("[TOOL] cancel_appointment result", { ms: Date.now()-t0, ok });
-      return { text: ok ? "Canceled." : "Could not cancel." , data };
-    } catch(e){ console.error("[TOOL] cancel_appointment error]", e.message); return { text:"I couldn't cancel that." }; }
+      return { text: ok ? "Canceled." : "Could not cancel.", data };
+    } catch(e){ return { text:"Cancellation failed." }; }
+  },
+  async lead_upsert({ name, phone, intent, notes }) {
+    console.log("[TOOL] lead_upsert", { name, intent });
+    if (!URLS.LEAD_UPSERT) return { text:"Lead logging unavailable." };
+    try {
+      const { data } = await httpPost(URLS.LEAD_UPSERT,
+        { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes },
+        { timeout: 8000, tag:"LEAD_UPSERT", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+      return { data };
+    } catch { return { text:"" }; }
   },
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
-    if (!CAPABILITIES.faq) return { text:"" };
-    try { if (URLS.FAQ_LOG) await axios.post(URLS.FAQ_LOG, { topic, service }); } catch {}
+    try {
+      if (URLS.FAQ_LOG) {
+        await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SOURCE, topic, service },
+          { timeout:8000, tag:"FAQ_LOG", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+      }
+    } catch {}
     return { data:{ topic, service } };
   },
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
-    if (!CAPABILITIES.transfer) return { text:"" };
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
-      console.warn("[TOOL] transfer missing config or callSid]");
-      return { text:"Sorry, I can’t transfer right now." };
+      return { text:"Transfer not configured." };
     }
     try {
       const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
       const handoffUrl = `https://${host}/handoff`;
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Url: handoffUrl, Method: "POST" });
       const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
-      const t0 = Date.now();
-      const resp = await axios.post(url, params, {
-        auth,
+      await httpPost(url, params, {
+        auth, timeout: 10000, tag:"TWILIO_REDIRECT",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 10000
+        trace:{ callSid, convoId: currentTrace.convoId }
       });
-      console.log("[TOOL] transfer redirect ok", { ms: Date.now()-t0, status: resp.status });
       return { text:"Transferring you now. Please hold." };
-    } catch(e){
-      console.error("[TOOL] transfer redirect error", e.message);
-      return { text:"Sorry, transfer failed." };
-    }
+    } catch { return { text:"Transfer failed." }; }
   },
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) {
-      console.warn("[TOOL] end_call missing config or callSid");
-      return { text:"" };
-    }
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { text:"" };
     try {
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${encodeURIComponent(callSid)}.json`;
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Status: "completed" });
       const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
-      const t0 = Date.now();
-      const resp = await axios.post(url, params, {
-        auth,
+      await httpPost(url, params, {
+        auth, timeout: 10000, tag:"TWILIO_HANGUP",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        timeout: 10000
+        trace:{ callSid, reason, convoId: currentTrace.convoId }
       });
-      console.log("[TOOL] end_call ok", { ms: Date.now()-t0, status: resp.status });
       return { text:"" };
-    } catch(e){
-      console.error("[TOOL] end_call error", e.message);
-      return { text:"" };
-    }
-  },
-  async store_memory({ key, value }) {
-    console.log("[TOOL] store_memory", { key });
-    return { data:{ saved:true } };
+    } catch { return { text:"" }; }
   }
 };
 
-/* Tool schema advertised to the model */
+/* Tool schema advertised to the model (the model chooses based on prompt policy) */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
       description:"Read calendar availability in a given window",
       parameters:{ type:"object", properties:{
-        dateISO:{type:"string"}, startISO:{type:"string"}, endISO:{type:"string"}
+        dateISO:{type:"string", description:"YYYY-MM-DD in business timezone"},
+        startISO:{type:"string", description:"ISO start"},
+        endISO:{type:"string", description:"ISO end"}
       }, required:[] }
   }},
   { type:"function", function:{
@@ -373,8 +441,17 @@ const toolSchema = [
   }},
   { type:"function", function:{
       name:"cancel_appointment",
-      description:"Cancel a calendar event by id",
-      parameters:{ type:"object", properties:{ event_id:{type:"string"} }, required:["event_id"] }
+      description:"Cancel a calendar event by id; caller must prove identity per policy",
+      parameters:{ type:"object", properties:{
+        event_id:{type:"string"}, name:{type:"string"}, phone:{type:"string"}
+      }, required:["event_id"] }
+  }},
+  { type:"function", function:{
+      name:"lead_upsert",
+      description:"Create or update a lead/contact for this caller",
+      parameters:{ type:"object", properties:{
+        name:{type:"string"}, phone:{type:"string"}, intent:{type:"string"}, notes:{type:"string"}
+      }, required:["name","phone"] }
   }},
   { type:"function", function:{
       name:"faq",
@@ -390,17 +467,11 @@ const toolSchema = [
       name:"end_call",
       description:"Politely end the call immediately",
       parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] }
-  }},
-  { type:"function", function:{
-      name:"store_memory",
-      description:"Store a memory key/value for this caller",
-      parameters:{ type:"object", properties:{ key:{type:"string"}, value:{type:"string"} }, required:["key","value"] }
   }}
 ];
 
 /* ===== LLM ===== */
 async function openaiChat(messages, options={}){
-  console.log("[GPT] request", { msgs: messages.length });
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
     model: "gpt-4o-mini",
@@ -411,44 +482,26 @@ async function openaiChat(messages, options={}){
     response_format: { type: "text" },
     ...options
   };
-  const t0 = Date.now();
-  const { data } = await axios.post("https://api.openai.com/v1/chat/completions", body, { headers });
-  const choice = data.choices?.[0];
-  console.log("[GPT] ok", {
-    ms: Date.now()-t0,
-    toolCalls: choice?.message?.tool_calls?.length || 0,
-    hasText: !!(choice?.message?.content || "").trim()
+  const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
+    headers, timeout: 30000, tag:"OPENAI_CHAT", trace: { convoId: currentTrace.convoId, callSid: currentTrace.callSid }
   });
-  return choice;
+  return data.choices?.[0];
 }
 
-/* Build system prompt with tenant facts + runtime summary */
+/* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const profile = {
-    BIZ_NAME: BIZ.name,
-    PHONE: BIZ.phone,
-    LOCATION: BIZ.location,
-    TIMEZONE: BIZ.timezone,
-    HOURS: JSON.parse(BIZ.hours),
-    SERVICES: JSON.parse(BIZ.services)
-  };
-  const p = (tenantPrompt || RENDER_PROMPT).replaceAll("{{BIZ_NAME}}", BIZ.name);
   const todayISO = new Date().toISOString().slice(0,10);
+  const p = (tenantPrompt || RENDER_PROMPT);
   return [
-    { role:"system", content: `Today is ${todayISO} and the business timezone is ${BIZ.timezone}. Resolve relative dates like "today" and "tomorrow" in this timezone.` },
+    { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
     { role:"system", content: p },
-    { role:"system", content: `<biz_profile>${JSON.stringify(profile)}</biz_profile>` },
-    { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` },
     { role:"system", content:
-`Rules:
-- Sound human and conversational. Acknowledge, then move things forward.
-- Use tools for availability, booking, canceling, FAQs, transfer, and hangup. Do not fabricate.
-- Extract and reuse caller details you learn: name, phone, service, date, time.
-- Confirm key details before booking. Offer alternatives if conflict.
-- When caller hints they’re done, ask: “Anything else I can help with?”
-- If they say no, say ONE brief goodbye line, then end the call.
-- Keep replies under ~25 words unless reading back details.`
-    }
+`Hard constraints:
+- Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
+- Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
+- Keep replies under ~25 words unless reading back details.
+- One goodbye line only, then end_call.` },
+    { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
 }
 
@@ -462,6 +515,7 @@ function buildMessages(mem, userText, tenantPrompt) {
 }
 
 /* ===== WS wiring ===== */
+let currentTrace = { convoId:"", callSid:"" }; // updated per-connection
 wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
   let dg = null;
@@ -476,11 +530,11 @@ wss.on("connection", (ws) => {
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
 
-  // Closing state (for goodbye once + clean hangup)
-  ws.__closeIntentCount = 0;   // how many times user hinted they’re done
-  ws.__awaitingCloseConfirm = false; // AI should be asking “anything else?”
-  ws.__closing = false;        // once true, we’re in goodbye window
-  ws.__saidFarewell = false;   // we already spoke the goodbye
+  // Closing state
+  ws.__closeIntentCount = 0;
+  ws.__awaitingCloseConfirm = false;
+  ws.__closing = false;
+  ws.__saidFarewell = false;
 
   // Dedup speech
   ws.__lastBotText = "";
@@ -497,17 +551,15 @@ wss.on("connection", (ws) => {
     if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
     ws.__pendingHangupUntil = 0;
   }
-
   function scheduleHangup(ms = 2500) {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
-      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch(e){ console.error("[TOOL] end_call exec error", e.message); }
+      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch {}
       try { ws.close(); } catch {}
       setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
   }
-
   function flushULaw() {
     if (!pendingULaw.length || !dg) return;
     const chunk = Buffer.concat(pendingULaw);
@@ -523,30 +575,36 @@ wss.on("connection", (ws) => {
   async function postCallLogOnce(ws, reason) {
     if (ws.__postedLog) return;
     ws.__postedLog = true;
+
+    const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
+    const payload = {
+      biz: DASH_BIZ,
+      source: DASH_SOURCE,
+      convoId: trace.convoId,
+      callSid: trace.callSid,
+      from: trace.from,
+      summary: ws.__mem?.summary || "",
+      transcript: ws.__mem?.transcript || [],
+      ended_reason: reason || ""
+    };
+
     try {
-      const payload = {
-        biz: BIZ.id,
-        source: "voice",
-        convoId: ws.__convoId || "",
-        callSid: ws.__callSid || "",
-        from: ws.__from || "",
-        summary: ws.__mem?.summary || "",
-        transcript: ws.__mem?.transcript || [],
-        ended_reason: reason || ""
-      };
       if (URLS.CALL_LOG) {
-        const t0 = Date.now();
-        await axios.post(URLS.CALL_LOG, payload, { timeout: 10000 });
-        console.log("[CALL_LOG] posted", { ms: Date.now()-t0 });
+        await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
+      } else {
+        console.warn("[CALL_LOG] URL missing");
       }
+    } catch {}
+
+    try {
       if (URLS.CALL_SUMMARY) {
-        const t1 = Date.now();
-        await axios.post(URLS.CALL_SUMMARY, { ...payload, transcript: undefined }, { timeout: 8000 });
-        console.log("[CALL_SUMMARY] posted", { ms: Date.now()-t1 });
+        await httpPost(URLS.CALL_SUMMARY, { ...payload, transcript: undefined }, {
+          timeout: 8000, tag:"CALL_SUMMARY", trace
+        });
+      } else {
+        console.warn("[CALL_SUMMARY] URL missing");
       }
-    } catch (e) {
-      console.warn("[CALL_LOG] post error", e.message);
-    }
+    } catch {}
   }
 
   ws.__mem = newMemory();
@@ -560,12 +618,17 @@ wss.on("connection", (ws) => {
       const cp = msg.start?.customParameters || {};
       ws.__from = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
+      currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
+      // Optionally fetch tenant-specific prompt
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
-          const { data } = await axios.get(`${URLS.PROMPT_FETCH}?biz=${encodeURIComponent(BIZ.id)}`);
+          const { data } = await httpGet(
+            `${URLS.PROMPT_FETCH}?biz=${encodeURIComponent(DASH_BIZ)}`,
+            { timeout: 10000, tag:"PROMPT_FETCH", trace:{ convoId: ws.__convoId, callSid: ws.__callSid } }
+          );
           if (data?.prompt) ws.__tenantPrompt = data.prompt;
           console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
         } catch(e){
@@ -609,8 +672,8 @@ wss.on("connection", (ws) => {
         }
       });
 
-      await say(ws, `Hi, thanks for calling ${BIZ.name}. How can I help?`);
-      remember(ws.__mem, "bot", `Hi, thanks for calling ${BIZ.name}. How can I help?`);
+      await say(ws, `Hi, how can I help?`);
+      remember(ws.__mem, "bot", `Hi, how can I help?`);
       return;
     }
 
@@ -640,19 +703,16 @@ wss.on("connection", (ws) => {
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
-  /* ===== Turn handler ===== */
+  /* ===== Turn handler (prompt is the brain) ===== */
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
     // Soft intent to end
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
-
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
-      ws.__awaitingCloseConfirm = ws.__closeIntentCount === 1;  // AI should ask “Anything else…?”
+      ws.__awaitingCloseConfirm = ws.__closeIntentCount === 1;
       if (ws.__closeIntentCount >= 2) {
-        // Caller declined again — allow AI to say goodbye once,
-        // then we hang up after we send AI's reply.
         ws.__closing = true;
       }
     }
@@ -666,47 +726,49 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Tool flow */
+    /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
-      const toolCall = choice.message.tool_calls[0];
-      const name = toolCall.function.name;
-      let args = {};
-      try { args = JSON.parse(toolCall.function.arguments || "{}"); } catch {}
+      for (const tc of choice.message.tool_calls) {
+        const name = tc.function.name;
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
 
-      if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-      console.log("[TOOL] call ->", name, args);
+        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+        console.log("[TOOL] call ->", name, args);
 
-      const impl = Tools[name];
-      let toolResult = { text:"" };
-      if (impl) {
-        try { toolResult = await impl(args); }
-        catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
-      } else {
-        console.warn("[TOOL] missing impl", name);
-      }
+        const impl = Tools[name];
+        let toolResult = { text:"" };
+        if (impl) {
+          try { toolResult = await impl(args); }
+          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+        } else {
+          console.warn("[TOOL] missing impl", name);
+        }
 
-      let follow;
-      try {
-        follow = await openaiChat([...messages,
-          choice.message,
-          { role:"tool", tool_call_id: toolCall.id, content: JSON.stringify(toolResult) }
-        ]);
-      } catch(e){
-        console.error("[GPT] follow error", e.message);
-        return;
-      }
+        // Follow-up turn after tool result
+        let follow;
+        try {
+          follow = await openaiChat([
+            ...messages,
+            choice.message,
+            { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }
+          ]);
+        } catch(e){
+          console.error("[GPT] follow error", e.message);
+          continue;
+        }
 
-      const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
-      if (botText) {
-        await say(ws, botText);
-        remember(ws.__mem, "bot", botText);
-      }
+        const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
+        if (botText) {
+          await say(ws, botText);
+          remember(ws.__mem, "bot", botText);
+        }
 
-      // If AI explicitly used end_call tool, don't send any more lines; close cleanly
-      if (name === "end_call") {
-        ws.__saidFarewell = true; // assume AI just said a farewell
-        ws.__closing = true;
-        scheduleHangup(2000);
+        if (name === "end_call") {
+          ws.__saidFarewell = true;
+          ws.__closing = true;
+          scheduleHangup(2000);
+        }
       }
 
       await updateSummary(ws.__mem);
@@ -720,7 +782,6 @@ wss.on("connection", (ws) => {
       remember(ws.__mem, "bot", botText);
     }
 
-    // If we are in closing mode, assume the just-spoken botText is the single farewell.
     if (ws.__closing && !ws.__saidFarewell) {
       ws.__saidFarewell = true;
       scheduleHangup(2000);
@@ -734,34 +795,29 @@ wss.on("connection", (ws) => {
 async function updateSummary(mem) {
   const last = mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
   try {
-    const t0 = Date.now();
-    const { data } = await axios.post(
+    const { data } = await httpPost(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
         temperature: 0.1,
         messages: [
-          { role:"system", content:"Summarize the dialog in 2 lines. Include name, phone, service, date/time if known." },
+          { role:"system", content:`Summarize the dialog in 2 lines. Include name, phone, service, date/time if known. TZ=${BIZ_TZ}.` },
           { role:"user", content: last }
         ]
       },
-      { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` } }
+      { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout: 20000, tag:"OPENAI_SUMMARY",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
     );
-    mem.summary = data.choices[0].message.content.trim().slice(0, 500);
-    console.log("[SUMMARY] len", mem.summary.length, "ms", Date.now()-t0);
+    mem.summary = data.choices?.[0]?.message?.content?.trim()?.slice(0, 500) || "";
+    console.log("[SUMMARY] len", mem.summary.length);
   } catch(e){
     console.warn("[SUMMARY] error", e.message);
   }
 }
 
-/* ===== How to extend =====
-1) Add a tool:
-   - Implement async function in Tools (return {text?, data?}).
-   - Add its JSON schema in toolSchema.
-2) Per-client setup:
-   - Set BIZ_* env vars and CAP_* toggles.
-   - Set RENDER_PROMPT or host it at PROMPT_FETCH.
-   - Point REPLIT_* URLs to that tenant’s endpoints.
-3) Behavior control:
-   - Edit prompt text only. Keep server identical across customers.
+/* ===== Notes =====
+- Put all per-tenant behavior and business facts in RENDER_PROMPT (or return {prompt} from PROMPT_FETCH).
+- Keep only keys, Twilio, and endpoint URLs as envs.
+- The model decides when to call tools based on your prompt policy.
+- Webhooks and tools remain stable across customers -> copy/paste ready.
 */
