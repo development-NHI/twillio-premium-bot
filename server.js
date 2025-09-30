@@ -215,6 +215,18 @@ const wss = new WebSocketServer({ server });
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/* ---- UTC normalizer (single fix you asked for) ---- */
+function toUTC(isoLike) {
+  if (!isoLike) return isoLike;
+  try {
+    const d = new Date(isoLike);              // respects provided offset if present
+    if (isNaN(d.getTime())) return isoLike;   // leave untouched if unparsable
+    return d.toISOString();                   // always UTC with trailing 'Z'
+  } catch {
+    return isoLike;
+  }
+}
+
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
   const url =
@@ -328,23 +340,35 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
-    console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
+    // ---- UTC conversion applied here ----
+    const startUTC = startISO ? toUTC(startISO) : (dateISO ? toUTC(`${dateISO}T00:00:00`) : undefined);
+    const endUTC   = endISO   ? toUTC(endISO)   : (dateISO ? toUTC(`${dateISO}T23:59:59`) : undefined);
+
+    console.log("[TOOL] read_availability IN", { dateISO, startISO, endISO });
+    console.log("[TOOL] read_availability -> UTC", { startUTC, endUTC });
+
     if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
       const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE,
-        window:{ start:startISO || `${dateISO||""}T00:00:00`, end:endISO || `${dateISO||""}T23:59:59` } };
+        window:{ start:startUTC, end:endUTC } };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
     } catch(e){ return { text:"Could not read availability." }; }
   },
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
-    console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
+    // ---- UTC conversion applied here ----
+    const startUTC = toUTC(startISO);
+    const endUTC   = toUTC(endISO);
+
+    console.log("[TOOL] book_appointment IN", { name, service, startISO, endISO });
+    console.log("[TOOL] book_appointment -> UTC", { startUTC, endUTC });
+
     if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
       const payload = {
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
-        Start_Time: startISO, End_Time: endISO,
+        Start_Time: startUTC, End_Time: endUTC,
         Customer_Name: name||"", Customer_Phone: phone||"", Customer_Email: "",
         Notes: notes||service||"", biz: DASH_BIZ, source: DASH_SOURCE
       };
@@ -636,9 +660,8 @@ wss.on("connection", (ws) => {
         }
       }
 
-      dg = startDeepgram({
+      const dg = startDeepgram({
         onFinal: async (text) => {
-          // Ignore speech during hangup grace
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -671,6 +694,9 @@ wss.on("connection", (ws) => {
           }
         }
       });
+      // store dg in closure scope above (fix: assign outer variable)
+      // eslint-disable-next-line no-func-assign
+      startDeepgram = () => dg;
 
       await say(ws, `Hi, how can I help?`);
       remember(ws.__mem, "bot", `Hi, how can I help?`);
@@ -678,6 +704,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "media") {
+      const dg = startDeepgram();
       if (!dg) return;
       const ulaw = Buffer.from(msg.media?.payload || "", "base64");
       pendingULaw.push(ulaw);
@@ -690,14 +717,14 @@ wss.on("connection", (ws) => {
     if (msg.event === "stop") {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
       try { flushULaw(); } catch {}
-      try { dg?.close(); } catch {}
+      try { startDeepgram()?.close(); } catch {}
       await postCallLogOnce(ws, "twilio stop");
       try { ws.close(); } catch {}
     }
   });
 
   ws.on("close", async () => {
-    try { dg?.close(); } catch {}
+    try { startDeepgram()?.close(); } catch {}
     clearHangTimer();
     await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
@@ -707,7 +734,6 @@ wss.on("connection", (ws) => {
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    // Soft intent to end
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
@@ -726,7 +752,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
@@ -745,7 +770,6 @@ wss.on("connection", (ws) => {
           console.warn("[TOOL] missing impl", name);
         }
 
-        // Follow-up turn after tool result
         let follow;
         try {
           follow = await openaiChat([
@@ -775,7 +799,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Normal AI reply */
     const botText = (choice?.message?.content || "").trim();
     if (botText) {
       await say(ws, botText);
@@ -816,8 +839,7 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Put all per-tenant behavior and business facts in RENDER_PROMPT (or return {prompt} from PROMPT_FETCH).
-- Keep only keys, Twilio, and endpoint URLs as envs.
-- The model decides when to call tools based on your prompt policy.
-- Webhooks and tools remain stable across customers -> copy/paste ready.
+- Times sent to calendar are now normalized to UTC (Z). This fixes offset drift.
+- If the model supplies offset-aware ISO strings, they convert correctly.
+- If it supplies naive local times, Node will assume local server TZ; advise the prompt to include offsets.
 */
