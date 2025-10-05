@@ -236,7 +236,6 @@ function startDeepgram({ onFinal }) {
   let lastInterimLog = 0;
   dg.on("message", (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
-    if (ev.type !== "Results") return;
     const alt = ev.channel?.alternatives?.[0];
     const text = (alt?.transcript || "").trim();
     if (!text) return;
@@ -577,6 +576,11 @@ wss.on("connection", (ws) => {
     ws.__postedLog = true;
 
     const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
+
+    // Build transcript string
+    const transcriptArr = ws.__mem?.transcript || [];
+    const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
+
     const payload = {
       biz: DASH_BIZ,
       source: DASH_SOURCE,
@@ -584,7 +588,7 @@ wss.on("connection", (ws) => {
       callSid: trace.callSid,
       from: trace.from,
       summary: ws.__mem?.summary || "",
-      transcript: ws.__mem?.transcript || [],
+      transcript: transcriptText,   // send as string
       ended_reason: reason || ""
     };
 
@@ -598,7 +602,7 @@ wss.on("connection", (ws) => {
 
     try {
       if (URLS.CALL_SUMMARY) {
-        await httpPost(URLS.CALL_SUMMARY, { ...payload, transcript: undefined }, {
+        await httpPost(URLS.CALL_SUMMARY, payload, {
           timeout: 8000, tag:"CALL_SUMMARY", trace
         });
       } else {
