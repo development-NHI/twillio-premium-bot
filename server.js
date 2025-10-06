@@ -93,7 +93,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
   try {
     const resp = await axios.get(url, { headers, timeout, params, auth });
-  if (DEBUG_HTTP && watched) {
+    if (DEBUG_HTTP && watched) {
       console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"GET", url,
         status: resp.status, ms: Date.now()-t, resp_preview: preview(resp.data), at: new Date().toISOString(), trace }));
     }
@@ -130,10 +130,10 @@ Interview style:
 - Keep turns under ~12–15 words unless reading back details. Sound warm, efficient, and local.
 
 Collect before booking (ask only for missing fields):
-- Full name, phone, role (buyer/seller/investor/tenant/landlord), service type (buyer tour, listing consult, etc.), property address/MLS if a showing, preferred date/time, meeting type (phone/office/in-person showing), notes.
+- Full name, phone, role, service type, property address/MLS if a showing, preferred date/time, meeting type (phone/office/in-person), notes.
 
 Scheduling policy:
-- Use calendar tools to read/hold/confirm. Resolve relative dates (“today/tomorrow/next Tuesday”) in America/New_York.
+- Use calendar tools to read/hold/confirm. Resolve relative dates in America/New_York.
 - Confirm details and read back once before booking. Never double-book.
 - If requested time is taken, say that once, then offer 2–3 closest alternatives.
 - Reminders are handled downstream; just confirm they’ll get one.
@@ -148,15 +148,19 @@ Escalation/transfer:
 - If urgent/complex or caller asks for a human, offer transfer-to-agent.
 
 Closing policy:
-- When caller is done, ask “Anything else I can help with?” If no, give one short goodbye line and end the call.
+- When caller is done, ask “Anything else I can help with?”
+- Treat **yes/yep/yeah/sure** as *they have more*. Ask: “What else can I help with?”
+- Only end if they clearly say **no / nothing else / that’s all**.
+- One short goodbye line, then end the call via the **end_call tool**. Do not speak after triggering hangup.
 
 Behavioral constraints:
 - Do **not** fabricate tool outcomes. Always use tools for availability, booking, canceling, transfer, lead logging, and call logging.
+- **Never re-ask for info already provided in transcript/memory.** Use memory to avoid repeats.
 - Keep responses natural, concise, and on-brand.
 - Outside business hours: capture name/number/service + best time to reach them; promise a callback during office hours.
 
 Greeting:
-- Open with: “Thanks for calling The Victory Team in Bel Air—how can I help today?”
+- “Thanks for calling The Victory Team in Bel Air—how can I help today?”
 
 Output:
 - Short, natural voice responses.
@@ -204,7 +208,7 @@ app.post("/handoff", (req, res) => {
   `.trim());
 });
 
-/* Optional: simple goodbye TwiML */
+/* Goodbye TwiML (authoritative hangup) */
 app.post("/goodbye", (_req, res) => {
   res.type("text/xml").send(`<Response><Say voice="alice">Goodbye.</Say><Hangup/></Response>`);
 });
@@ -230,7 +234,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=750"; // wait longer before cutting caller off
+    + "&endpointing=750";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -411,14 +415,24 @@ const Tools = {
     console.log("[TOOL] end_call", { callSid, reason });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { text:"" };
     try {
+      // FIRST: redirect the active call to /goodbye TwiML which contains <Hangup/>
+      const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+      const redirectUrl = `https://${host}/goodbye`;
       const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
-      const params = new URLSearchParams({ Status: "completed" });
       const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
-      await httpPost(url, params, {
-        auth, timeout: 10000, tag:"TWILIO_HANGUP",
+      await httpPost(url, new URLSearchParams({ Url: redirectUrl, Method: "POST" }), {
+        auth, timeout: 10000, tag:"TWILIO_HANGUP_REDIRECT",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         trace:{ callSid, reason, convoId: currentTrace.convoId }
       });
+      // Optionally follow with a hard complete after a short delay (best-effort)
+      setTimeout(() => {
+        httpPost(url, new URLSearchParams({ Status: "completed" }), {
+          auth, timeout: 8000, tag:"TWILIO_HANGUP_COMPLETE",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          trace:{ callSid, reason, convoId: currentTrace.convoId }
+        }).catch(()=>{});
+      }, 600);
       return { text:"" };
     } catch { return { text:"" }; }
   }
@@ -493,22 +507,18 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* === TZ helper: derive YYYY-MM-DD in business timezone (uses BIZ_TZ) === */
+/* === TZ helper: derive YYYY-MM-DD in business timezone === */
 function todayInTZ(tz) {
   const d = new Date();
-  // Format as dd/mm/yyyy to avoid locale surprises, then reassemble
   const [day, month, year] = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz,
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric"
+    timeZone: tz, day: "2-digit", month: "2-digit", year: "numeric"
   }).format(d).split("/");
   return `${year}-${month}-${day}`;
 }
 
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = todayInTZ(BIZ_TZ); // use business timezone
+  const todayISO = todayInTZ(BIZ_TZ);
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
@@ -518,7 +528,9 @@ function buildSystemPrompt(mem, tenantPrompt) {
 - Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
 - Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
 - Keep replies under ~12–15 words unless reading back details.
-- One goodbye line only, then end_call.` },
+- Never re-ask for info already provided in the transcript/memory.
+- After asking "Anything else I can help with?", wait for the caller. "Yes/Yeah/Yep/Sure" means they have more; only end on a clear "No/That’s all."
+- When ending, trigger end_call and stop speaking immediately.` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
 }
@@ -589,13 +601,13 @@ wss.on("connection", (ws) => {
     if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
     ws.__pendingHangupUntil = 0;
   }
-  function scheduleHangup(ms = 2500) {
+  function scheduleHangup(ms = 800) { // shorter, snappier end once tool fires
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
       try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch {}
       try { ws.close(); } catch {}
-      setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
+      setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1000);
     }, ms);
   }
   function flushULaw() {
@@ -616,7 +628,6 @@ wss.on("connection", (ws) => {
 
     const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
 
-    // Build transcript string
     const transcriptArr = ws.__mem?.transcript || [];
     const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
 
@@ -627,7 +638,7 @@ wss.on("connection", (ws) => {
       callSid: trace.callSid,
       from: trace.from,
       summary: ws.__mem?.summary || "",
-      transcript: transcriptText,   // send as string
+      transcript: transcriptText,
       ended_reason: reason || ""
     };
 
@@ -681,8 +692,7 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          if (!ws.__active()) return; // ignore after closing
-          // Ignore speech during hangup grace
+          if (!ws.__active()) return;
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -733,7 +743,7 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
-      ws.__closing = true; // gate all further actions
+      ws.__closing = true;
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       await postCallLogOnce(ws, "twilio stop");
@@ -775,15 +785,13 @@ wss.on("connection", (ws) => {
     /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
-        if (!ws.__active()) break;
         const name = tc.function.name;
         let args = {};
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
         console.log("[TOOL] call ->", name, args);
 
-        if (!ws.__active()) break;
+        // Run tool
         const impl = Tools[name];
         let toolResult = { text:"" };
         if (impl) {
@@ -793,7 +801,17 @@ wss.on("connection", (ws) => {
           console.warn("[TOOL] missing impl", name);
         }
 
-        // Follow-up turn after tool result
+        // If ending call, do NOT generate a follow-up LLM turn; just stop talking and hang up.
+        if (name === "end_call") {
+          ws.__saidFarewell = true;
+          ws.__closing = true;
+          ws.__queuedTurn = null;
+          try { dg?.close(); } catch {}
+          scheduleHangup(200); // allow redirect to apply
+          return; // skip any follow-up text
+        }
+
+        // Otherwise, do a follow-up turn after tool result
         let follow;
         try {
           follow = await openaiChat([
@@ -811,15 +829,6 @@ wss.on("connection", (ws) => {
           await say(ws, botText);
           remember(ws.__mem, "bot", botText);
         }
-
-        if (name === "end_call") {
-          ws.__saidFarewell = true;
-          ws.__closing = true;
-          ws.__queuedTurn = null;   // drop queued turns
-          try { dg?.close(); } catch {}
-          try { await Tools.end_call({ callSid: ws.__callSid, reason: "assistant goodbye" }); } catch {}
-          scheduleHangup(500);
-        }
       }
 
       await updateSummary(ws.__mem);
@@ -835,7 +844,7 @@ wss.on("connection", (ws) => {
 
     if (ws.__closing && !ws.__saidFarewell) {
       ws.__saidFarewell = true;
-      scheduleHangup(500);
+      scheduleHangup(200);
     }
 
     await updateSummary(ws.__mem);
@@ -867,8 +876,7 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Put all per-tenant behavior and business facts in RENDER_PROMPT (or return {prompt} from PROMPT_FETCH).
-- Keep only keys, Twilio, and endpoint URLs as envs.
-- The model decides when to call tools based on your prompt policy.
-- Webhooks and tools remain stable across customers -> copy/paste ready.
+- Prompt tightened to: (1) avoid re-asking provided info, (2) interpret “Yes/Yep” after “Anything else?” as “has more”, and (3) stop speaking after hangup.
+- end_call now redirects to /goodbye TwiML with <Hangup/> and then completes, fixing cases where Twilio didn’t end immediately.
+- Tool flow skips follow-up LLM after end_call, preventing extra lines after hangup is triggered.
 */
