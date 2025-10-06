@@ -107,11 +107,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
 }
 
-/* ===== Brain prompt (single source of truth) =====
-   Put ALL behavior, policies, business profile, hours, services, pricing ranges,
-   cancellation rules, transfer criteria, recap rules, and tone in this string.
-   You can also host it and set PROMPT_FETCH to return { prompt } for per-tenant control.
-*/
+/* ===== Brain prompt ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are an AI phone receptionist for a professional services company.
 You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
@@ -186,10 +182,10 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* TwiML handoff target used during live transfer */
+/* TwiML handoff target for live transfer */
 app.post("/handoff", (req, res) => {
   const from = req.body?.From || TWILIO_CALLER_ID || "";
-  console.log("[HTTP] /handoff]", { from, owner: OWNER_PHONE });
+  console.log("[HTTP] /handoff", { from, owner: OWNER_PHONE });
   res.type("text/xml").send(`
     <Response>
       <Say voice="alice">Transferring you now.</Say>
@@ -225,18 +221,14 @@ function toLocalParts(iso, tz) {
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
 }
-function isoNoMs(dateOrIso) {
-  const s = new Date(dateOrIso).toISOString();
-  return s.replace(/\.\d{3}Z$/, "Z"); // "YYYY-MM-DDTHH:mm:ssZ"
-}
-function asUTCNoMs(iso) {
-  return isoNoMs(iso);
+function asUTC(iso) {
+  return new Date(iso).toISOString(); // "YYYY-MM-DDTHH:mm:ss.sssZ"
 }
 function dayWindowLocal(dateISO, tz) {
   const start_local = `${dateISO} 00:00`;
   const end_local   = `${dateISO} 23:59`;
-  const start_utc = isoNoMs(`${dateISO}T00:00:00Z`);
-  const end_utc   = isoNoMs(`${dateISO}T23:59:00Z`);
+  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
+  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
 }
 
@@ -250,7 +242,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200"; // allow ~1.2s pause before finalizing
+    + "&endpointing=1200";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -350,7 +342,7 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Tool Registry (prompt-driven usage) ===== */
+/* ===== Tool Registry ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
@@ -362,8 +354,8 @@ const Tools = {
         const end_local   = toLocalParts(endISO,   BIZ_TZ);
         windowObj = {
           start_local, end_local,
-          start_utc: asUTCNoMs(startISO),
-          end_utc:   asUTCNoMs(endISO)
+          start_utc: asUTC(startISO),
+          end_utc:   asUTC(endISO)
         };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
@@ -376,13 +368,7 @@ const Tools = {
       } else {
         return { text:"Missing date window." };
       }
-      const payload = {
-        intent:"READ",
-        biz: DASH_BIZ,
-        source: DASH_SOURCE,
-        timezone: BIZ_TZ,
-        window: windowObj
-      };
+      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE, timezone: BIZ_TZ, window: windowObj };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
@@ -403,8 +389,8 @@ const Tools = {
         Timezone: BIZ_TZ,
         Start_Time_Local: start_local,
         End_Time_Local:   end_local,
-        Start_Time_UTC:   asUTCNoMs(startISO),
-        End_Time_UTC:     asUTCNoMs(endISO),
+        Start_Time_UTC:   asUTC(startISO),
+        End_Time_UTC:     asUTC(endISO),
         Customer_Name: name||"",
         Customer_Phone: phone||"",
         Customer_Email: "",
@@ -487,7 +473,7 @@ const Tools = {
   }
 };
 
-/* Tool schema advertised to the model (the model chooses based on prompt policy) */
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -645,7 +631,6 @@ wss.on("connection", (ws) => {
 
     const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
 
-    // Build transcript string
     const transcriptArr = ws.__mem?.transcript || [];
     const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
 
@@ -664,7 +649,7 @@ wss.on("connection", (ws) => {
       if (URLS.CALL_LOG) {
         await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
       } else {
-        console.warn("[CALL_LOG] URL missing]");
+        console.warn("[CALL_LOG] URL missing");
       }
     } catch {}
 
@@ -674,7 +659,7 @@ wss.on("connection", (ws) => {
           timeout: 8000, tag:"CALL_SUMMARY", trace
         });
       } else {
-        console.warn("[CALL_SUMMARY] URL missing]");
+        console.warn("[CALL_SUMMARY] URL missing");
       }
     } catch {}
   }
@@ -703,10 +688,10 @@ wss.on("connection", (ws) => {
           );
           if (data?.prompt) ws.__tenantPrompt = data.prompt;
           console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
-        } } catch(e){
+        } catch(e){
           console.warn("[PROMPT_FETCH] error", e.message);
         }
-      
+      }
 
       dg = startDeepgram({
         onFinal: async (text) => {
@@ -774,10 +759,11 @@ wss.on("connection", (ws) => {
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
-  /* ===== Turn handler (prompt is the brain) ===== */
+  /* ===== Turn handler ===== */
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
+    // Soft intent to end
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
@@ -796,6 +782,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    /* Tool flow */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
@@ -814,6 +801,7 @@ wss.on("connection", (ws) => {
           console.warn("[TOOL] missing impl", name);
         }
 
+        // Follow-up turn after tool result
         let follow;
         try {
           follow = await openaiChat([
@@ -843,6 +831,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    /* Normal AI reply */
     const botText = (choice?.message?.content || "").trim();
     if (botText) {
       await say(ws, botText);
