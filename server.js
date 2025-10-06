@@ -107,7 +107,11 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
 }
 
-/* ===== Brain prompt (single source of truth) ===== */
+/* ===== Brain prompt (single source of truth) =====
+   Put ALL behavior, policies, business profile, hours, services, pricing ranges,
+   cancellation rules, transfer criteria, recap rules, and tone in this string.
+   You can also host it and set PROMPT_FETCH to return { prompt } for per-tenant control.
+*/
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are an AI phone receptionist for a professional services company.
 You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
@@ -163,18 +167,16 @@ app.get("/", (_, res) => res.status(200).send("OK: AI Voice Agent up"));
 
 app.post("/twiml", (req, res) => {
   const from = req.body?.From || "";
-  theCallSidFix(req, res); // ensure we always emit both CallSid + callSid params
-});
-
-function theCallSidFix(req, res) {
   const callSid = req.body?.CallSid || "";
+  console.log("[HTTP] /twiml", { from, callSid });
+
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
   res.send(`
     <Response>
       <Connect>
         <Stream url="wss://${host}" track="inbound_track">
-          <Parameter name="from" value="${req.body?.From || ""}"/>
+          <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
@@ -182,7 +184,7 @@ function theCallSidFix(req, res) {
     </Response>
   `.trim());
   console.log("[HTTP] TwiML served with host", host);
-}
+});
 
 /* TwiML handoff target used during live transfer */
 app.post("/handoff", (req, res) => {
@@ -223,21 +225,18 @@ function toLocalParts(iso, tz) {
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
 }
+function isoNoMs(dateOrIso) {
+  const s = new Date(dateOrIso).toISOString();
+  return s.replace(/\.\d{3}Z$/, "Z"); // "YYYY-MM-DDTHH:mm:ssZ"
+}
 function asUTCNoMs(iso) {
-  const d = new Date(iso);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth()+1).padStart(2,"0");
-  const da = String(d.getUTCDate()).padStart(2,"0");
-  const hh = String(d.getUTCHours()).padStart(2,"0");
-  const mm = String(d.getUTCMinutes()).padStart(2,"0");
-  const ss = String(d.getUTCSeconds()).padStart(2,"0");
-  return `${y}-${m}-${da}T${hh}:${mm}:${ss}Z`;
+  return isoNoMs(iso);
 }
 function dayWindowLocal(dateISO, tz) {
   const start_local = `${dateISO} 00:00`;
   const end_local   = `${dateISO} 23:59`;
-  const start_utc = asUTCNoMs(`${dateISO}T00:00:00`);
-  const end_utc   = asUTCNoMs(`${dateISO}T23:59:00`);
+  const start_utc = isoNoMs(`${dateISO}T00:00:00Z`);
+  const end_utc   = isoNoMs(`${dateISO}T23:59:00Z`);
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
 }
 
@@ -251,7 +250,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200";
+    + "&endpointing=1200"; // allow ~1.2s pause before finalizing
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -282,7 +281,8 @@ function startDeepgram({ onFinal }) {
     sendULaw(buf){
       try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
-    close(){ try { dg.close(); } catch {} }
+    close(){ try { dg.close(); } catch {}
+    }
   };
 }
 
@@ -350,66 +350,43 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Helper: robust POST with payload fallbacks ===== */
-async function postWithFallback(url, payloads, meta) {
-  let lastErr = null;
-  for (let i = 0; i < payloads.length; i++) {
-    try {
-      return await httpPost(url, payloads[i], meta);
-    } catch (e) {
-      lastErr = e;
-      await sleep(120 * (i + 1)); // tiny backoff
-    }
-  }
-  throw lastErr;
-}
-
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
-      // Build both the NEW payload (with local/utc fields) and LEGACY payload (simple ISO window)
-      let start = startISO, end = endISO;
-      if (!start && dateISO) start = `${dateISO}T00:00:00`;
-      if (!end && dateISO)   end   = `${dateISO}T23:59:59`;
-
-      const start_local = start ? toLocalParts(start, BIZ_TZ) : undefined;
-      const end_local   = end   ? toLocalParts(end,   BIZ_TZ) : undefined;
-
-      const newPayload = {
-        intent: "READ",
+      let windowObj;
+      if (startISO && endISO) {
+        const start_local = toLocalParts(startISO, BIZ_TZ);
+        const end_local   = toLocalParts(endISO,   BIZ_TZ);
+        windowObj = {
+          start_local, end_local,
+          start_utc: asUTCNoMs(startISO),
+          end_utc:   asUTCNoMs(endISO)
+        };
+      } else if (dateISO) {
+        const w = dayWindowLocal(dateISO, BIZ_TZ);
+        windowObj = {
+          start_local: w.start_local,
+          end_local:   w.end_local,
+          start_utc:   w.start_utc,
+          end_utc:     w.end_utc
+        };
+      } else {
+        return { text:"Missing date window." };
+      }
+      const payload = {
+        intent:"READ",
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
-        window: start && end ? {
-          start_local, end_local,
-          start_utc: asUTCNoMs(start),
-          end_utc:   asUTCNoMs(end)
-        } : (dateISO ? dayWindowLocal(dateISO, BIZ_TZ) : undefined)
+        window: windowObj
       };
-
-      const legacyPayload = {
-        intent: "READ",
-        biz: DASH_BIZ,
-        source: DASH_SOURCE,
-        window: {
-          start: start || (dateISO ? `${dateISO}T00:00:00` : ""),
-          end:   end   || (dateISO ? `${dateISO}T23:59:59` : "")
-        }
-      };
-
-      const { data } = await postWithFallback(
-        URLS.CAL_READ,
-        [newPayload, legacyPayload],
-        { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
-      );
-
+      const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
-    } catch(e){
-      return { text:"I’m having trouble checking availability. Want me to take your preferred time and have an agent confirm?" };
-    }
+    } catch(e){ return { text:"Could not read availability." }; }
   },
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
@@ -417,37 +394,24 @@ const Tools = {
     if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
       if (!startISO || !endISO) return { text:"Booking failed: missing start/end." };
-
       const start_local = toLocalParts(startISO, BIZ_TZ);
       const end_local   = toLocalParts(endISO,   BIZ_TZ);
-
-      // NEW payload (rich) + LEGACY payload (Start_Time/End_Time only). Send both keys for maximum compatibility.
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
         Timezone: BIZ_TZ,
-
-        // New fields
         Start_Time_Local: start_local,
         End_Time_Local:   end_local,
         Start_Time_UTC:   asUTCNoMs(startISO),
         End_Time_UTC:     asUTCNoMs(endISO),
-
-        // Legacy fields (kept)
-        Start_Time: startISO,
-        End_Time:   endISO,
-
         Customer_Name: name||"",
         Customer_Phone: phone||"",
         Customer_Email: "",
         Notes: notes||service||""
       };
-
-      const { data } = await httpPost(URLS.CAL_CREATE, payload, {
-        timeout:12000, tag:"CAL_CREATE",
-        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
-      });
+      const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000, tag:"CAL_CREATE",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data, text:"Booked." };
     } catch(e){ return { text:"Booking failed." }; }
   },
@@ -739,10 +703,10 @@ wss.on("connection", (ws) => {
           );
           if (data?.prompt) ws.__tenantPrompt = data.prompt;
           console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
-        } catch(e){
+        } } catch(e){
           console.warn("[PROMPT_FETCH] error", e.message);
         }
-      }
+      
 
       dg = startDeepgram({
         onFinal: async (text) => {
