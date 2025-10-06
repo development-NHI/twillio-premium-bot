@@ -215,6 +215,28 @@ const wss = new WebSocketServer({ server });
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+/* ---- Time helpers (Local/UTC pairing) ---- */
+function toLocalParts(iso, tz) {
+  const d = new Date(iso);
+  const f = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", hour12:false
+  });
+  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
+}
+function asUTC(iso) {
+  return new Date(iso).toISOString(); // "YYYY-MM-DDTHH:mm:ss.sssZ"
+}
+function dayWindowLocal(dateISO, tz) {
+  const start_local = `${dateISO} 00:00`;
+  const end_local   = `${dateISO} 23:59`;
+  // Best-effort UTC window; server will recompute from local per contract
+  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
+  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
+  return { start_local, end_local, start_utc, end_utc, timezone: tz };
+}
+
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
   const url =
@@ -225,7 +247,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=250";
+    + "&endpointing=1200"; // allow ~1.2s pause before finalizing
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -330,28 +352,60 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
-      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE,
-        window:{ start:startISO || `${dateISO||""}T00:00:00`, end:endISO || `${dateISO||""}T23:59:59` } };
+      let windowObj;
+      if (startISO && endISO) {
+        const start_local = toLocalParts(startISO, BIZ_TZ);
+        const end_local   = toLocalParts(endISO,   BIZ_TZ);
+        windowObj = {
+          start_local, end_local,
+          start_utc: asUTC(startISO),
+          end_utc:   asUTC(endISO)
+        };
+      } else if (dateISO) {
+        const w = dayWindowLocal(dateISO, BIZ_TZ);
+        windowObj = {
+          start_local: w.start_local,
+          end_local:   w.end_local,
+          start_utc:   w.start_utc,
+          end_utc:     w.end_utc
+        };
+      } else {
+        return { text:"Missing date window." };
+      }
+      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE, timezone: BIZ_TZ, window: windowObj };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
     } catch(e){ return { text:"Could not read availability." }; }
   },
+
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
+      if (!startISO || !endISO) return { text:"Booking failed: missing start/end." };
+      const start_local = toLocalParts(startISO, BIZ_TZ);
+      const end_local   = toLocalParts(endISO,   BIZ_TZ);
       const payload = {
+        biz: DASH_BIZ,
+        source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
-        Start_Time: startISO, End_Time: endISO,
-        Customer_Name: name||"", Customer_Phone: phone||"", Customer_Email: "",
-        Notes: notes||service||"", biz: DASH_BIZ, source: DASH_SOURCE
+        Timezone: BIZ_TZ,
+        Start_Time_Local: start_local,
+        End_Time_Local:   end_local,
+        Start_Time_UTC:   asUTC(startISO),
+        End_Time_UTC:     asUTC(endISO),
+        Customer_Name: name||"",
+        Customer_Phone: phone||"",
+        Customer_Email: "",
+        Notes: notes||service||""
       };
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data, text:"Booked." };
     } catch(e){ return { text:"Booking failed." }; }
   },
+
   async cancel_appointment({ event_id, name, phone }) {
     console.log("[TOOL] cancel_appointment", { event_id });
     if (!URLS.CAL_DELETE) return { text:"Cancellation unavailable." };
@@ -363,6 +417,7 @@ const Tools = {
       return { text: ok ? "Canceled." : "Could not cancel.", data };
     } catch(e){ return { text:"Cancellation failed." }; }
   },
+
   async lead_upsert({ name, phone, intent, notes }) {
     console.log("[TOOL] lead_upsert", { name, intent });
     if (!URLS.LEAD_UPSERT) return { text:"Lead logging unavailable." };
@@ -373,6 +428,7 @@ const Tools = {
       return { data };
     } catch { return { text:"" }; }
   },
+
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
     try {
@@ -383,6 +439,7 @@ const Tools = {
     } catch {}
     return { data:{ topic, service } };
   },
+
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
@@ -402,6 +459,7 @@ const Tools = {
       return { text:"Transferring you now. Please hold." };
     } catch { return { text:"Transfer failed." }; }
   },
+
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { text:"" };
@@ -596,7 +654,7 @@ wss.on("connection", (ws) => {
       if (URLS.CALL_LOG) {
         await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
       } else {
-        console.warn("[CALL_LOG] URL missing");
+        console.warn("[CALL_LOG] URL missing]");
       }
     } catch {}
 
@@ -606,7 +664,7 @@ wss.on("connection", (ws) => {
           timeout: 8000, tag:"CALL_SUMMARY", trace
         });
       } else {
-        console.warn("[CALL_SUMMARY] URL missing");
+        console.warn("[CALL_SUMMARY] URL missing]");
       }
     } catch {}
   }
