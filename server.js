@@ -225,15 +225,22 @@ function toLocalParts(iso, tz) {
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
 }
-function asUTC(iso) {
-  return new Date(iso).toISOString(); // "YYYY-MM-DDTHH:mm:ss.sssZ"
+function asUTCNoMs(iso) {
+  const d = new Date(iso);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth()+1).padStart(2,"0");
+  const da = String(d.getUTCDate()).padStart(2,"0");
+  const hh = String(d.getUTCHours()).padStart(2,"0");
+  const mm = String(d.getUTCMinutes()).padStart(2,"0");
+  const ss = String(d.getUTCSeconds()).padStart(2,"0");
+  return `${y}-${m}-${da}T${hh}:${mm}:${ss}Z`; // no milliseconds
 }
 function dayWindowLocal(dateISO, tz) {
   const start_local = `${dateISO} 00:00`;
   const end_local   = `${dateISO} 23:59`;
   // Best-effort UTC window; server will recompute from local per contract
-  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
-  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
+  const start_utc = asUTCNoMs(`${dateISO}T00:00:00`);
+  const end_utc   = asUTCNoMs(`${dateISO}T23:59:00`);
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
 }
 
@@ -247,7 +254,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200"; // allow ~1.2s pause before finalizing
+    + "&endpointing=1200";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -358,8 +365,8 @@ const Tools = {
         const end_local   = toLocalParts(endISO,   BIZ_TZ);
         windowObj = {
           start_local, end_local,
-          start_utc: asUTC(startISO),
-          end_utc:   asUTC(endISO)
+          start_utc: asUTCNoMs(startISO),
+          end_utc:   asUTCNoMs(endISO)
         };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
@@ -393,8 +400,8 @@ const Tools = {
         Timezone: BIZ_TZ,
         Start_Time_Local: start_local,
         End_Time_Local:   end_local,
-        Start_Time_UTC:   asUTC(startISO),
-        End_Time_UTC:     asUTC(endISO),
+        Start_Time_UTC:   asUTCNoMs(startISO),
+        End_Time_UTC:     asUTCNoMs(endISO),
         Customer_Name: name||"",
         Customer_Phone: phone||"",
         Customer_Email: "",
@@ -646,7 +653,7 @@ wss.on("connection", (ws) => {
       callSid: trace.callSid,
       from: trace.from,
       summary: ws.__mem?.summary || "",
-      transcript: transcriptText,   // send as string
+      transcript: transcriptText,
       ended_reason: reason || ""
     };
 
@@ -700,7 +707,6 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          // Ignore speech during hangup grace
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -769,7 +775,6 @@ wss.on("connection", (ws) => {
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    // Soft intent to end
     const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
     if (byeHint.test(userText)) {
       ws.__closeIntentCount += 1;
@@ -788,7 +793,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
@@ -807,7 +811,6 @@ wss.on("connection", (ws) => {
           console.warn("[TOOL] missing impl", name);
         }
 
-        // Follow-up turn after tool result
         let follow;
         try {
           follow = await openaiChat([
@@ -837,7 +840,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Normal AI reply */
     const botText = (choice?.message?.content || "").trim();
     if (botText) {
       await say(ws, botText);
