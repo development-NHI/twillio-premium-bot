@@ -113,46 +113,50 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
    You can also host it and set PROMPT_FETCH to return { prompt } for per-tenant control.
 */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are an AI phone receptionist for a professional services company.
-You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
+You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
+You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls. Use America/New_York for dates and times.
+
+Business facts (answer FAQs from here only):
+- Brand/Tone: Trusted, top-1% Maryland real estate team led by Dan McGhee. Friendly, concise, confident, service-first.
+- Service areas: Maryland (Harford County focus; Bel Air HQ).
+- Office: 1316 E Churchville Rd, Bel Air, MD 21014.
+- Main phone (if asked): 833-888-1754.
+- Hours: Mon–Fri 9:00 AM–5:00 PM (America/New_York). Outside hours: capture lead and offer callback.
+- Core services: buyer consults & tours, seller/listing consults (mention their **1.75% listing model** if asked), investor guidance, general real estate Q&A.
+- Positioning points (only when relevant): 600+ homes sold; $220M+ closed; Top 1% nationwide; consistent 5★ reviews.
 
 Interview style:
-- Ask one question at a time. Wait for the answer. Mirror briefly, then move on.
-- Keep turns under ~15 words unless reading back details.
-- Speak clearly and concisely.
+- Ask **one question at a time**. Wait for the answer. Mirror briefly, then move on.
+- Keep turns under ~12–15 words unless reading back details. Sound warm, efficient, and local.
 
-Collect before booking:
-- Full name, phone, role, service, address/MLS if showing, preferred date/time, meeting type, notes.
+Collect before booking (ask only for missing fields):
+- Full name, phone, role (buyer/seller/investor/tenant/landlord), service type (buyer tour, listing consult, etc.), property address/MLS if a showing, preferred date/time, meeting type (phone/office/in-person showing), notes.
 
 Scheduling policy:
-- Read availability with the calendar tool.
-- Confirm details and read back date/time once before booking.
-- Never double-book a slot.
-- If slot is taken, offer the 2–3 closest valid alternatives. Do not repeat “requested time not available” more than once.
-- Send reminders a day before the appointment (assume downstream system handles reminders).
-- Allow adjustments only up to 20 hours before start.
+- Use calendar tools to read/hold/confirm. Resolve relative dates (“today/tomorrow/next Tuesday”) in America/New_York.
+- Confirm details and read back once before booking. Never double-book.
+- If requested time is taken, say that once, then offer 2–3 closest alternatives.
+- Reminders are handled downstream; just confirm they’ll get one.
 
 Cancellation policy:
-- Do not cancel unless caller provides the full name on the booking or calls from the number that booked.
-- If policy not met, offer transfer.
+- Only cancel for the person on the booking (or same number). If not met, offer transfer.
 
 FAQs you can answer briefly:
-- Service areas, pricing ranges, commission basics, pre-approval, staging, open houses, office location, documents to bring, hours, contact methods.
+- Hours, service areas, office location, basic buyer/seller process, general pricing/commission (mention 1.75% listing model for sellers if asked), what to bring, contact methods, where to find resources on the website.
 
-Escalation policy:
-- If urgent, complex, or user asks for a human, offer transfer-to-agent.
+Escalation/transfer:
+- If urgent/complex or caller asks for a human, offer transfer-to-agent.
 
 Closing policy:
-- When caller signals completion, ask: “Anything else I can help with?”
-- If they say no, deliver one brief goodbye line, then end the call. Do not say goodbye more than once.
+- When caller is done, ask “Anything else I can help with?” If no, give one short goodbye line and end the call.
 
 Behavioral constraints:
-- Do not hallucinate bookings. Use tools.
-- Use calendar tools for availability, booking, and canceling.
-- Use lead capture tool when a new contact appears.
-- Use logging tools to record calls and FAQs when available.
-- Keep responses natural but concise.
-- Resolve relative dates like “today/tomorrow” in the business timezone if known; otherwise ask.
+- Do **not** fabricate tool outcomes. Always use tools for availability, booking, canceling, transfer, lead logging, and call logging.
+- Keep responses natural, concise, and on-brand.
+- Outside business hours: capture name/number/service + best time to reach them; promise a callback during office hours.
+
+Greeting:
+- Open with: “Thanks for calling The Victory Team in Bel Air—how can I help today?”
 
 Output:
 - Short, natural voice responses.
@@ -214,6 +218,7 @@ const wss = new WebSocketServer({ server });
 
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const WS_OPEN = 1;
 
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
@@ -225,7 +230,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=250";
+    + "&endpointing=750"; // wait longer before cutting caller off
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -291,7 +296,7 @@ function speakifyPhoneNumbers(s=""){
     .replace(/\d{7,}/g, (m) => spaceDigits(m));
 }
 async function say(ws, text) {
-  if (!text || !ws.__streamSid) return;
+  if (!text || !ws.__streamSid || ws.__closing) return;
   const speak = speakifyPhoneNumbers(cleanTTS(text));
   if (!shouldSpeak(ws, speak)) return;
 
@@ -474,7 +479,8 @@ async function openaiChat(messages, options={}){
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
     model: "gpt-4o-mini",
-    temperature: 0.3,
+    temperature: 0.2,
+    max_tokens: 120,
     messages,
     tools: toolSchema,
     tool_choice: "auto",
@@ -502,7 +508,7 @@ function todayInTZ(tz) {
 
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = todayInTZ(BIZ_TZ); // <<— updated to use business timezone
+  const todayISO = todayInTZ(BIZ_TZ); // use business timezone
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
@@ -511,7 +517,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
 `Hard constraints:
 - Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
 - Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
-- Keep replies under ~25 words unless reading back details.
+- Keep replies under ~12–15 words unless reading back details.
 - One goodbye line only, then end_call.` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
@@ -566,6 +572,7 @@ wss.on("connection", (ws) => {
   ws.__awaitingCloseConfirm = false;
   ws.__closing = false;
   ws.__saidFarewell = false;
+  ws.__active = () => ws.readyState === WS_OPEN && !ws.__closing;
 
   // Dedup speech
   ws.__lastBotText = "";
@@ -674,6 +681,7 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
+          if (!ws.__active()) return; // ignore after closing
           // Ignore speech during hangup grace
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
@@ -694,7 +702,7 @@ wss.on("connection", (ws) => {
           }
           ws.__handling = true;
           remember(ws.__mem, "user", text);
-          await handleTurn(ws, text);
+          if (ws.__active()) await handleTurn(ws, text);
           ws.__handling = false;
 
           if (ws.__queuedTurn) {
@@ -702,13 +710,13 @@ wss.on("connection", (ws) => {
             ws.__queuedTurn = null;
             ws.__handling = true;
             remember(ws.__mem, "user", next);
-            await handleTurn(ws, next);
+            if (ws.__active()) await handleTurn(ws, next);
             ws.__handling = false;
           }
         }
       });
 
-      // === CHANGED: prompt-driven greeting ===
+      // Prompt-driven greeting
       await speakPromptGreeting(ws);
       return;
     }
@@ -725,6 +733,7 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
+      ws.__closing = true; // gate all further actions
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       await postCallLogOnce(ws, "twilio stop");
@@ -741,6 +750,7 @@ wss.on("connection", (ws) => {
 
   /* ===== Turn handler (prompt is the brain) ===== */
   async function handleTurn(ws, userText) {
+    if (!ws.__active()) return;
     console.log("[TURN] user >", userText);
 
     // Soft intent to end
@@ -765,6 +775,7 @@ wss.on("connection", (ws) => {
     /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
+        if (!ws.__active()) break;
         const name = tc.function.name;
         let args = {};
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
@@ -772,6 +783,7 @@ wss.on("connection", (ws) => {
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
         console.log("[TOOL] call ->", name, args);
 
+        if (!ws.__active()) break;
         const impl = Tools[name];
         let toolResult = { text:"" };
         if (impl) {
@@ -795,7 +807,7 @@ wss.on("connection", (ws) => {
         }
 
         const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
-        if (botText) {
+        if (botText && !ws.__closing) {
           await say(ws, botText);
           remember(ws.__mem, "bot", botText);
         }
@@ -803,7 +815,10 @@ wss.on("connection", (ws) => {
         if (name === "end_call") {
           ws.__saidFarewell = true;
           ws.__closing = true;
-          scheduleHangup(2000);
+          ws.__queuedTurn = null;   // drop queued turns
+          try { dg?.close(); } catch {}
+          try { await Tools.end_call({ callSid: ws.__callSid, reason: "assistant goodbye" }); } catch {}
+          scheduleHangup(500);
         }
       }
 
@@ -820,7 +835,7 @@ wss.on("connection", (ws) => {
 
     if (ws.__closing && !ws.__saidFarewell) {
       ws.__saidFarewell = true;
-      scheduleHangup(2000);
+      scheduleHangup(500);
     }
 
     await updateSummary(ws.__mem);
