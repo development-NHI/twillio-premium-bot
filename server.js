@@ -93,7 +93,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
   try {
     const resp = await axios.get(url, { headers, timeout, params, auth });
-    if (DEBUG_HTTP && watched) {
+  if (DEBUG_HTTP && watched) {
       console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"GET", url,
         status: resp.status, ms: Date.now()-t, resp_preview: preview(resp.data), at: new Date().toISOString(), trace }));
     }
@@ -513,6 +513,25 @@ function buildMessages(mem, userText, tenantPrompt) {
   return [...sys, ...history, { role:"user", content:userText }];
 }
 
+/* ==== Prompt-driven greeting ==== */
+async function speakPromptGreeting(ws) {
+  try {
+    const sys = buildSystemPrompt(ws.__mem, ws.__tenantPrompt);
+    const messages = [
+      ...sys,
+      { role: "user", content: "Start of call. Greet the caller per the prompt, then wait for input." }
+    ];
+    const choice = await openaiChat(messages);
+    const text = (choice?.message?.content || "").trim();
+    if (text) {
+      await say(ws, text);
+      remember(ws.__mem, "bot", text);
+    }
+  } catch (e) {
+    console.error("[GREETING] error", e.message);
+  }
+}
+
 /* ===== WS wiring ===== */
 let currentTrace = { convoId:"", callSid:"" }; // updated per-connection
 wss.on("connection", (ws) => {
@@ -650,7 +669,7 @@ wss.on("connection", (ws) => {
 
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-            console.log("[TURN] dropped duplicate final");
+            console.log("[TURN] dropped duplicate final]");
             return;
           }
           ws.__lastUserText = text;
@@ -676,8 +695,8 @@ wss.on("connection", (ws) => {
         }
       });
 
-      await say(ws, `Hi, how can I help?`);
-      remember(ws.__mem, "bot", `Hi, how can I help?`);
+      // === CHANGED: prompt-driven greeting ===
+      await speakPromptGreeting(ws);
       return;
     }
 
@@ -704,7 +723,7 @@ wss.on("connection", (ws) => {
     try { dg?.close(); } catch {}
     clearHangTimer();
     await postCallLogOnce(ws, "socket close");
-    console.log("[WS] closed", { convoId: ws.__convoId });
+    console.log("[WS] closed]", { convoId: ws.__convoId });
   });
 
   /* ===== Turn handler (prompt is the brain) ===== */
@@ -815,7 +834,7 @@ async function updateSummary(mem) {
     mem.summary = data.choices?.[0]?.message?.content?.trim()?.slice(0, 500) || "";
     console.log("[SUMMARY] len", mem.summary.length);
   } catch(e){
-    console.warn("[SUMMARY] error", e.message);
+    console.warn("[SUMMARY] error]", e.message);
   }
 }
 
