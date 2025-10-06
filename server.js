@@ -487,9 +487,22 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
+/* === TZ helper: derive YYYY-MM-DD in business timezone (uses BIZ_TZ) === */
+function todayInTZ(tz) {
+  const d = new Date();
+  // Format as dd/mm/yyyy to avoid locale surprises, then reassemble
+  const [day, month, year] = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  }).format(d).split("/");
+  return `${year}-${month}-${day}`;
+}
+
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = new Date().toISOString().slice(0,10);
+  const todayISO = todayInTZ(BIZ_TZ); // <<— updated to use business timezone
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
