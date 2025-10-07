@@ -112,7 +112,56 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are an AI phone receptionist. All caller-facing words are your choice. Use tools for actions. Never fabricate outcomes.
+You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
+
+Business facts:
+- Brand/Tone: Trusted, top-1% Maryland real estate team led by Dan McGhee. Friendly, concise, confident, service-first.
+- Service areas: Maryland (Harford County focus; Bel Air HQ).
+- Office: 1316 E Churchville Rd, Bel Air, MD 21014.
+- Main phone to read back if asked: 833-888-1754.
+- Hours: Mon–Fri 9:00 AM–5:00 PM (America/New_York). Outside hours: capture lead and offer callback.
+- Core services: buyer consults & tours, seller/listing consults (mention 1.75% listing model if asked), investor guidance, general real-estate Q&A; direct to website resources when appropriate.
+- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1% nationwide; consistent 5★ reviews.
+
+Interview style:
+- Ask one question at a time, wait for the answer, mirror briefly, keep it under ~15 words unless reading back details.
+- Warm, efficient, and local.
+
+Collect before booking:
+- Full name, phone, role (buyer/seller/investor/tenant/landlord), service type (buyer tour, listing consult, etc.), property address/MLS if a showing, preferred date/time, meeting type (phone/office/in-person showing), notes.
+
+Scheduling policy:
+- Use calendar tools to read/hold/confirm.
+- Resolve relative dates (“today/tomorrow/next Tuesday”) in America/New_York.
+- Confirm details and read back once before booking.
+- Never double-book; if slot taken, offer 2–3 nearby times.
+- Reminders handled downstream—just confirm they’ll get one.
+
+Identity policy for reschedule/cancel:
+- Verify **full name + phone** on the booking before using cancel/reschedule tools.
+- If the caller says “this number,” use the caller ID as the phone.
+- Only proceed if tools confirm a match; otherwise offer transfer.
+
+Cancellation policy:
+- Only cancel for the person on the booking (same name + phone). Otherwise, offer transfer.
+
+Escalation/transfer:
+- Offer transfer to a human if urgent/complex or requested.
+
+Closing:
+- When the caller seems done, ask “Anything else I can help with?”
+- If no, one short goodbye line, then end the call.
+
+Behavioral constraints:
+- Never fabricate tool outcomes; always use tools for availability, booking, canceling, transfer, lead logging, call logging.
+- Keep responses natural, concise, and on-brand.
+- Outside business hours: capture name/number/service + best time to reach them; promise a callback during office hours.
+
+Greeting example (from prompt, not code):
+- “Thanks for calling The Victory Team in Bel Air—how can I help today?”
+
+Output:
+- Short, natural voice responses.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -243,22 +292,6 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
     start_utc:   startUTCAdj,
     end_utc:     endUTCAdj
   };
-}
-
-/* ======= Call-scoped registries ======= */
-let CURRENT_FROM = "";
-let LAST_EVENT = null;
-
-function looksLikeEventId(s="") {
-  return /^[0-9a-f-]{8,}$/i.test((s||"").trim());
-}
-
-function isIncompleteUtterance(t="") {
-  const s = t.trim().toLowerCase();
-  if (!s) return false;
-  if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
-  if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
-  return false;
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
@@ -395,10 +428,13 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
-  async read_availability({ dateISO, startISO, endISO }) {
-    console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
+  async read_availability({ dateISO, startISO, endISO, name, phone }) {
+    console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"" };
     try {
+      // Use caller ID if model passed "this number" (prompt handles wording)
+      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+
       let windowObj;
       if (startISO && endISO) {
         const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -411,12 +447,16 @@ const Tools = {
         const w = dayWindowLocal(today, BIZ_TZ);
         windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       }
+
       const payload = {
         intent:"READ",
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
-        window: windowObj
+        window: windowObj,
+        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
+        contact_name: name || undefined,
+        contact_phone: normalizedPhone || undefined
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
         timeout:12000, tag:"CAL_READ",
@@ -427,32 +467,16 @@ const Tools = {
   },
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
-    console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
+    console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"" };
     try {
-      // default phone to caller ID if missing
-      phone = phone || CURRENT_FROM || "";
+      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // Model decides wording; tool just signals constraint via empty text or a flag if you want
+        // The model will phrase any constraint; we just proceed or let the backend refuse.
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
-
-      // If we have a previous event and the time changed, best-effort cancel it first
-      try {
-        if (LAST_EVENT?.id) {
-          const prevStart = LAST_EVENT.start_local || "";
-          const newStartLocal = win.start_local;
-          if (prevStart && newStartLocal && prevStart !== newStartLocal && URLS.CAL_DELETE) {
-            await httpPost(URLS.CAL_DELETE,
-              { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id: LAST_EVENT.id, name, phone },
-              { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
-            ).catch(()=>{ /* ignore failures */ });
-          }
-        }
-      } catch {}
-
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
@@ -463,7 +487,7 @@ const Tools = {
         Start_Time_UTC:   win.start_utc,
         End_Time_UTC:     win.end_utc,
         Customer_Name: name||"",
-        Customer_Phone: phone||"",
+        Customer_Phone: normalizedPhone,
         Customer_Email: "",
         Notes: notes||service||""
       };
@@ -471,31 +495,28 @@ const Tools = {
         timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
-
-      // remember last event for reschedules
-      if (data?.event_id) {
-        LAST_EVENT = {
-          id: data.event_id,
-          start_local: data.start_local,
-          end_local: data.end_local,
-          timezone: data.timezone
-        };
-      }
-
       return { data, ok:true };
     } catch(e){ return { text:"", ok:false }; }
   },
 
   async cancel_appointment({ event_id, name, phone }) {
-    console.log("[TOOL] cancel_appointment", { event_id });
+    console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE) return { text:"" };
     try {
-      if (!event_id || !looksLikeEventId(event_id)) {
-        if (LAST_EVENT?.id) event_id = LAST_EVENT.id;
-      }
+      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+
+      // Let backend handle either direct ID OR contact match (name+phone). Prompt dictates we must have both.
       const { data, status } = await httpPost(URLS.CAL_DELETE,
-        { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone },
+        {
+          intent:"DELETE",
+          biz: DASH_BIZ,
+          source: DASH_SOURCE,
+          event_id: event_id || undefined,
+          name: name || undefined,
+          phone: normalizedPhone || undefined
+        },
         { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
       return { data, ok };
     } catch(e){ return { text:"", ok:false }; }
@@ -544,26 +565,27 @@ const Tools = {
   },
 
   async end_call({ callSid, reason }) {
-    // Signal-only. Model must have already spoken a goodbye per prompt.
     console.log("[TOOL] end_call (signal only)", { callSid, reason });
     return { text:"" };
   }
 };
 
-/* Tool schema advertised to the model */
+/* Tool schema advertised to the model (prompt drives what to ask; schema only enables actions) */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
-      description:"Read calendar availability in a given window",
+      description:"Read calendar availability in a given window. Optionally filter by contact (name+phone) to verify identity or find existing bookings.",
       parameters:{ type:"object", properties:{
         dateISO:{type:"string", description:"YYYY-MM-DD in business timezone"},
         startISO:{type:"string", description:"ISO start"},
-        endISO:{type:"string", description:"ISO end"}
+        endISO:{type:"string", description:"ISO end"},
+        name:{type:"string"},
+        phone:{type:"string"}
       }, required:[] }
   }},
   { type:"function", function:{
       name:"book_appointment",
-      description:"Create a calendar event",
+      description:"Create a calendar event.",
       parameters:{ type:"object", properties:{
         name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
         startISO:{type:"string"}, endISO:{type:"string"}, notes:{type:"string"}
@@ -571,10 +593,12 @@ const toolSchema = [
   }},
   { type:"function", function:{
       name:"cancel_appointment",
-      description:"Cancel a calendar event by id; caller must prove identity per policy",
+      description:"Cancel a calendar event by event_id, or by (name+phone) when the id is unknown.",
       parameters:{ type:"object", properties:{
-        event_id:{type:"string"}, name:{type:"string"}, phone:{type:"string"}
-      }, required:["event_id"] }
+        event_id:{type:"string"},
+        name:{type:"string"},
+        phone:{type:"string"}
+      }, required:[] }
   }},
   { type:"function", function:{
       name:"lead_upsert",
@@ -646,6 +670,7 @@ function buildMessages(mem, userText, tenantPrompt) {
 
 /* ===== WS wiring ===== */
 let currentTrace = { convoId:"", callSid:"" };
+let CURRENT_FROM = "";
 
 wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
@@ -768,8 +793,8 @@ wss.on("connection", (ws) => {
       ws.__convoId = uuidv4();
       const cp = msg.start?.customParameters || {};
       ws.__from = cp.from || "";
-      ws.__callSid = cp.CallSid || cp.callSid || "";
       CURRENT_FROM = ws.__from || "";
+      ws.__callSid = cp.CallSid || cp.callSid || "";
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
@@ -791,8 +816,7 @@ wss.on("connection", (ws) => {
       dg = startDeepgram({
         onFinal: async (text) => {
           const now = Date.now();
-
-          // Coalesce duplicate finals
+          // de-dupe
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
             return;
@@ -802,13 +826,20 @@ wss.on("connection", (ws) => {
 
           LAST_UTTERANCE = text;
 
-          // "This number" -> capture caller ID
+          // "this number" → capture caller ID (prompt decides when to say it)
           if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
             ws.__mem.entities.phone = ws.__from;
           }
 
-          // If final looks incomplete, debounce briefly to catch continuation
-          if (isIncompleteUtterance(text)) {
+          // Debounce obviously incomplete finals to avoid back-to-back questions
+          const looksPartial = (() => {
+            const s = text.trim().toLowerCase();
+            if (!s) return false;
+            if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
+            if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
+            return false;
+          })();
+          if (looksPartial) {
             clearTimeout(ws.__finalTimer);
             ws.__pendingFinal = text;
             ws.__finalTimer = setTimeout(async () => {
@@ -828,7 +859,6 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          // Normal final handling
           if (ws.__handling) {
             ws.__queuedTurn = text;
             return;
@@ -849,7 +879,7 @@ wss.on("connection", (ws) => {
         }
       });
 
-      // Trigger model-generated greeting per prompt
+      // Prompt-driven greeting
       ws.__handling = true;
       await handleTurn(ws, "<CALL_START>");
       ws.__handling = false;
