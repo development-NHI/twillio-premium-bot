@@ -342,6 +342,7 @@ function shouldSpeak(ws, normalized=""){
 }
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
+  if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
   let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
   const speak = cleanTTS(polished);
   if (!shouldSpeak(ws, speak)) return;
@@ -350,7 +351,7 @@ async function say(ws, text) {
   ws.__lastBotAt = Date.now();
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-    console.warn("[TTS] missing ElevenLabs credentials");
+    console.warn("[TTS] missing ElevenLabs credentials]");
     return;
   }
   try {
@@ -358,6 +359,7 @@ async function say(ws, text) {
     const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
     resp.data.on("data", chunk => {
+      if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
@@ -625,6 +627,11 @@ wss.on("connection", (ws) => {
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
 
+  // Heartbeat
+  const hb = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
+  }, 15000);
+
   function clearHangTimer() {
     if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
     ws.__pendingHangupUntil = 0;
@@ -781,22 +788,27 @@ wss.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       console.log("[CALL_STOP]", { convoId: ws.__convoId });
+      ws.__closing = true;
+      ws.__stopSeenAt = Date.now();
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       await postCallLogOnce(ws, "twilio stop");
       try { ws.close(); } catch {}
+      return;
     }
   });
 
   ws.on("close", async () => {
     try { dg?.close(); } catch {}
     clearHangTimer();
+    clearInterval(hb);
     await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
   /* ===== Turn handler ===== */
   async function handleTurn(ws, userText) {
+    if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
     console.log("[TURN] user >", userText);
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
@@ -810,6 +822,7 @@ wss.on("connection", (ws) => {
 
     /* Tool flow */
     if (choice?.message?.tool_calls?.length) {
+      if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
         let args = {};
