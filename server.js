@@ -524,6 +524,14 @@ const toolSchema = [
 ];
 
 /* ===== LLM ===== */
+
+/* >>> FIX: today in business timezone <<< */
+function todayISOInTZ(tz){
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day}`; // YYYY-MM-DD in tz
+}
+
 async function openaiChat(messages, options={}){
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
@@ -543,7 +551,7 @@ async function openaiChat(messages, options={}){
 
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = new Date().toISOString().slice(0,10);
+  const todayISO = todayISOInTZ(BIZ_TZ); // FIX APPLIED
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
