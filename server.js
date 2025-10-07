@@ -831,14 +831,24 @@ wss.on("connection", (ws) => {
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
-    // Soft intent to end
-    const byeHint = /\b(that's all|that is all|i'?m good|i'?m okay|no thanks|no thank you|nothing else|that'?ll be it|i'?m fine|all set|im fine|im good|nope|bye|goodbye|see you)\b/i;
-    if (byeHint.test(userText)) {
+    // NEW: protect against "buy" being heard as "bye"
+    const buyIntent = /\b(buy|buyer|buying)\b/i;
+
+    // Tightened close phrases (avoid over-trigger)
+    const byeHint = /\b(good\s*bye|goodbye|bye|see you|that's all|that is all|nothing else|no thanks|no thank you)\b/i;
+
+    // Only treat as closing if not obviously a buying intent
+    if (byeHint.test(userText) && !buyIntent.test(userText)) {
       ws.__closeIntentCount += 1;
       ws.__awaitingCloseConfirm = ws.__closeIntentCount === 1;
       if (ws.__closeIntentCount >= 2) {
         ws.__closing = true;
       }
+    } else if (buyIntent.test(userText)) {
+      // Reset accidental close state on buying intent
+      ws.__closeIntentCount = 0;
+      ws.__awaitingCloseConfirm = false;
+      ws.__closing = false;
     }
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
@@ -859,6 +869,18 @@ wss.on("connection", (ws) => {
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
         console.log("[TOOL] call ->", name, args);
+
+        // Gate end_call so it never fires on first “bye” (mishears included)
+        if (name === "end_call" && ws.__closeIntentCount < 2) {
+          const confirm = ws.__awaitingCloseConfirm
+            ? "Before I go, anything else I can help with?"
+            : "Anything else I can help with?";
+          await say(ws, confirm);
+          remember(ws.__mem, "bot", confirm);
+          ws.__closeIntentCount = 1;
+          ws.__awaitingCloseConfirm = true;
+          continue; // do not execute the tool
+        }
 
         const impl = Tools[name];
         let toolResult = { text:"" };
