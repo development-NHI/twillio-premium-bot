@@ -34,8 +34,12 @@ const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transf
 const DASH_BIZ    = process.env.DASH_BIZ || "";           // tenant id string for logs
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";   // e.g., "voice"
 
-/* Business timezone for resolving relative dates */
+/* Business timezone for resolving relative dates (prompt drives behavior; tz here is only for conversion) */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
+
+/* Optional env-driven hours gate (keeps code un-hardcoded; leave unset to defer to prompt) */
+const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // e.g. "09:00"
+const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || ""; // e.g. "17:00"
 
 /* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
@@ -211,7 +215,7 @@ const wss = new WebSocketServer({ server });
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---- Time helpers (Local/UTC pairing for READ + relative dates) ---- */
+/* ---- Time helpers (Local/UTC pairing + “today” in TZ) ---- */
 function toLocalParts(iso, tz) {
   const d = new Date(iso);
   const f = new Intl.DateTimeFormat("en-CA", {
@@ -221,15 +225,10 @@ function toLocalParts(iso, tz) {
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
 }
-function asUTC(iso) {
-  return new Date(iso).toISOString(); // "YYYY-MM-DDTHH:mm:ss.sssZ"
-}
+function asUTC(iso) { return new Date(iso).toISOString(); }
 function dayWindowLocal(dateISO, tz) {
-  // Local wall-clock bounds for the given day + equivalent UTC
   const start_local = `${dateISO} 00:00`;
   const end_local   = `${dateISO} 23:59`;
-  // Build Date from local midnight in tz by using offset of "fake" ISO with tz applied via formatter
-  // For our backend validator we just need UTC strings at local 00:00 and 23:59
   const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
   const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
@@ -237,7 +236,21 @@ function dayWindowLocal(dateISO, tz) {
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day}`; // YYYY-MM-DD
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+/* ---- Optional business-hours gate (env-driven; unset = no gate) ---- */
+function withinBizHours(iso, tz){
+  if (!BIZ_HOURS_START || !BIZ_HOURS_END) return true; // prompt-only control if unset
+  const d = new Date(iso);
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, hour:"2-digit", minute:"2-digit", hour12:false })
+    .formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  const h = +parts.hour, m = +parts.minute;
+  const nowMin = h*60+m;
+  const [sh,sm]=BIZ_HOURS_START.split(":").map(Number);
+  const [eh,em]=BIZ_HOURS_END.split(":").map(Number);
+  const startMin = sh*60+sm, endMin = eh*60+em;
+  return nowMin >= startMin && nowMin < endMin;
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
@@ -250,7 +263,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=250";
+    + "&endpointing=1200"; // longer endpointing improves natural turn-taking
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -281,7 +294,8 @@ function startDeepgram({ onFinal }) {
     sendULaw(buf){
       try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
-    close(){ try { dg.close(); } catch {} }
+    close(){ try { dg.close(); } catch {}
+    }
   };
 }
 
@@ -299,25 +313,48 @@ function cleanTTS(s=""){
     .replace(/\n/g, ", ")
     .trim();
 }
+function formatPhoneForSpeech(s=""){
+  // Normalize to 10 digits and format; do NOT space digits (less robotic)
+  const d = (s||"").replace(/\D+/g,"");
+  if (d.length >= 10) {
+    const ds = d.slice(-10);
+    return `(${ds.slice(0,3)}) ${ds.slice(3,6)}-${ds.slice(6)}`;
+  }
+  return s;
+}
+function compressReadback(text=""){
+  // If model outputs "Name: X  Phone: Y  Role: Z ...", compress to a natural sentence.
+  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
+  if (pairs.length >= 3) {
+    const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
+    const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
+    const name = get("name");
+    const phone = formatPhoneForSpeech(get("phone"));
+    const role  = get("role");
+    const svc   = get("service");
+    const prop  = get("property") || get("address") || get("mls");
+    const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
+    const meet  = get("meeting type");
+    const bits = [
+      name && `${name}`, phone && `${phone}`,
+      role && role, svc && svc, prop && prop, when && when, meet && meet
+    ].filter(Boolean);
+    if (bits.length) {
+      const base = `Confirming: ${bits.join(", ")}. Shall I book it?`;
+      return base;
+    }
+  }
+  return text;
+}
 function shouldSpeak(ws, normalized=""){
   const now = Date.now();
   return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
-function speakifyPhoneNumbers(s=""){
-  const toDigits = str => str.replace(/\D+/g, "");
-  const spaceDigits = digits => digits.split("").join(" ");
-  return s
-    .replace(/\+?1?[\s.-]*\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}\b/g, (m) => {
-      let d = toDigits(m);
-      if (d.length === 11 && d.startsWith("1")) d = d.slice(1);
-      if (d.length === 10) return spaceDigits(d);
-      return spaceDigits(toDigits(m));
-    })
-    .replace(/\d{7,}/g, (m) => spaceDigits(m));
-}
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  const speak = speakifyPhoneNumbers(cleanTTS(text));
+  // Humanize readbacks & phones before TTS
+  const polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
+  const speak = cleanTTS(polished);
   if (!shouldSpeak(ws, speak)) return;
 
   ws.__lastBotText = speak;
@@ -351,21 +388,19 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
-  // FIXED: Build the window with Local↔UTC pairing your validator expects.
+  // Local↔UTC paired window so backend validator can catch offset mismatches
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
       let windowObj;
-
       if (startISO && endISO) {
         const start_local = toLocalParts(startISO, BIZ_TZ);
         const end_local   = toLocalParts(endISO,   BIZ_TZ);
         windowObj = {
-          start_local,
-          end_local,
+          start_local, end_local,
           start_utc: asUTC(startISO),
-          end_utc:   asUTC(endISO),
+          end_utc:   asUTC(endISO)
         };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
@@ -373,31 +408,28 @@ const Tools = {
           start_local: w.start_local,
           end_local:   w.end_local,
           start_utc:   w.start_utc,
-          end_utc:     w.end_utc,
+          end_utc:     w.end_utc
         };
       } else {
-        // If model forgot to provide a date, default to "today" in business TZ
         const today = todayISOInTZ(BIZ_TZ);
         const w = dayWindowLocal(today, BIZ_TZ);
         windowObj = {
           start_local: w.start_local,
           end_local:   w.end_local,
           start_utc:   w.start_utc,
-          end_utc:     w.end_utc,
+          end_utc:     w.end_utc
         };
       }
 
       const payload = {
-        intent: "READ",
+        intent:"READ",
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj
       };
-
       const { data } = await httpPost(URLS.CAL_READ, payload, {
-        timeout: 12000,
-        tag: "CAL_READ",
+        timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
       return { data };
@@ -408,17 +440,27 @@ const Tools = {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
-      // Keep your simple booking flow; backend will validate hours.
+      // Optional: prevent obviously out-of-hours bookings if env hours provided
+      if (!withinBizHours(startISO, BIZ_TZ)) {
+        return { text:"That time is outside business hours. Let’s pick another nearby slot." };
+      }
+
+      const start_local = toLocalParts(startISO, BIZ_TZ);
+      const end_local   = toLocalParts(endISO,   BIZ_TZ);
+
       const payload = {
+        biz: DASH_BIZ,
+        source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
-        Start_Time: startISO,
-        End_Time: endISO,
+        Timezone: BIZ_TZ,
+        Start_Time_Local: start_local,
+        End_Time_Local:   end_local,
+        Start_Time_UTC:   asUTC(startISO),
+        End_Time_UTC:     asUTC(endISO),
         Customer_Name: name||"",
         Customer_Phone: phone||"",
         Customer_Email: "",
-        Notes: notes||service||"",
-        biz: DASH_BIZ,
-        source: DASH_SOURCE
+        Notes: notes||service||""
       };
       const { data } = await httpPost(URLS.CAL_CREATE, payload, {
         timeout:12000, tag:"CAL_CREATE",
@@ -569,7 +611,7 @@ async function openaiChat(messages, options={}){
 
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = todayISOInTZ(BIZ_TZ); // resolve "today" in business TZ
+  const todayISO = todayISOInTZ(BIZ_TZ);
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
@@ -754,8 +796,8 @@ wss.on("connection", (ws) => {
         }
       });
 
-      await say(ws, `Hi, how can I help?`);
-      remember(ws.__mem, "bot", `Hi, how can I help?`);
+      await say(ws, `Thanks for calling—how can I help today?`);
+      remember(ws.__mem, "bot", `Thanks for calling—how can I help today?`);
       return;
     }
 
@@ -898,7 +940,7 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Keep tenant behavior/business facts in RENDER_PROMPT (or serve via PROMPT_FETCH).
-- The model decides when to call tools based on your prompt policy.
-- READ endpoint now receives Local↔UTC paired window + timezone so validation passes.
+- Prompt drives behavior; envs only provide runtime wiring and optional hours gate.
+- READ uses Local↔UTC pairing + timezone so your validator can flag double-offset bugs.
+- TTS post-processing compresses robotic read-backs and formats phone numbers naturally.
 */
