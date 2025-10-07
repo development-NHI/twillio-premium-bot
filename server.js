@@ -95,19 +95,23 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
     const resp = await axios.get(url, { headers, timeout, params, auth });
     if (DEBUG_HTTP && watched) {
       console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"GET", url,
-        status: resp.status, ms: Date.now()-t, resp_preview: preview(resp.data), at: new Date().toISOString() }));
+        status: resp.status, ms: Date.now()-t, resp_preview: preview(resp.data), at: new Date().toISOString(), trace }));
     }
     return resp;
   } catch (e) {
     const status = e.response?.status || 0;
     const bodyPrev = e.response ? preview(e.response.data) : "";
     console.warn(JSON.stringify({ evt:"HTTP_ERR", id, tag, method:"GET", url, status, ms: Date.now()-t,
-      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString() }));
+      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString(), trace }));
     throw e;
   }
 }
 
-/* ===== Brain prompt ===== */
+/* ===== Brain prompt (single source of truth) =====
+   Put ALL behavior, policies, business profile, hours, services, pricing ranges,
+   cancellation rules, transfer criteria, recap rules, and tone in this string.
+   You can also host it and set PROMPT_FETCH to return { prompt } for per-tenant control.
+*/
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are an AI phone receptionist for a professional services company.
 You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
@@ -182,10 +186,10 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* TwiML handoff target for live transfer */
+/* TwiML handoff target used during live transfer */
 app.post("/handoff", (req, res) => {
   const from = req.body?.From || TWILIO_CALLER_ID || "";
-  console.log("[HTTP] /handoff", { from, owner: OWNER_PHONE });
+  console.log("[HTTP] /handoff]", { from, owner: OWNER_PHONE });
   res.type("text/xml").send(`
     <Response>
       <Say voice="alice">Transferring you now.</Say>
@@ -211,95 +215,6 @@ const wss = new WebSocketServer({ server });
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---- Time helpers (Local/UTC pairing) ---- */
-function toLocalParts(iso, tz) {
-  const d = new Date(iso);
-  const f = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
-    hour:"2-digit", minute:"2-digit", hour12:false
-  });
-  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
-}
-function asUTC(iso) {
-  return new Date(iso).toISOString(); // "YYYY-MM-DDTHH:mm:ss.sssZ"
-}
-function dayWindowLocal(dateISO, tz) {
-  const start_local = `${dateISO} 00:00`;
-  const end_local   = `${dateISO} 23:59`;
-  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
-  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
-  return { start_local, end_local, start_utc, end_utc, timezone: tz };
-}
-
-/* ---- Fix: derive intended local wall-time and correct double-offsets ---- */
-function parseLastUserTime(mem) {
-  // Finds most recent time like "4 PM", "3:30pm", "15:00"
-  const rx = /\b(?:(?:at|for|around)\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i;
-  for (let i = mem?.transcript?.length - 1; i >= 0; i--) {
-    const t = mem.transcript[i];
-    if (t.from !== "user") continue;
-    const m = t.text.match(rx);
-    if (!m) continue;
-    let hour = parseInt(m[1], 10);
-    const minute = m[2] ? parseInt(m[2], 10) : 0;
-    const ap = m[3]?.toLowerCase();
-    if (ap === "pm" && hour < 12) hour += 12;
-    if (ap === "am" && hour === 12) hour = 0;
-    if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
-      return { hour, minute };
-    }
-  }
-  return null;
-}
-function clampBizHours(hour, minute) {
-  // Business window: 09:00–17:00 (exclusive of 17:00 start)
-  if (hour < 9) return { hour: 9, minute: 0, clamped: true };
-  if (hour > 16 || (hour === 16 && minute > 0)) return { hour: 16, minute: 0, clamped: true };
-  return { hour, minute, clamped: false };
-}
-function replaceTimeKeepOffset(isoLike, hour, minute) {
-  // Accepts strings like "YYYY-MM-DDTHH:mm:ss-04:00" (or Z). Preserves date and offset.
-  const m = String(isoLike).match(/^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|Z)$/);
-  if (!m) return isoLike;
-  const [_, d, off] = m;
-  const hh = String(hour).padStart(2, "0");
-  const mm = String(minute).padStart(2, "0");
-  return `${d}T${hh}:${mm}:00${off}`;
-}
-function maybeCorrectLocalWallTime({ startISO, endISO, mem }) {
-  try {
-    if (!startISO || !endISO || !mem) return { startISO, endISO, corrected: false, reason: "" };
-    const want = parseLastUserTime(mem);
-    if (!want) return { startISO, endISO, corrected: false, reason: "" };
-
-    // What local hour did the provided ISO encode in the business TZ?
-    const localStr = toLocalParts(startISO, BIZ_TZ); // "YYYY-MM-DD HH:mm"
-    const [, localHourStr, localMinStr] = localStr.match(/(\d{2}):(\d{2})$/) || [];
-    if (localHourStr == null) return { startISO, endISO, corrected: false, reason: "" };
-    const givenHour = parseInt(localHourStr, 10);
-    const givenMin  = parseInt(localMinStr, 10);
-
-    // If hours already match, nothing to do.
-    if (givenHour === want.hour && givenMin === want.minute) {
-      return { startISO, endISO, corrected: false, reason: "" };
-    }
-
-    // Nudge to caller's stated time (clamped to business hours).
-    const { hour: fixedH, minute: fixedM } = clampBizHours(want.hour, want.minute);
-    const s2 = replaceTimeKeepOffset(startISO, fixedH, fixedM);
-    // Keep original duration
-    const durMin = Math.max(15, Math.round((new Date(endISO) - new Date(startISO)) / 60000) || 30);
-    const endTotal = fixedH * 60 + fixedM + durMin;
-    const endH = Math.floor(endTotal / 60);
-    const endM = endTotal % 60;
-    const e2 = replaceTimeKeepOffset(endISO, endH, endM);
-    return { startISO: s2, endISO: e2, corrected: true, reason: "aligned to stated local time" };
-  } catch {
-    return { startISO, endISO, corrected: false, reason: "" };
-  }
-}
-
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
   const url =
@@ -310,7 +225,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200";
+    + "&endpointing=250";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -341,8 +256,7 @@ function startDeepgram({ onFinal }) {
     sendULaw(buf){
       try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
-    close(){ try { dg.close(); } catch {}
-    }
+    close(){ try { dg.close(); } catch {} }
   };
 }
 
@@ -410,82 +324,34 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
-/* ===== Tool Registry ===== */
+/* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
     try {
-      let windowObj;
-      if (startISO && endISO) {
-        const start_local = toLocalParts(startISO, BIZ_TZ);
-        const end_local   = toLocalParts(endISO,   BIZ_TZ);
-        windowObj = {
-          start_local, end_local,
-          start_utc: asUTC(startISO),
-          end_utc:   asUTC(endISO)
-        };
-      } else if (dateISO) {
-        const w = dayWindowLocal(dateISO, BIZ_TZ);
-        windowObj = {
-          start_local: w.start_local,
-          end_local:   w.end_local,
-          start_utc:   w.start_utc,
-          end_utc:     w.end_utc
-        };
-      } else {
-        return { text:"Missing date window." };
-      }
-      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE, timezone: BIZ_TZ, window: windowObj };
+      const payload = { intent:"READ", biz: DASH_BIZ, source: DASH_SOURCE,
+        window:{ start:startISO || `${dateISO||""}T00:00:00`, end:endISO || `${dateISO||""}T23:59:59` } };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
     } catch(e){ return { text:"Could not read availability." }; }
   },
-
-  async book_appointment({ name, phone, service, startISO, endISO, notes, __mem }) {
+  async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
     try {
-      if (!startISO || !endISO) return { text:"Booking failed: missing start/end." };
-
-      // Fix: align provided ISO to the caller’s stated local time (prevents double-offset bug)
-      const { startISO: sFixed, endISO: eFixed, corrected } = maybeCorrectLocalWallTime({ startISO, endISO, mem: __mem });
-      if (corrected) {
-        console.log("[TIME_FIX] corrected start/end ->", { startISO: sFixed, endISO: eFixed });
-        startISO = sFixed; endISO = eFixed;
-      }
-
-      // Guard: block out-of-hours locally before remote call (9–5 in BIZ_TZ)
-      const local = toLocalParts(startISO, BIZ_TZ);
-      const m = local.match(/(\d{2}):(\d{2})$/);
-      const h = m ? parseInt(m[1], 10) : NaN;
-      if (isFinite(h) && (h < 9 || h >= 17)) {
-        return { text:`That time is outside business hours (9–5 ${BIZ_TZ}). Would you like 1 PM or 4 PM instead?` };
-      }
-
-      const start_local = toLocalParts(startISO, BIZ_TZ);
-      const end_local   = toLocalParts(endISO,   BIZ_TZ);
       const payload = {
-        biz: DASH_BIZ,
-        source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
-        Timezone: BIZ_TZ,
-        Start_Time_Local: start_local,
-        End_Time_Local:   end_local,
-        Start_Time_UTC:   asUTC(startISO),
-        End_Time_UTC:     asUTC(endISO),
-        Customer_Name: name||"",
-        Customer_Phone: phone||"",
-        Customer_Email: "",
-        Notes: notes||service||""
+        Start_Time: startISO, End_Time: endISO,
+        Customer_Name: name||"", Customer_Phone: phone||"", Customer_Email: "",
+        Notes: notes||service||"", biz: DASH_BIZ, source: DASH_SOURCE
       };
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data, text:"Booked." };
     } catch(e){ return { text:"Booking failed." }; }
   },
-
   async cancel_appointment({ event_id, name, phone }) {
     console.log("[TOOL] cancel_appointment", { event_id });
     if (!URLS.CAL_DELETE) return { text:"Cancellation unavailable." };
@@ -497,7 +363,6 @@ const Tools = {
       return { text: ok ? "Canceled." : "Could not cancel.", data };
     } catch(e){ return { text:"Cancellation failed." }; }
   },
-
   async lead_upsert({ name, phone, intent, notes }) {
     console.log("[TOOL] lead_upsert", { name, intent });
     if (!URLS.LEAD_UPSERT) return { text:"Lead logging unavailable." };
@@ -508,7 +373,6 @@ const Tools = {
       return { data };
     } catch { return { text:"" }; }
   },
-
   async faq({ topic, service }) {
     console.log("[TOOL] faq", { topic, service });
     try {
@@ -519,7 +383,6 @@ const Tools = {
     } catch {}
     return { data:{ topic, service } };
   },
-
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
@@ -539,7 +402,6 @@ const Tools = {
       return { text:"Transferring you now. Please hold." };
     } catch { return { text:"Transfer failed." }; }
   },
-
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { text:"" };
@@ -557,7 +419,7 @@ const Tools = {
   }
 };
 
-/* Tool schema advertised to the model */
+/* Tool schema advertised to the model (the model chooses based on prompt policy) */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -608,14 +470,6 @@ const toolSchema = [
 ];
 
 /* ===== LLM ===== */
-
-/* >>> FIX: today in business timezone <<< */
-function todayISOInTZ(tz){
-  const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day}`; // YYYY-MM-DD in tz
-}
-
 async function openaiChat(messages, options={}){
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = {
@@ -635,7 +489,7 @@ async function openaiChat(messages, options={}){
 
 /* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
 function buildSystemPrompt(mem, tenantPrompt) {
-  const todayISO = todayISOInTZ(BIZ_TZ); // FIX APPLIED
+  const todayISO = new Date().toISOString().slice(0,10);
   const p = (tenantPrompt || RENDER_PROMPT);
   return [
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
@@ -723,6 +577,7 @@ wss.on("connection", (ws) => {
 
     const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
 
+    // Build transcript string
     const transcriptArr = ws.__mem?.transcript || [];
     const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
 
@@ -733,7 +588,7 @@ wss.on("connection", (ws) => {
       callSid: trace.callSid,
       from: trace.from,
       summary: ws.__mem?.summary || "",
-      transcript: transcriptText,
+      transcript: transcriptText,   // send as string
       ended_reason: reason || ""
     };
 
@@ -787,6 +642,7 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
+          // Ignore speech during hangup grace
           if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
             console.log("[HANG] user spoke during grace window — ignoring");
             return;
@@ -851,7 +707,7 @@ wss.on("connection", (ws) => {
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
-  /* ===== Turn handler ===== */
+  /* ===== Turn handler (prompt is the brain) ===== */
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
 
@@ -874,7 +730,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Tool flow */
+    /* Tool flow (model decides) */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
@@ -887,8 +743,6 @@ wss.on("connection", (ws) => {
         const impl = Tools[name];
         let toolResult = { text:"" };
         if (impl) {
-          // Pass memory into book_appointment so the time fixer can read the last user-stated time
-          if (name === "book_appointment") args.__mem = ws.__mem;
           try { toolResult = await impl(args); }
           catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
         } else {
