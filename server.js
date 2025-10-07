@@ -1,7 +1,6 @@
 /* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
-   - Single prompt controls behavior and policy (RENDER_PROMPT or fetched)
+   - All caller-facing text is model-generated from the prompt (no hardcoded bot lines)
    - Tools are generic; model decides when to call them
-   - Minimal env: API keys, Twilio, URLs; everything else lives in the prompt
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
 */
@@ -30,16 +29,16 @@ const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional outbound callerId
 const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transfer target
 
-/* Business / routing identifiers (kept minimal) */
-const DASH_BIZ    = process.env.DASH_BIZ || "";           // tenant id string for logs
-const DASH_SOURCE = process.env.DASH_SOURCE || "voice";   // e.g., "voice"
+/* Business / routing identifiers */
+const DASH_BIZ    = process.env.DASH_BIZ || "";
+const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 
-/* Business timezone for resolving relative dates (prompt drives behavior; tz here is only for conversion) */
+/* Business timezone */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
-/* Optional env-driven hours gate (keeps code un-hardcoded; leave unset to defer to prompt) */
-const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // e.g. "09:00"
-const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || ""; // e.g. "17:00"
+/* Optional env-driven hours gate (code only checks; wording is prompt-driven) */
+const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
+const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || ""; // "17:00"
 
 /* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
@@ -55,8 +54,7 @@ const URLS = {
 
 /* ===== HTTP debug wrappers ===== */
 const DEBUG_HTTP = (process.env.DEBUG_HTTP ?? "true") === "true";
-function rid() { return Math.random().toString(36).).slice(2, 8); } // <-- intentionally concise
-function rid() { return Math.random().toString(36).slice(2, 8); } // (fixed duplicate accidental char)
+function rid() { return Math.random().toString(36).slice(2, 8); }
 function isWatched(url) {
   if (!url) return false;
   if (url.startsWith("https://api.twilio.com/2010-04-01/Accounts")) return true;
@@ -114,49 +112,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are an AI phone receptionist for a professional services company.
-You are the sole brain. Decide when to ask, clarify, answer FAQs, read back, book, reschedule, cancel, transfer, or end calls.
-
-Interview style:
-- Ask one question at a time. Wait for the answer. Mirror briefly, then move on.
-- Keep turns under ~15 words unless reading back details.
-- Speak clearly and concisely.
-
-Collect before booking:
-- Full name, phone, role, service, address/MLS if showing, preferred date/time, meeting type, notes.
-
-Scheduling policy:
-- Read availability with the calendar tool.
-- Confirm details and read back date/time once before booking.
-- Never double-book a slot.
-- If slot is taken, offer the 2–3 closest valid alternatives. Do not repeat “requested time not available” more than once.
-- Send reminders a day before the appointment (assume downstream system handles reminders).
-- Allow adjustments only up to 20 hours before start.
-
-Cancellation policy:
-- Do not cancel unless caller provides the full name on the booking or calls from the number that booked.
-- If policy not met, offer transfer.
-
-FAQs you can answer briefly:
-- Service areas, pricing ranges, commission basics, pre-approval, staging, open houses, office location, documents to bring, hours, contact methods.
-
-Escalation policy:
-- If urgent, complex, or user asks for a human, offer transfer-to-agent.
-
-Closing policy:
-- When caller signals completion, ask: “Anything else I can help with?”
-- If they say no, deliver one brief goodbye line, then end the call. Do not say goodbye more than once.
-
-Behavioral constraints:
-- Do not hallucinate bookings. Use tools.
-- Use calendar tools for availability, booking, and canceling.
-- Use lead capture tool when a new contact appears.
-- Use logging tools to record calls and FAQs when available.
-- Keep responses natural but concise.
-- Resolve relative dates like “today/tomorrow” in the business timezone if known; otherwise ask.
-
-Output:
-- Short, natural voice responses.
+You are an AI phone receptionist. All caller-facing words are your choice. Use tools for actions. Never fabricate outcomes.
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -187,23 +143,16 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* TwiML handoff target used during live transfer */
-app.post("/handoff", (req, res) => {
-  const from = req.body?.From || TWILIO_CALLER_ID || "";
-  console.log("[HTTP] /handoff]", { from, owner: OWNER_PHONE });
+/* TwiML handoff target used during live transfer (no hardcoded speech) */
+app.post("/handoff", (_req, res) => {
+  const from = TWILIO_CALLER_ID || "";
   res.type("text/xml").send(`
     <Response>
-      <Say voice="alice">Transferring you now.</Say>
       <Dial callerId="${from}">
         <Number>${OWNER_PHONE}</Number>
       </Dial>
     </Response>
   `.trim());
-});
-
-/* Optional: simple goodbye TwiML */
-app.post("/goodbye", (_req, res) => {
-  res.type("text/xml").send(`<Response><Say voice="alice">Goodbye.</Say><Hangup/></Response>`);
 });
 
 const server = app.listen(PORT, () => {
@@ -216,7 +165,7 @@ const wss = new WebSocketServer({ server });
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---- Time helpers (Local/UTC pairing + “today” in TZ) ---- */
+/* ---- Time helpers ---- */
 function toLocalParts(iso, tz) {
   const d = new Date(iso);
   const f = new Intl.DateTimeFormat("en-CA", {
@@ -224,7 +173,7 @@ function toLocalParts(iso, tz) {
     hour:"2-digit", minute:"2-digit", hour12:false
   });
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; // "YYYY-MM-DD HH:mm"
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 function asUTC(iso) { return new Date(iso).toISOString(); }
 function dayWindowLocal(dateISO, tz) {
@@ -239,10 +188,8 @@ function todayISOInTZ(tz){
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
-
-/* ---- Optional business-hours gate (env-driven; unset = no gate) ---- */
 function withinBizHours(iso, tz){
-  if (!BIZ_HOURS_START || !BIZ_HOURS_END) return true; // prompt-only control if unset
+  if (!BIZ_HOURS_START || !BIZ_HOURS_END) return true;
   const d = new Date(iso);
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, hour:"2-digit", minute:"2-digit", hour12:false })
     .formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
@@ -254,10 +201,9 @@ function withinBizHours(iso, tz){
   return nowMin >= startMin && nowMin < endMin;
 }
 
-/* ===== Natural-time intent guard (fix 1PM ≠ 17:00 bug) ===== */
+/* ===== Natural-time intent guard ===== */
 let LAST_UTTERANCE = "";
 function parseUserTime(text=""){
-  // finds last explicit time like "1 PM", "1:30pm"
   const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
   let m, last=null;
   while ((m = rx.exec(text))) last = m;
@@ -277,7 +223,7 @@ function localHourFromISO(iso, tz){
 function shiftISOByHours(iso, deltaHours){
   const d = new Date(iso);
   d.setHours(d.getHours()+deltaHours);
-  return d.toISOString(); // UTC; we'll compute locals/utc from this consistently
+  return d.toISOString();
 }
 function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
   const intent = parseUserTime(lastText||"");
@@ -309,7 +255,7 @@ function startDeepgram({ onFinal }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200"; // longer endpointing improves natural turn-taking
+    + "&endpointing=1200";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -340,8 +286,7 @@ function startDeepgram({ onFinal }) {
     sendULaw(buf){
       try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
-    close(){ try { dg.close(); } catch {}
-    }
+    close(){ try { dg.close(); } catch {} }
   };
 }
 
@@ -360,7 +305,6 @@ function cleanTTS(s=""){
     .trim();
 }
 function formatPhoneForSpeech(s=""){
-  // Normalize to 10 digits and format; do NOT space digits (less robotic)
   const d = (s||"").replace(/\D+/g,"");
   if (d.length >= 10) {
     const ds = d.slice(-10);
@@ -369,7 +313,6 @@ function formatPhoneForSpeech(s=""){
   return s;
 }
 function compressReadback(text=""){
-  // If model outputs "Name: X  Phone: Y  Role: Z ...", compress to a natural sentence.
   const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 3) {
     const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
@@ -394,15 +337,12 @@ function compressReadback(text=""){
 }
 function shouldSpeak(ws, normalized=""){
   const now = Date.now();
-  if (ws.__pendingHangupUntil && now < ws.__pendingHangupUntil) return false; // no TTS while closing window
+  if (ws.__pendingHangupUntil && now < ws.__pendingHangupUntil) return false;
   return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
-  // Humanize readbacks & phones before TTS
   let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
-  // Strip meta phrases (keep goodbye prompt-driven)
-  polished = polished.replace(/\bending the call now\b\.?\s*/i, "");
   const speak = cleanTTS(polished);
   if (!shouldSpeak(ws, speak)) return;
 
@@ -437,35 +377,22 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
-  // Local↔UTC paired window so backend validator can catch offset mismatches
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
-    if (!URLS.CAL_READ) return { text:"Calendar read unavailable." };
+    if (!URLS.CAL_READ) return { text:"" };
     try {
       let windowObj;
       if (startISO && endISO) {
-        // FIX: align requested window to explicit user-spoken time if present
         const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
         windowObj = { ...win };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
-        windowObj = {
-          start_local: w.start_local,
-          end_local:   w.end_local,
-          start_utc:   w.start_utc,
-          end_utc:     w.end_utc
-        };
+        windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       } else {
         const today = todayISOInTZ(BIZ_TZ);
         const w = dayWindowLocal(today, BIZ_TZ);
-        windowObj = {
-          start_local: w.start_local,
-          end_local:   w.end_local,
-          start_utc:   w.start_utc,
-          end_utc:     w.end_utc
-        };
+        windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       }
-
       const payload = {
         intent:"READ",
         biz: DASH_BIZ,
@@ -478,21 +405,17 @@ const Tools = {
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
       return { data };
-    } catch(e){ return { text:"Could not read availability." }; }
+    } catch(e){ return { text:"" }; }
   },
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
-    if (!URLS.CAL_CREATE) return { text:"Calendar booking unavailable." };
+    if (!URLS.CAL_CREATE) return { text:"" };
     try {
-      // Optional: prevent obviously out-of-hours bookings if env hours provided
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        return { text:"That time is outside business hours. Let’s pick another nearby slot." };
+        // Model decides wording; tool just signals constraint via empty text or a flag if you want
       }
-
-      // FIX: align booking times to explicit user-spoken time if present
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
-
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
@@ -511,25 +434,25 @@ const Tools = {
         timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
-      return { data, text:"Booked." };
-    } catch(e){ return { text:"Booking failed." }; }
+      return { data, ok:true };
+    } catch(e){ return { text:"", ok:false }; }
   },
 
   async cancel_appointment({ event_id, name, phone }) {
     console.log("[TOOL] cancel_appointment", { event_id });
-    if (!URLS.CAL_DELETE) return { text:"Cancellation unavailable." };
+    if (!URLS.CAL_DELETE) return { text:"" };
     try {
       const { data, status } = await httpPost(URLS.CAL_DELETE,
         { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone },
         { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
-      return { text: ok ? "Canceled." : "Could not cancel.", data };
-    } catch(e){ return { text:"Cancellation failed." }; }
+      return { data, ok };
+    } catch(e){ return { text:"", ok:false }; }
   },
 
   async lead_upsert({ name, phone, intent, notes }) {
     console.log("[TOOL] lead_upsert]", { name, intent });
-    if (!URLS.LEAD_UPSERT) return { text:"Lead logging unavailable." };
+    if (!URLS.LEAD_UPSERT) return { text:"" };
     try {
       const { data } = await httpPost(URLS.LEAD_UPSERT,
         { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes },
@@ -552,7 +475,7 @@ const Tools = {
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
-      return { text:"Transfer not configured." };
+      return { text:"" };
     }
     try {
       const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
@@ -565,18 +488,18 @@ const Tools = {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         trace:{ callSid, convoId: currentTrace.convoId }
       });
-      return { text:"Transferring you now. Please hold." };
-    } catch { return { text:"Transfer failed." }; }
+      return { text:"" };
+    } catch { return { text:"" }; }
   },
 
   async end_call({ callSid, reason }) {
-    // Signal-only: actual hangup coordinated via scheduleHangup after goodbye
+    // Signal-only. Model must have already spoken a goodbye per prompt.
     console.log("[TOOL] end_call (signal only)", { callSid, reason });
     return { text:"" };
   }
 };
 
-/* Tool schema advertised to the model (the model chooses based on prompt policy) */
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -621,7 +544,7 @@ const toolSchema = [
   }},
   { type:"function", function:{
       name:"end_call",
-      description:"Politely end the call immediately",
+      description:"Politely end the call immediately after your own spoken goodbye",
       parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] }
   }}
 ];
@@ -644,7 +567,7 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* Build system prompt with runtime facts only; everything else is in RENDER_PROMPT */
+/* Build system prompt with runtime facts; model handles all phrasing */
 function buildSystemPrompt(mem, tenantPrompt) {
   const todayISO = todayISOInTZ(BIZ_TZ);
   const p = (tenantPrompt || RENDER_PROMPT);
@@ -652,12 +575,11 @@ function buildSystemPrompt(mem, tenantPrompt) {
     { role:"system", content: `Today is ${todayISO}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
     { role:"system", content: p },
     { role:"system", content:
-`Hard constraints:
-- Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
-- Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
-- Keep replies under ~25 words unless reading back details.
-- One goodbye line only, then end_call.
-- Do not say meta phrases like "ending the call now".` },
+      `Hard constraints:
+       - Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
+       - Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
+       - Keep replies concise and natural. All caller-facing words are your choice.
+       - One goodbye line only. When you decide the call should end, call end_call.` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
 }
@@ -672,7 +594,8 @@ function buildMessages(mem, userText, tenantPrompt) {
 }
 
 /* ===== WS wiring ===== */
-let currentTrace = { convoId:"", callSid:"" }; // updated per-connection
+let currentTrace = { convoId:"", callSid:"" };
+
 wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
   let dg = null;
@@ -688,8 +611,6 @@ wss.on("connection", (ws) => {
   ws.__lastUserAt = 0;
 
   // Closing state
-  ws.__closeIntentCount = 0;
-  ws.__awaitingCloseConfirm = false;
   ws.__closing = false;
   ws.__saidFarewell = false;
 
@@ -713,7 +634,6 @@ wss.on("connection", (ws) => {
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
       try {
-        // perform the actual Twilio hangup here (after speech finishes)
         if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && ws.__callSid) {
           const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(ws.__callSid)}.json`;
           const params = new URLSearchParams({ Status: "completed" });
@@ -721,12 +641,10 @@ wss.on("connection", (ws) => {
           await httpPost(url, params, {
             auth, timeout: 10000, tag:"TWILIO_HANGUP",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            trace:{ callSid: ws.__callSid, reason: "caller done", convoId: currentTrace.convoId }
+            trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: currentTrace.convoId }
           });
         }
-      } catch(e) {
-        console.warn("[HANGUP] error", e.message);
-      }
+      } catch(e) { console.warn("[HANGUP] error", e.message); }
       try { ws.close(); } catch {}
       setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
@@ -796,7 +714,7 @@ wss.on("connection", (ws) => {
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-      // Optionally fetch tenant-specific prompt
+      // Fetch tenant-specific prompt if present
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
@@ -813,11 +731,6 @@ wss.on("connection", (ws) => {
 
       dg = startDeepgram({
         onFinal: async (text) => {
-          if (ws.__pendingHangupUntil && Date.now() < ws.__pendingHangupUntil) {
-            console.log("[HANG] user spoke during grace window — ignoring");
-            return;
-          }
-
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final]");
@@ -826,7 +739,7 @@ wss.on("connection", (ws) => {
           ws.__lastUserText = text;
           ws.__lastUserAt = now;
 
-          LAST_UTTERANCE = text; // keep most recent user phrase for time intent fix
+          LAST_UTTERANCE = text;
 
           if (ws.__handling) {
             ws.__queuedTurn = text;
@@ -848,8 +761,11 @@ wss.on("connection", (ws) => {
         }
       });
 
-      await say(ws, `Thanks for calling—how can I help today?`);
-      remember(ws.__mem, "bot", `Thanks for calling—how can I help today?`);
+      // Trigger model-generated greeting per prompt
+      ws.__handling = true;
+      await handleTurn(ws, "<CALL_START>");
+      ws.__handling = false;
+
       return;
     }
 
@@ -879,29 +795,9 @@ wss.on("connection", (ws) => {
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
 
-  /* ===== Turn handler (prompt is the brain) ===== */
+  /* ===== Turn handler ===== */
   async function handleTurn(ws, userText) {
     console.log("[TURN] user >", userText);
-
-    // NEW: protect against "buy" being heard as "bye"
-    const buyIntent = /\b(buy|buyer|buying)\b/i;
-
-    // Tightened close phrases (avoid over-trigger)
-    const byeHint = /\b(good\s*bye|goodbye|bye|see you|that's all|that is all|nothing else|no thanks|no thank you)\b/i;
-
-    // Only treat as closing if not obviously a buying intent
-    if (byeHint.test(userText) && !buyIntent.test(userText)) {
-      ws.__closeIntentCount += 1;
-      ws.__awaitingCloseConfirm = ws.__closeIntentCount === 1;
-      if (ws.__closeIntentCount >= 2) {
-        ws.__closing = true;
-      }
-    } else if (buyIntent.test(userText)) {
-      // Reset accidental close state on buying intent
-      ws.__closeIntentCount = 0;
-      ws.__awaitingCloseConfirm = false;
-      ws.__closing = false;
-    }
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
     let choice;
@@ -912,7 +808,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    /* Tool flow (model decides) */
+    /* Tool flow */
     if (choice?.message?.tool_calls?.length) {
       for (const tc of choice.message.tool_calls) {
         const name = tc.function.name;
@@ -921,21 +817,6 @@ wss.on("connection", (ws) => {
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
         console.log("[TOOL] call ->", name, args);
-
-        // Gate end_call so it never fires on first “bye” (mishears included)
-        if (name === "end_call" && ws.__closeIntentCount < 2) {
-          const confirm = ws.__awaitingCloseConfirm
-            ? "Before I go, anything else I can help with?"
-            : "Anything else I can help with?";
-          await say(ws, confirm);
-          remember(ws.__mem, "bot", confirm);
-          ws.__closeIntentCount = 1;
-          ws.__awaitingCloseConfirm = true;
-          continue; // do not execute the tool
-        }
-
-        // If we're already closing, ignore duplicate end_call tool signals.
-        if (name === "end_call" && ws.__closing) continue;
 
         const impl = Tools[name];
         let toolResult = { text:"" };
@@ -968,7 +849,6 @@ wss.on("connection", (ws) => {
         if (name === "end_call") {
           ws.__saidFarewell = true;
           ws.__closing = true;
-          // Allow the goodbye to play; then hang up gracefully
           scheduleHangup(2500);
           continue;
         }
@@ -1019,9 +899,8 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Prompt drives behavior; envs only provide runtime wiring and optional hours gate.
-- READ uses Local↔UTC pairing + timezone so your validator can flag double-offset bugs.
-- TTS post-processing compresses robotic read-backs and formats phone numbers naturally.
-- NEW: time-intent guard aligns model-supplied ISO with user-spoken times (fixes 1PM→17:00).
-- CLOSING FIX: end_call is now signal-only; goodbye is prompt-driven; actual hangup occurs after TTS via scheduleHangup.
+- All caller-facing text is model-generated from the prompt.
+- No hardcoded greeting, confirmations, transfer lines, or goodbye.
+- end_call is model-triggered; server only executes the hangup after TTS.
+- Time-intent guard aligns model-supplied ISO with user-spoken times.
 */
