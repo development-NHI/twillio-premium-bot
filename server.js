@@ -245,6 +245,22 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
   };
 }
 
+/* ======= Call-scoped registries ======= */
+let CURRENT_FROM = "";
+let LAST_EVENT = null;
+
+function looksLikeEventId(s="") {
+  return /^[0-9a-f-]{8,}$/i.test((s||"").trim());
+}
+
+function isIncompleteUtterance(t="") {
+  const s = t.trim().toLowerCase();
+  if (!s) return false;
+  if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
+  if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
+  return false;
+}
+
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
   const url =
@@ -414,10 +430,29 @@ const Tools = {
     console.log("[TOOL] book_appointment", { name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"" };
     try {
+      // default phone to caller ID if missing
+      phone = phone || CURRENT_FROM || "";
+
       if (!withinBizHours(startISO, BIZ_TZ)) {
         // Model decides wording; tool just signals constraint via empty text or a flag if you want
       }
+
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
+
+      // If we have a previous event and the time changed, best-effort cancel it first
+      try {
+        if (LAST_EVENT?.id) {
+          const prevStart = LAST_EVENT.start_local || "";
+          const newStartLocal = win.start_local;
+          if (prevStart && newStartLocal && prevStart !== newStartLocal && URLS.CAL_DELETE) {
+            await httpPost(URLS.CAL_DELETE,
+              { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id: LAST_EVENT.id, name, phone },
+              { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
+            ).catch(()=>{ /* ignore failures */ });
+          }
+        }
+      } catch {}
+
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
@@ -436,6 +471,17 @@ const Tools = {
         timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
+
+      // remember last event for reschedules
+      if (data?.event_id) {
+        LAST_EVENT = {
+          id: data.event_id,
+          start_local: data.start_local,
+          end_local: data.end_local,
+          timezone: data.timezone
+        };
+      }
+
       return { data, ok:true };
     } catch(e){ return { text:"", ok:false }; }
   },
@@ -444,6 +490,9 @@ const Tools = {
     console.log("[TOOL] cancel_appointment", { event_id });
     if (!URLS.CAL_DELETE) return { text:"" };
     try {
+      if (!event_id || !looksLikeEventId(event_id)) {
+        if (LAST_EVENT?.id) event_id = LAST_EVENT.id;
+      }
       const { data, status } = await httpPost(URLS.CAL_DELETE,
         { intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone },
         { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
@@ -611,6 +660,8 @@ wss.on("connection", (ws) => {
   ws.__queuedTurn = null;
   ws.__lastUserText = "";
   ws.__lastUserAt = 0;
+  ws.__pendingFinal = "";
+  ws.__finalTimer = null;
 
   // Closing state
   ws.__closing = false;
@@ -718,6 +769,7 @@ wss.on("connection", (ws) => {
       const cp = msg.start?.customParameters || {};
       ws.__from = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
+      CURRENT_FROM = ws.__from || "";
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
@@ -739,8 +791,10 @@ wss.on("connection", (ws) => {
       dg = startDeepgram({
         onFinal: async (text) => {
           const now = Date.now();
+
+          // Coalesce duplicate finals
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-            console.log("[TURN] dropped duplicate final]");
+            console.log("[TURN] dropped duplicate final");
             return;
           }
           ws.__lastUserText = text;
@@ -748,6 +802,33 @@ wss.on("connection", (ws) => {
 
           LAST_UTTERANCE = text;
 
+          // "This number" -> capture caller ID
+          if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
+            ws.__mem.entities.phone = ws.__from;
+          }
+
+          // If final looks incomplete, debounce briefly to catch continuation
+          if (isIncompleteUtterance(text)) {
+            clearTimeout(ws.__finalTimer);
+            ws.__pendingFinal = text;
+            ws.__finalTimer = setTimeout(async () => {
+              if (ws.__handling) { ws.__queuedTurn = ws.__pendingFinal; ws.__pendingFinal = ""; return; }
+              ws.__handling = true;
+              remember(ws.__mem, "user", ws.__pendingFinal);
+              await handleTurn(ws, ws.__pendingFinal);
+              ws.__pendingFinal = "";
+              ws.__handling = false;
+
+              if (ws.__queuedTurn) {
+                const next = ws.__queuedTurn; ws.__queuedTurn = null;
+                ws.__handling = true; remember(ws.__mem, "user", next);
+                await handleTurn(ws, next); ws.__handling = false;
+              }
+            }, 900);
+            return;
+          }
+
+          // Normal final handling
           if (ws.__handling) {
             ws.__queuedTurn = text;
             return;
