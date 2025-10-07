@@ -86,7 +86,7 @@ async function httpPost(url, data, { headers={}, timeout=12000, auth, tag, trace
     const status = e.response?.status || 0;
     const bodyPrev = e.response ? preview(e.response.data) : "";
     console.warn(JSON.stringify({ evt:"HTTP_ERR", id, tag, method:"POST", url, status, ms: Date.now()-t,
-      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString(), trace }));
+      message: e.message, resp_preview: bodyPrev, at: new Date().toISOString() }));
     throw e;
   }
 }
@@ -253,6 +253,51 @@ function withinBizHours(iso, tz){
   return nowMin >= startMin && nowMin < endMin;
 }
 
+/* ===== Natural-time intent guard (fix 1PM ≠ 17:00 bug) ===== */
+let LAST_UTTERANCE = "";
+function parseUserTime(text=""){
+  // finds last explicit time like "1 PM", "1:30pm"
+  const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
+  let m, last=null;
+  while ((m = rx.exec(text))) last = m;
+  if (!last) return null;
+  let [_, h, mm, ap] = last;
+  let hour = parseInt(h,10);
+  const min = parseInt(mm||"0",10);
+  const pm = /^p/i.test(ap);
+  if (hour === 12) hour = pm ? 12 : 0;
+  else if (pm) hour += 12;
+  return { hour24: hour, min };
+}
+function localHourFromISO(iso, tz){
+  const lp = toLocalParts(iso, tz);
+  return parseInt(lp.slice(11,13),10);
+}
+function shiftISOByHours(iso, deltaHours){
+  const d = new Date(iso);
+  d.setHours(d.getHours()+deltaHours);
+  return d.toISOString(); // UTC; we'll compute locals/utc from this consistently
+}
+function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
+  const intent = parseUserTime(lastText||"");
+  if (!intent) return {
+    start_local: toLocalParts(startISO, tz),
+    end_local:   toLocalParts(endISO, tz),
+    start_utc:   asUTC(startISO),
+    end_utc:     asUTC(endISO)
+  };
+  const providedLocalHour = localHourFromISO(startISO, tz);
+  const delta = intent.hour24 - providedLocalHour;
+  const startUTCAdj = shiftISOByHours(startISO, delta);
+  const endUTCAdj   = shiftISOByHours(endISO,   delta);
+  return {
+    start_local: toLocalParts(startUTCAdj, tz),
+    end_local:   toLocalParts(endUTCAdj, tz),
+    start_utc:   startUTCAdj,
+    end_utc:     endUTCAdj
+  };
+}
+
 /* === Deepgram ASR (μ-law passthrough) === */
 function startDeepgram({ onFinal }) {
   const url =
@@ -395,13 +440,9 @@ const Tools = {
     try {
       let windowObj;
       if (startISO && endISO) {
-        const start_local = toLocalParts(startISO, BIZ_TZ);
-        const end_local   = toLocalParts(endISO,   BIZ_TZ);
-        windowObj = {
-          start_local, end_local,
-          start_utc: asUTC(startISO),
-          end_utc:   asUTC(endISO)
-        };
+        // FIX: align requested window to explicit user-spoken time if present
+        const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
+        windowObj = { ...win };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
         windowObj = {
@@ -445,18 +486,18 @@ const Tools = {
         return { text:"That time is outside business hours. Let’s pick another nearby slot." };
       }
 
-      const start_local = toLocalParts(startISO, BIZ_TZ);
-      const end_local   = toLocalParts(endISO,   BIZ_TZ);
+      // FIX: align booking times to explicit user-spoken time if present
+      const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
         Timezone: BIZ_TZ,
-        Start_Time_Local: start_local,
-        End_Time_Local:   end_local,
-        Start_Time_UTC:   asUTC(startISO),
-        End_Time_UTC:     asUTC(endISO),
+        Start_Time_Local: win.start_local,
+        End_Time_Local:   win.end_local,
+        Start_Time_UTC:   win.start_utc,
+        End_Time_UTC:     win.end_utc,
         Customer_Name: name||"",
         Customer_Phone: phone||"",
         Customer_Email: "",
@@ -770,11 +811,13 @@ wss.on("connection", (ws) => {
 
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-            console.log("[TURN] dropped duplicate final");
+            console.log("[TURN] dropped duplicate final]");
             return;
           }
           ws.__lastUserText = text;
           ws.__lastUserAt = now;
+
+          LAST_UTTERANCE = text; // keep most recent user phrase for time intent fix
 
           if (ws.__handling) {
             ws.__queuedTurn = text;
@@ -900,7 +943,7 @@ wss.on("connection", (ws) => {
             { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }
           ]);
         } catch(e){
-          console.error("[GPT] follow error", e.message);
+          console.error("[GPT] follow error]", e.message);
           continue;
         }
 
@@ -965,4 +1008,5 @@ async function updateSummary(mem) {
 - Prompt drives behavior; envs only provide runtime wiring and optional hours gate.
 - READ uses Local↔UTC pairing + timezone so your validator can flag double-offset bugs.
 - TTS post-processing compresses robotic read-backs and formats phone numbers naturally.
+- NEW: time-intent guard aligns model-supplied ISO with user-spoken times (fixes 1PM→17:00).
 */
