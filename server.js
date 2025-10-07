@@ -55,7 +55,8 @@ const URLS = {
 
 /* ===== HTTP debug wrappers ===== */
 const DEBUG_HTTP = (process.env.DEBUG_HTTP ?? "true") === "true";
-function rid() { return Math.random().toString(36).slice(2, 8); }
+function rid() { return Math.random().toString(36).).slice(2, 8); } // <-- intentionally concise
+function rid() { return Math.random().toString(36).slice(2, 8); } // (fixed duplicate accidental char)
 function isWatched(url) {
   if (!url) return false;
   if (url.startsWith("https://api.twilio.com/2010-04-01/Accounts")) return true;
@@ -393,12 +394,15 @@ function compressReadback(text=""){
 }
 function shouldSpeak(ws, normalized=""){
   const now = Date.now();
+  if (ws.__pendingHangupUntil && now < ws.__pendingHangupUntil) return false; // no TTS while closing window
   return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
 }
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   // Humanize readbacks & phones before TTS
-  const polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
+  let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
+  // Strip meta phrases (keep goodbye prompt-driven)
+  polished = polished.replace(/\bending the call now\b\.?\s*/i, "");
   const speak = cleanTTS(polished);
   if (!shouldSpeak(ws, speak)) return;
 
@@ -566,19 +570,9 @@ const Tools = {
   },
 
   async end_call({ callSid, reason }) {
-    console.log("[TOOL] end_call", { callSid, reason });
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { text:"" };
-    try {
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
-      const params = new URLSearchParams({ Status: "completed" });
-      const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
-      await httpPost(url, params, {
-        auth, timeout: 10000, tag:"TWILIO_HANGUP",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        trace:{ callSid, reason, convoId: currentTrace.convoId }
-      });
-      return { text:"" };
-    } catch { return { text:"" }; }
+    // Signal-only: actual hangup coordinated via scheduleHangup after goodbye
+    console.log("[TOOL] end_call (signal only)", { callSid, reason });
+    return { text:"" };
   }
 };
 
@@ -662,7 +656,8 @@ function buildSystemPrompt(mem, tenantPrompt) {
 - Use tools for availability, booking, canceling, transfer, FAQ logging, lead capture, and hangup.
 - Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
 - Keep replies under ~25 words unless reading back details.
-- One goodbye line only, then end_call.` },
+- One goodbye line only, then end_call.
+- Do not say meta phrases like "ending the call now".` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
 }
@@ -717,7 +712,21 @@ wss.on("connection", (ws) => {
     clearHangTimer();
     ws.__pendingHangupUntil = Date.now() + ms;
     ws.__hangTimer = setTimeout(async () => {
-      try { await Tools.end_call({ callSid: ws.__callSid, reason: "caller done" }); } catch {}
+      try {
+        // perform the actual Twilio hangup here (after speech finishes)
+        if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && ws.__callSid) {
+          const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(ws.__callSid)}.json`;
+          const params = new URLSearchParams({ Status: "completed" });
+          const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
+          await httpPost(url, params, {
+            auth, timeout: 10000, tag:"TWILIO_HANGUP",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            trace:{ callSid: ws.__callSid, reason: "caller done", convoId: currentTrace.convoId }
+          });
+        }
+      } catch(e) {
+        console.warn("[HANGUP] error", e.message);
+      }
       try { ws.close(); } catch {}
       setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
     }, ms);
@@ -925,6 +934,9 @@ wss.on("connection", (ws) => {
           continue; // do not execute the tool
         }
 
+        // If we're already closing, ignore duplicate end_call tool signals.
+        if (name === "end_call" && ws.__closing) continue;
+
         const impl = Tools[name];
         let toolResult = { text:"" };
         if (impl) {
@@ -956,7 +968,9 @@ wss.on("connection", (ws) => {
         if (name === "end_call") {
           ws.__saidFarewell = true;
           ws.__closing = true;
-          scheduleHangup(2000);
+          // Allow the goodbye to play; then hang up gracefully
+          scheduleHangup(2500);
+          continue;
         }
       }
 
@@ -973,7 +987,7 @@ wss.on("connection", (ws) => {
 
     if (ws.__closing && !ws.__saidFarewell) {
       ws.__saidFarewell = true;
-      scheduleHangup(2000);
+      scheduleHangup(2500);
     }
 
     await updateSummary(ws.__mem);
@@ -1009,4 +1023,5 @@ async function updateSummary(mem) {
 - READ uses Local↔UTC pairing + timezone so your validator can flag double-offset bugs.
 - TTS post-processing compresses robotic read-backs and formats phone numbers naturally.
 - NEW: time-intent guard aligns model-supplied ISO with user-spoken times (fixes 1PM→17:00).
+- CLOSING FIX: end_call is now signal-only; goodbye is prompt-driven; actual hangup occurs after TTS via scheduleHangup.
 */
