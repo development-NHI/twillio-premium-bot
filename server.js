@@ -159,6 +159,11 @@ Tool rules:
 - **Availability interpretation:** When read_availability returns an empty "events" array **or** {summary:{free:true}}, treat the slot as **available**. When events.length>0 **or** {summary:{busy:true}}, it’s **unavailable**. Do not say a slot is taken if the array is empty.
 - After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
 
+Reschedule specifics (preserve details & notes):
+- When rescheduling, **carry forward the original intent** (service, meeting type, property/MLS or address, and notes about what the caller wants).
+- Before booking the new time, **read back the full details exactly like a new booking**: Name, Phone, Service, Property/Address/MLS, Date, Time, Meeting Type, Notes. Ask for a single "yes" to confirm.
+- When you BOOK after a reschedule, **populate the Notes field** with a clear summary of what the caller wants, same as a fresh appointment (include service + any property/MLS + constraints/preferences).
+
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
@@ -249,7 +254,6 @@ function toLocalParts(iso, tz) {
     timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
     hour:"2-digit", minute:"2-digit", hour12:false
   });
-    // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
@@ -265,7 +269,6 @@ function addDaysISO(dateISO, days) {
   const d = new Date(`${dateISO}T00:00:00`);
   d.setDate(d.getDate() + days);
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
-    // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -283,7 +286,6 @@ function rangeWindowLocal(startDateISO, days, tz) {
 }
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
-    // eslint-disable-next-line no-sequences
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -345,7 +347,7 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
-function startDeepgram({ onFinal }) {
+function startDeepgram({ onFinal, onInterim }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=mulaw"
@@ -376,6 +378,7 @@ function startDeepgram({ onFinal }) {
       if (now - lastInterimLog > 1500) {
         console.log(`[ASR interim] ${text}`);
         lastInterimLog = now;
+        onInterim?.();
       }
     }
   });
@@ -412,7 +415,7 @@ function formatPhoneForSpeech(s=""){
   return s;
 }
 function compressReadback(text=""){
-  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
+  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 3) {
     const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
     const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
@@ -423,9 +426,10 @@ function compressReadback(text=""){
     const prop  = get("property") || get("address") || get("mls");
     const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
     const meet  = get("meeting type");
+    const notes = get("notes");
     const bits = [
       name && `${name}`, phone && `${phone}`,
-      role && role, svc && svc, prop && prop, when && when, meet && meet
+      role && role, svc && svc, prop && prop, when && when, meet && meet, notes && notes
     ].filter(Boolean);
     if (bits.length) {
       const base = `Confirming: ${bits.join(", ")}. Shall I book it?`;
@@ -485,7 +489,6 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"", summary:{ busy:false, free:true } };
     try {
-      // Use caller ID if model passed "this number" (prompt handles wording)
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       let windowObj;
@@ -507,7 +510,6 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj,
-        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
         contact_name: name || undefined,
         contact_phone: normalizedPhone || undefined
       };
@@ -516,7 +518,6 @@ const Tools = {
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
 
-      // <<< FIX: surface explicit free/busy >>>
       const events = data?.events || [];
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
@@ -532,7 +533,7 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // The model will phrase any constraint; we just proceed or let the backend refuse.
+        // Model handles phrasing; backend may still accept or reject.
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -558,7 +559,6 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  // Lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
@@ -618,7 +618,6 @@ const Tools = {
     }
   },
 
-  // Contact-wide finder to list upcoming events (default 30 days)
   async find_customer_events({ name, phone, days = 30 }) {
     console.log("[TOOL] find_customer_events", { hasName: !!name, hasPhone: !!phone, days });
     if (!URLS.CAL_READ) return { ok:false, events:[] };
@@ -693,15 +692,12 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
-  // Fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
 
-    // Immediately prevent any further speech on this call
     const w = CALLS.get(callSid);
     if (w) w.__pendingHangupUntil = Date.now() + 999999;
 
-    // Hang up ASAP via Twilio
     try {
       if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
         const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
@@ -864,10 +860,27 @@ wss.on("connection", (ws) => {
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
 
+  // --- NEW: activity tracking for watchdog ---
+  ws.__lastHeardAt = Date.now();
+  ws.__lastMediaAt = Date.now();
+  ws.__lastPromptNudgeAt = 0;
+
   // Heartbeat
   const hb = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
   }, 15000);
+
+  // --- NEW: “still there?” watchdog nudges ---
+  const nudgeTimer = setInterval(async () => {
+    if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    const sinceMedia = now - (ws.__lastMediaAt || 0);
+    const sinceWeSpoke = now - (ws.__lastBotAt || 0);
+    if (sinceWeSpoke > 6000 && sinceMedia > 8000 && now - (ws.__lastPromptNudgeAt || 0) > 20000) {
+      ws.__lastPromptNudgeAt = now;
+      await say(ws, "I’m not hearing you—are you still there?");
+    }
+  }, 3000);
 
   function clearHangTimer() {
     if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
@@ -966,7 +979,6 @@ wss.on("connection", (ws) => {
         try { toolResult = await (impl ? impl(args) : { text:"" }); }
         catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
 
-        // Append tool result and keep looping; the model may chain tools
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
 
         if (name === "end_call") {
@@ -976,7 +988,7 @@ wss.on("connection", (ws) => {
         }
       }
     }
-    return ""; // safety fallback
+    return "";
   }
 
   ws.on("message", async raw => {
@@ -992,11 +1004,19 @@ wss.on("connection", (ws) => {
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-      // track socket by callSid (for fast hangup mute)
       if (ws.__callSid) {
         CALLS.set(ws.__callSid, ws);
         ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
       }
+
+      // Warn if no media arrives early
+      setTimeout(() => {
+        if (!ws.__lastMediaAt || (Date.now() - ws.__lastMediaAt) > 7000) {
+          console.warn("[AUDIO] No inbound media detected in first 7s of call", {
+            convoId: ws.__convoId, callSid: ws.__callSid
+          });
+        }
+      }, 7000);
 
       // Fetch tenant-specific prompt if present
       ws.__tenantPrompt = "";
@@ -1015,8 +1035,9 @@ wss.on("connection", (ws) => {
 
       const dg = startDeepgram({
         onFinal: async (text) => {
+          ws.__lastHeardAt = Date.now();
+
           const now = Date.now();
-          // de-dupe
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
             return;
@@ -1026,12 +1047,10 @@ wss.on("connection", (ws) => {
 
           LAST_UTTERANCE = text;
 
-          // "this number" → capture caller ID (prompt decides when to say it)
           if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
             ws.__mem.entities.phone = ws.__from;
           }
 
-          // Debounce obviously incomplete finals to avoid back-to-back questions
           const looksPartial = (() => {
             const s = text.trim().toLowerCase();
             if (!s) return false;
@@ -1076,13 +1095,12 @@ wss.on("connection", (ws) => {
             await handleTurn(ws, next);
             ws.__handling = false;
           }
-        }
+        },
+        onInterim: () => { ws.__lastHeardAt = Date.now(); }
       });
 
-      // store dg handle
       ws.__dg = dg;
 
-      // Prompt-driven greeting
       ws.__handling = true;
       await handleTurn(ws, "<CALL_START>");
       ws.__handling = false;
@@ -1091,6 +1109,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "media") {
+      ws.__lastMediaAt = Date.now(); // NEW: mark inbound audio seen
       if (!ws.__dg) return;
       const ulaw = Buffer.from(msg.media?.payload || "", "base64");
       pendingULaw.push(ulaw);
@@ -1116,6 +1135,7 @@ wss.on("connection", (ws) => {
     try { ws.__dg?.close(); } catch {}
     clearHangTimer();
     clearInterval(hb);
+    clearInterval(nudgeTimer); // NEW: cleanup watchdog
     await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
@@ -1127,7 +1147,6 @@ wss.on("connection", (ws) => {
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
 
-    // Resolve tool chains until the model returns plain text
     const finalText = await resolveToolChain(messages);
 
     if (finalText) {
@@ -1175,5 +1194,6 @@ async function updateSummary(mem) {
 - Time-intent guard aligns model-supplied ISO with user-spoken times.
 - find_customer_events lets the model fetch all upcoming bookings for identification.
 - cancel_appointment searches 30 days when date is unknown.
-- read_availability now returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
+- read_availability returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
+- Audio watchdog nudges if no inbound speech/media, and logs if no media within first 7s.
 */
