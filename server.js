@@ -1,8 +1,7 @@
 /* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
-   - All caller-facing text is model-generated from the prompt (no hardcoded bot lines)
-   - Tools are generic; model decides when to call them
-   - Deepgram μ-law passthrough + ElevenLabs TTS
-   - Verbose per-request logging for debugging external calls
+   - Fix: no more silence after cancel/reschedule (speak-after-tool nudge)
+   - Fix: anti double-cancel for same event_id on a call
+   - Prompt tightened for reschedule flow & slot offering
 */
 
 import express from "express";
@@ -134,6 +133,7 @@ Scheduling policy:
 - Use tools for read/hold/confirm. Resolve "today/tomorrow/next Tue" in America/New_York.
 - Read back once then book. If slot taken, offer 2–3 nearby options.
 - If a slot shows "canceled," you may offer it.
+- **Ask for the caller’s preferred day/time first**, then READ only the relevant day/hour. Do not scan multiple days in silence.
 
 Cancel/Reschedule identity (name + phone only):
 - Require full name + phone on the booking. If caller says "this number," use caller ID.
@@ -141,27 +141,25 @@ Cancel/Reschedule identity (name + phone only):
   1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
   2) If exactly one future match, capture its "event_id".
   3) For "cancel": cancel by "event_id".
-  4) For "reschedule": cancel by "event_id", then propose 2–3 nearby times and book the chosen one.
+  4) For "reschedule": **first confirm the cancel**, then ask for day/time and book (or propose 2–3 options). Do not call any more tools until you speak once.
   5) If none or multiple matches: ask only for the missing disambiguator (e.g., "what date/time was it?"). If still unclear, offer transfer.
 - Only cancel/reschedule for the person on the booking (same name + phone).
-- Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour, not an all-day window. If the targeted read fails, then broaden (±1 day) and disambiguate briefly.
+- Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour. If that fails, then broaden (±1 day) and disambiguate briefly.
 
 Wider search behavior (when caller gives no date/time):
-- Before rescheduling, call find_customer_events with name + phone (30 days). If you find any future bookings, read back short options and confirm which one to change; then use its "event_id".
-- Perform a contact-filtered READ across the next 30 days.
-- If you find any matches, read back short options like: "I found A) Wed 3–4 PM, B) Fri 11–12. Are you talking about one of these?"
-- If exactly one sounds right, proceed using its "event_id".
-- If none are found, ask for the date and approximate time.
+- Before rescheduling, call find_customer_events with name + phone (30 days). If you find future bookings, read back short options and confirm which one to change; then use its "event_id".
+- If a day’s READ returns **no events**, treat it as open and **offer 2–3 1-hour options inside business hours** (e.g., 10, 1, 3). Don’t keep scanning day-by-day without speaking.
 
 Tool rules:
 - Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
 - Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
+- **After ANY tool call, you must say one short line before calling another tool.** Confirm results or ask one concise follow-up.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
-Operational guardrails (do not skip speaking):
-- After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
+Operational guardrails:
+- After ANY tool call, ALWAYS speak: confirm, ask a single disambiguation question, or explain next step. Never chain tool calls in silence.
 
 Identity & phone handling:
 - If the caller gives partial digits (e.g., "443642" or "0617"), combine with known context:
@@ -217,7 +215,7 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* TwiML handoff target used during live transfer (no hardcoded speech) */
+/* TwiML handoff target */
 app.post("/handoff", (_req, res) => {
   const from = TWILIO_CALLER_ID || "";
   res.type("text/xml").send(`
@@ -479,9 +477,7 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"" };
     try {
-      // Use caller ID if model passed "this number" (prompt handles wording)
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
-
       let windowObj;
       if (startISO && endISO) {
         const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -501,7 +497,6 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj,
-        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
         contact_name: name || undefined,
         contact_phone: normalizedPhone || undefined
       };
@@ -518,11 +513,7 @@ const Tools = {
     if (!URLS.CAL_CREATE) return { text:"" };
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
-
-      if (!withinBizHours(startISO, BIZ_TZ)) {
-        // The model will phrase any constraint; we just proceed or let the backend refuse.
-      }
-
+      if (!withinBizHours(startISO, BIZ_TZ)) {}
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
       const payload = {
         biz: DASH_BIZ,
@@ -546,24 +537,21 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  // **** UPDATED: lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
+  // Lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
 
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+    const ws = CALLS.get(currentTrace.callSid || "") || null;
+    ws && (ws.__canceledIds = ws.__canceledIds || new Set());
 
     try {
       let id = event_id;
 
-      // If no event_id, look it up by name+phone (optionally narrow by date)
       if (!id) {
-        // If the model didn't pass a date, search a 30-day window starting today to catch “tomorrow” cases.
         const baseDate = todayISOInTZ(BIZ_TZ);
-        const windowObj = dateISO
-          ? dayWindowLocal(dateISO, BIZ_TZ)
-          : rangeWindowLocal(baseDate, 30, BIZ_TZ);
-
+        const windowObj = dateISO ? dayWindowLocal(dateISO, BIZ_TZ) : rangeWindowLocal(baseDate, 30, BIZ_TZ);
         const readPayload = {
           intent: "READ",
           biz: DASH_BIZ,
@@ -582,19 +570,17 @@ const Tools = {
         const { data: readData } = await httpPost(URLS.CAL_READ, readPayload,
           { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
+        // If backend doesn't mark status, we can't filter; keep all returned
         const future = (readData?.events || []).filter(e => e.status !== "canceled");
-        if (future.length === 1) {
-          id = future[0].event_id;
-        } else {
-          return { ok:false, candidates: future.map(e => ({
-            event_id: e.event_id,
-            start_local: e.start_local,
-            event_name: e.event_name
-          })) };
-        }
+        if (future.length === 1) id = future[0].event_id;
+        else return { ok:false, candidates: future.map(e => ({ event_id: e.event_id, start_local: e.start_local, event_name: e.event_name })) };
       }
 
-      // cancel by event_id
+      // anti double-cancel on same call
+      if (ws && ws.__canceledIds.has(id)) {
+        return { ok:true, data:{ alreadyCancelled:true, event_id:id } };
+      }
+
       const { data, status } = await httpPost(URLS.CAL_DELETE, {
         intent: "DELETE",
         biz: DASH_BIZ,
@@ -603,13 +589,14 @@ const Tools = {
       }, { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
+      if (ws && ok) ws.__canceledIds.add(id);
       return { ok, data };
     } catch(e) {
       return { text:"", ok:false };
     }
   },
 
-  // **** NEW: contact-wide finder to list upcoming events (default 30 days)
+  // contact-wide finder to list upcoming events (default 30 days)
   async find_customer_events({ name, phone, days = 30 }) {
     console.log("[TOOL] find_customer_events", { hasName: !!name, hasPhone: !!phone, days });
     if (!URLS.CAL_READ) return { ok:false, events:[] };
@@ -684,15 +671,10 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
-  // **** UPDATED: fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
-
-    // Immediately prevent any further speech on this call
     const w = CALLS.get(callSid);
     if (w) w.__pendingHangupUntil = Date.now() + 999999;
-
-    // Hang up ASAP via Twilio
     try {
       if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
         const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
@@ -712,7 +694,7 @@ const Tools = {
   }
 };
 
-/* Tool schema advertised to the model (prompt drives what to ask; schema only enables actions) */
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -743,7 +725,6 @@ const toolSchema = [
         dateISO:{type:"string", description:"Optional YYYY-MM-DD to narrow lookup in business timezone"}
       }, required:[] }
   }},
-  // NEW: find_customer_events exposed to model
   { type:"function", function:{
       name:"find_customer_events",
       description:"Find upcoming events for a contact over a horizon (default 30 days).",
@@ -795,7 +776,7 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* Build system prompt with runtime facts; model handles all phrasing */
+/* Build system prompt with runtime facts */
 function buildSystemPrompt(mem, tenantPrompt) {
   const todayISO = todayISOInTZ(BIZ_TZ);
   const p = (tenantPrompt || RENDER_PROMPT);
@@ -829,11 +810,10 @@ wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
   let dg = null;
   let pendingULaw = [];
-  const BATCH = 10; // ~200ms @ 8kHz
+  const BATCH = 10;
   let tailTimer = null;
   let lastMediaLog = 0;
 
-  // Per-call state
   ws.__handling = false;
   ws.__queuedTurn = null;
   ws.__lastUserText = "";
@@ -841,22 +821,17 @@ wss.on("connection", (ws) => {
   ws.__pendingFinal = "";
   ws.__finalTimer = null;
 
-  // Closing state
   ws.__closing = false;
   ws.__saidFarewell = false;
 
-  // Dedup speech
   ws.__lastBotText = "";
   ws.__lastBotAt = 0;
 
-  // Logging
   ws.__postedLog = false;
 
-  // Graceful hangup window
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
 
-  // Heartbeat
   const hb = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
   }, 15000);
@@ -938,14 +913,23 @@ wss.on("connection", (ws) => {
 
   ws.__mem = newMemory();
 
-  // === Tool-call resolver ===
+  // === Tool-call resolver with "speak-after-tool" nudge ===
   async function resolveToolChain(baseMessages) {
     let messages = baseMessages.slice();
+    let consecutiveToolTurns = 0;
+
     for (let hops = 0; hops < 8; hops++) {
       const choice = await openaiChat(messages);
       const msg = choice?.message || {};
-      if (!msg.tool_calls?.length) return msg.content?.trim() || "";
 
+      // If the model finally speaks (no tool calls), return that text.
+      if (!msg.tool_calls?.length) {
+        return msg.content?.trim() || "";
+      }
+
+      consecutiveToolTurns++;
+
+      // Execute tool calls
       for (const tc of msg.tool_calls) {
         const name = tc.function.name;
         let args = {};
@@ -958,8 +942,29 @@ wss.on("connection", (ws) => {
         try { toolResult = await (impl ? impl(args) : { text:"" }); }
         catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
 
-        // Append tool result and keep looping; the model may chain tools
+        // Append tool result
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
+
+        // Inject a system "nudge" so the very next model step SPEAKS before calling more tools
+        messages.push({
+          role: "system",
+          content: "Speak a concise line (<=12 words) to the caller now, confirming the last action or asking one short follow-up, BEFORE any other tool call."
+        });
+
+        // If we just canceled, push a stronger hint to confirm + ask for day/time
+        if (name === "cancel_appointment") {
+          messages.push({
+            role: "system",
+            content: "You just canceled their appointment. Say: one-sentence confirmation, then ask: 'What day and time works to reschedule?' Do not call another tool until they answer."
+          });
+        }
+
+        if (name === "read_availability") {
+          messages.push({
+            role: "system",
+            content: "If the day is wide open, offer 2–3 one-hour options inside business hours instead of scanning more days."
+          });
+        }
 
         if (name === "end_call") {
           ws.__saidFarewell = true;
@@ -967,8 +972,16 @@ wss.on("connection", (ws) => {
           scheduleHangup(2500);
         }
       }
+
+      // Safety: after many consecutive tool-only turns, insist on speech
+      if (consecutiveToolTurns >= 2) {
+        messages.push({
+          role: "system",
+          content: "You have already called tools without speaking. Say one short line now before any further tools."
+        });
+      }
     }
-    return ""; // safety fallback
+    return "";
   }
 
   ws.on("message", async raw => {
@@ -984,13 +997,11 @@ wss.on("connection", (ws) => {
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-      // track socket by callSid (for fast hangup mute)
       if (ws.__callSid) {
         CALLS.set(ws.__callSid, ws);
         ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
       }
 
-      // Fetch tenant-specific prompt if present
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
@@ -1008,7 +1019,6 @@ wss.on("connection", (ws) => {
       dg = startDeepgram({
         onFinal: async (text) => {
           const now = Date.now();
-          // de-dupe
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
             return;
@@ -1018,12 +1028,10 @@ wss.on("connection", (ws) => {
 
           LAST_UTTERANCE = text;
 
-          // "this number" → capture caller ID (prompt decides when to say it)
           if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
             ws.__mem.entities.phone = ws.__from;
           }
 
-          // Debounce obviously incomplete finals to avoid back-to-back questions
           const looksPartial = (() => {
             const s = text.trim().toLowerCase();
             if (!s) return false;
@@ -1071,7 +1079,6 @@ wss.on("connection", (ws) => {
         }
       });
 
-      // Prompt-driven greeting
       ws.__handling = true;
       await handleTurn(ws, "<CALL_START>");
       ws.__handling = false;
@@ -1116,7 +1123,6 @@ wss.on("connection", (ws) => {
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
 
-    // Resolve tool chains until the model returns plain text
     const finalText = await resolveToolChain(messages);
 
     if (finalText) {
@@ -1158,10 +1164,8 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- All caller-facing text is model-generated from the prompt.
-- No hardcoded greeting, confirmations, transfer lines, or goodbye.
-- end_call is model-triggered; server only executes the hangup after TTS.
-- Time-intent guard aligns model-supplied ISO with user-spoken times.
-- find_customer_events lets the model fetch all upcoming bookings for identification.
-- cancel_appointment now searches 30 days when date is unknown.
+- Model must speak after every tool; runtime nudges enforce this to avoid silent loops.
+- Reschedule flow: confirm cancel → ask for day/time → then read/hold → book.
+- If a day is empty, the model offers 2–3 options inside business hours.
+- Per-call anti double-cancel prevents re-canceling the same event.
 */
