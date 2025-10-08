@@ -128,7 +128,7 @@ Interview style (anti-repeat):
 - If the caller talks while you’re speaking, accept it—don’t re-ask.
 
 Data to collect before booking:
-- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type, notes.
+- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type (in-person vs virtual; location if in-person), notes (special requests).
 
 Scheduling policy:
 - Use tools for read/hold/confirm. Resolve "today/tomorrow/next Tue" in America/New_York.
@@ -146,6 +146,16 @@ Cancel/Reschedule identity (name + phone only):
 - Only cancel/reschedule for the person on the booking (same name + phone).
 - Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour, not an all-day window. If the targeted read fails, then broaden (±1 day) and disambiguate briefly.
 
+Reschedule data integrity (must keep what the caller wants):
+- When rescheduling, preserve all prior details unless the caller changes them: service, meeting type (in-person vs virtual), location (office/property address), property/MLS, and notes/special requests.
+- If any of these are missing or ambiguous, ask one concise question to fill the gap **before** booking.
+- When calling "book_appointment", include:
+  - "service" with the original/updated service name,
+  - "notes" summarizing key preferences (meeting type, location, property/MLS, special requests),
+  - the confirmed "startISO"/"endISO",
+  - the same "name" and "phone" unless the caller updates them.
+- Read back the full new plan once: "Rescheduled to [day date time] for a [meeting type/service] at [location]. Anything else before I book?"
+
 Wider search behavior (when caller gives no date/time):
 - Before rescheduling, call find_customer_events with name + phone (30 days). If you find any future bookings, read back short options and confirm which one to change; then use its "event_id".
 - Perform a contact-filtered READ across the next 30 days.
@@ -156,39 +166,38 @@ Wider search behavior (when caller gives no date/time):
 Tool rules:
 - Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
 - Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
-- **Availability interpretation:** When read_availability returns an empty "events" array **or** {summary:{free:true}}, treat the slot as **available**. When events.length>0 **or** {summary:{busy:true}}, it’s **unavailable**. Do not say a slot is taken if the array is empty.
+- **Availability interpretation:** When "read_availability" returns an empty "events" array **or** {summary:{free:true}}, the slot is **available**. When events.length>0 **or** {summary:{busy:true}}, it’s **unavailable**. Do not say a slot is taken if the array is empty.
 - After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
+
+Post-booking behavior:
+- After you BOOK successfully, do not call "book_appointment" again unless the caller explicitly asks to add or change another slot.
+- If the caller says "thank you", "that’s it", or similar closers, confirm the booked time once, then say one short goodbye and call "end_call".
+- Do not attempt any further tool calls after a confirmed booking unless requested.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
-Operational guardrails (do not skip speaking):
+Operational guardrails:
 - After ANY tool call, ALWAYS speak. Never rely on silence to imply success.
-- When you decide the call should end, say one short goodbye line, then call "end_call".
+- One short goodbye only. When done, call "end_call".
 
 Identity & phone handling:
-- If the caller gives partial digits (e.g., "443642" or "0617"), combine with known context:
-  - Use caller ID as the base if they’ve said "this number."
-  - If a 6–7 digit fragment is given, interpret it as mid/last digits; prefer last-4 for confirmation.
-  - Once you have a plausible full match from tools (name + phone), proceed without re-asking for digits.
+- If the caller gives partial digits, combine with known context (use caller ID when they say "this number", prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
 
 Cancel flow (candidate handling):
-- When cancel_appointment returns multiple candidates, read back SHORT options: "I found A) Wed 3–4 PM, B) Fri 11–12. Which should I cancel?"
-- When exactly one future match returns, cancel it without reading the event_id; then confirm plainly: "All set—your Wed 3 PM is canceled."
+- If cancel_appointment returns multiple candidates, read back SHORT options and ask which to cancel.
+- If exactly one future match is found, cancel it and confirm plainly.
 
 Error/empty results:
 - If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
 
 Brevity:
-- Ask one question at a time. Avoid repeating requests for the same digits once you have enough to match.
+- Ask one question at a time. Avoid repeating requests once you have enough.
 
-Reschedule readback + render data:
-- When rescheduling, after you book the new time you must read back the full details (name, phone, service, property if relevant, new date/time, meeting type, notes) and ensure the backend "Notes" includes the caller’s stated preferences like a normal new booking.
-
-End call (fast):
+End call:
 - One short goodbye, then call "end_call", then remain silent.
 
-Greeting example (from prompt, not code):
+Greeting example:
 - "Thanks for calling The Victory Team in Bel Air—how can I help today?"
 
 Output:
@@ -241,7 +250,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX: single WebSocketServer init guard === */
+/* === FIX: single WebSocketServer init guard (prevents 'Identifier "wss" already declared') === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -308,7 +317,7 @@ function withinBizHours(iso, tz){
 
 /* ===== Natural-time intent guard ===== */
 let LAST_UTTERANCE = "";
-let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 };
+let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 }; // recent parsed time
 
 function parseUserTime(text=""){
   const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
@@ -381,7 +390,6 @@ function startDeepgram({ onFinal, wsRef }) {
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
       console.log(`[ASR FINAL] ${text}`);
-      try { if (wsRef) wsRef.__lastASRFinalAt = Date.now(); } catch {}
       onFinal?.(text);
     } else {
       const now = Date.now();
@@ -390,15 +398,6 @@ function startDeepgram({ onFinal, wsRef }) {
         lastInterimLog = now;
       }
       try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
-      // If TTS is playing and caller speaks, interrupt TTS immediately
-      try {
-        if (wsRef?.__ttsActive && wsRef.__ttsStream) {
-          console.log("[TTS] interrupt: caller speaking");
-          wsRef.__ttsStream.destroy?.();
-          wsRef.__ttsActive = false;
-          wsRef.__ttsStream = null;
-        }
-      } catch {}
     }
   });
   dg.on("error", e => console.error("[Deepgram error]", e.message));
@@ -412,9 +411,9 @@ function startDeepgram({ onFinal, wsRef }) {
 }
 
 /* === ElevenLabs TTS === */
-/* ASR-based barge-in: wait for ASR quiet; hard-stop if speech resumes */
-const QUIET_MS = 900;           // required ASR silence before TTS starts
-const QUIET_TIMEOUT_MS = 2500;  // max wait to avoid added latency
+/* Barge-in guards: short silence before TTS; abort mid-stream if human talks */
+const QUIET_MS = 600;          // required silence before TTS starts (faster)
+const QUIET_TIMEOUT_MS = 900;  // cap the wait to avoid sluggishness
 
 function cleanTTS(s=""){
   return String(s)
@@ -453,10 +452,7 @@ function compressReadback(text=""){
       name && `${name}`, phone && `${phone}`,
       role && role, svc && svc, prop && prop, when && when, meet && meet
     ].filter(Boolean);
-    if (bits.length) {
-      const base = `Confirming: ${bits.join(", ")}. Shall I book it?`;
-      return base;
-    }
+    if (bits.length) return `Confirming: ${bits.join(", ")}. Shall I book it?`;
   }
   return text;
 }
@@ -469,15 +465,15 @@ async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
 
-  // Wait for ASR quiet
+  // brief quiet wait to avoid interrupting live speech
   let waited = 0;
   while (true) {
-    const lastHuman = Math.max(ws.__lastASRInterimAt || 0, ws.__lastASRFinalAt || 0);
+    const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
     const since = Date.now() - lastHuman;
     if (since >= QUIET_MS) break;
     if (waited >= QUIET_TIMEOUT_MS) break;
-    await sleep(100);
-    waited += 100;
+    await sleep(80);
+    waited += 80;
   }
 
   let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
@@ -492,21 +488,21 @@ async function say(ws, text) {
     return;
   }
   try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=2&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
-    ws.__ttsActive = true;
-    ws.__ttsStream = resp.data;
+
+    let aborted = false;
     resp.data.on("data", chunk => {
+      if (aborted) return;
+      // barge-in: if human started speaking, abort remaining TTS frames
+      const sinceHuman = Date.now() - (ws.__lastAudioAt || 0);
+      if (sinceHuman < 200) { aborted = true; try { resp.data.destroy?.(); } catch {} return; }
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
-    resp.data.on("end", () => {
-      ws.__ttsActive = false;
-      ws.__ttsStream = null;
-      console.log("[TTS] stream end");
-    });
+    resp.data.on("end", () => console.log("[TTS] stream end"));
   } catch(e){ console.error("[TTS ERROR]", e.message); }
 }
 
@@ -522,6 +518,11 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 
 /* ===== Track live websockets by call ===== */
 const CALLS = new Map(); // callSid => ws
+
+/* === Booking dedupe helper === */
+function slotKey({ startISO, endISO, service }) {
+  return [startISO||"", endISO||"", (service||"").toLowerCase()].join("|");
+}
 
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
@@ -572,6 +573,14 @@ const Tools = {
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
+      // dedupe same-slot booking within 20s
+      const ws = CALLS.get(currentTrace.callSid || "");
+      const key = slotKey({ startISO, endISO, service });
+      if (ws?.__lastBooking && ws.__lastBooking.key === key && (Date.now() - ws.__lastBooking.ts) < 20000) {
+        console.log("[BOOK_DEDUP] skipping duplicate booking attempt", { key });
+        return { ok:true, dedup:true, data: ws.__lastBooking.data || null };
+      }
+
       if (!withinBizHours(startISO, BIZ_TZ)) {
         // proceed; backend can refuse if needed
       }
@@ -595,6 +604,8 @@ const Tools = {
         timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
+
+      if (ws) ws.__lastBooking = { key, ts: Date.now(), data };
       return { data, ok:true };
     } catch(e){ return { text:"", ok:false }; }
   },
@@ -877,7 +888,7 @@ if (!wss.__victory_handler_attached) {
     console.log("[WS] connection from Twilio]");
     let dg = null;
     let pendingULaw = [];
-    const BATCH = 10; // ~200ms @ 8kHz
+    const BATCH = 8; // faster flush (~160ms @ 8kHz)
     let tailTimer = null;
     let lastMediaLog = 0;
 
@@ -890,10 +901,8 @@ if (!wss.__victory_handler_attached) {
     ws.__finalTimer = null;
 
     // Barge-in tracking
+    ws.__lastAudioAt = 0;
     ws.__lastASRInterimAt = 0;
-    ws.__lastASRFinalAt = 0;
-    ws.__ttsActive = false;
-    ws.__ttsStream = null;
 
     // Closing state
     ws.__closing = false;
@@ -1056,7 +1065,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // Start Deepgram. Pass wsRef for ASR timestamps and TTS interrupt.
+        // assign to outer dg, pass wsRef for interim timestamps
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
@@ -1098,7 +1107,7 @@ if (!wss.__victory_handler_attached) {
                   ws.__handling = true; remember(ws.__mem, "user", next);
                   await handleTurn(ws, next); ws.__handling = false;
                 }
-              }, 900);
+              }, 700); // faster without stepping on speech
               return;
             }
 
@@ -1134,11 +1143,12 @@ if (!wss.__victory_handler_attached) {
 
       if (msg.event === "media") {
         if (!dg) return;
+        ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 120);
+        tailTimer = setTimeout(flushULaw, 90);
         return;
       }
 
@@ -1210,7 +1220,10 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- ASR-based barge-in: the bot speaks only after ~0.9s ASR silence and stops instantly on new speech.
+- Barge-in guard: waits ~0.6s of silence (max 0.9s) before TTS; also aborts TTS mid-stream if human speaks.
+- Faster ASR piping: smaller media batch and tail flush for lower end-to-end latency.
 - Time-intent hint keeps “10 AM” aligned even after later messages like name/phone.
+- Booking dedupe: skips duplicate "book_appointment" within 20s for the same slot.
 - Single WebSocketServer guard prevents redeclaration on hot reloads.
+- Deepgram handle scoped correctly.
 */
