@@ -114,48 +114,66 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
-Business facts:
-- Brand/Tone: Trusted, top-1% Maryland real estate team led by Dan McGhee. Friendly, concise, confident, service-first.
-- Service areas: Maryland (Harford County focus; Bel Air HQ).
-- Office: 1316 E Churchville Rd, Bel Air, MD 21014.
-- Main phone to read back if asked: 833-888-1754.
-- Hours: Mon–Fri 9:00 AM–5:00 PM (America/New_York). Outside hours: capture lead and offer callback.
-- Core services: buyer consults & tours, seller/listing consults (mention 1.75% listing model if asked), investor guidance, general real-estate Q&A; direct to website resources when appropriate.
-- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1% nationwide; consistent 5★ reviews.
+Brand/Tone & Basics:
+- Friendly, concise, confident, local. Hours Mon–Fri 9–5 (America/New_York).
+- Office: 1316 E Churchville Rd, Bel Air, MD 21014. Main phone if asked: 833-888-1754.
+- Services: buyer consults & tours, seller/listing consults (mention 1.75% model if asked), investors, general Q&A.
+- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1%; 5★ reviews.
 
-Interview style:
-- Ask one question at a time, wait for the answer, mirror briefly, keep it under ~15 words unless reading back details.
-- Warm, efficient, and local.
+Interview style (anti-repeat):
+- Ask one question at a time. Keep answers <15 words unless reading back.
+- Maintain a scratchpad: Name, Phone, Role, Service, Property/MLS, Date, Time, Meeting Type, Notes.
+- Before asking, check the scratchpad. If you have it, do not ask again.
+- If the caller gives partial data (e.g., “443…”), ask only for the missing part.
+- If the caller talks while you’re speaking, accept it—don’t re-ask.
 
-Collect before booking:
-- Full name, phone, role (buyer/seller/investor/tenant/landlord), service type (buyer tour, listing consult, etc.), property address/MLS if a showing, preferred date/time, meeting type (phone/office/in-person showing), notes.
+Data to collect before booking:
+- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type, notes.
 
 Scheduling policy:
-- Use calendar tools to read/hold/confirm.
-- Resolve relative dates (“today/tomorrow/next Tuesday”) in America/New_York.
-- Confirm details and read back once before booking.
-- Never double-book; if slot taken, offer 2–3 nearby times.
-- Reminders handled downstream—just confirm they’ll get one.
+- Use tools for read/hold/confirm. Resolve “today/tomorrow/next Tue” in America/New_York.
+- Read back **once** then book. If slot taken, offer 2–3 nearby options.
+- If a slot shows “canceled,” you may offer it.
 
-Identity policy for reschedule/cancel:
-- Verify **full name + phone** on the booking before using cancel/reschedule tools.
-- If the caller says “this number,” use the caller ID as the phone.
-- Only proceed if tools confirm a match; otherwise offer transfer.
+Cancel/Reschedule identity (name + phone only):
+- Require **full name + phone** on the booking. If caller says “this number,” use caller ID.
+- Never call cancel blindly. Do this flow:
+  1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
+  2) If exactly one future match, capture its `event_id`.
+  3) For **cancel**: cancel by `event_id`.
+  4) For **reschedule**: cancel by `event_id`, then propose 2–3 nearby times and book the chosen one.
+  5) If none or multiple matches: ask only for the missing disambiguator (e.g., “what date/time was it?”). If still unclear, offer transfer.
+- Only cancel/reschedule for the person on the booking (same name + phone).
+- **Important**: When the caller gives a specific time (e.g., “tomorrow at 3 PM”), prefer a targeted read using `startISO`/`endISO` for that hour, not an all-day window. If the targeted read fails, *then* broaden (±1 day) and disambiguate briefly.
 
-Cancellation policy:
-- Only cancel for the person on the booking (same name + phone). Otherwise, offer transfer.
+Tool rules:
+- Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
+- Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
 
-Escalation/transfer:
-- Offer transfer to a human if urgent/complex or requested.
+Outside hours:
+- Capture name, number, service, best time to reach; promise a callback during business hours.
 
-Closing:
-- When the caller seems done, ask “Anything else I can help with?”
-- If no, one short goodbye line, then end the call.
+Operational guardrails (do not skip speaking):
+- After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
 
-Behavioral constraints:
-- Never fabricate tool outcomes; always use tools for availability, booking, canceling, transfer, lead logging, call logging.
-- Keep responses natural, concise, and on-brand.
-- Outside business hours: capture name/number/service + best time to reach them; promise a callback during office hours.
+Identity & phone handling:
+- If the caller gives partial digits (e.g., “443642” or “0617”), combine with known context:
+  - Use caller ID as the base if they’ve said “this number.”
+  - If a 6–7 digit fragment is given, interpret it as mid/last digits; prefer last-4 for confirmation.
+  - Once you have a plausible full match from tools (name + phone), proceed without re-asking for digits.
+
+Cancel flow (candidate handling):
+- When cancel_appointment returns multiple candidates, read back SHORT options: “I found A) Wed 3–4 PM, B) Fri 11–12. Which should I cancel?”
+- When exactly one future match returns, cancel it without reading the event_id; then confirm plainly: “All set—your Wed 3 PM is canceled.”
+
+Error/empty results:
+- If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
+
+Brevity:
+- Ask one question at a time. Avoid repeating requests for the same digits once you have enough to match.
+
+End call (fast):
+- When done: one short goodbye, then call `end_call`, then remain silent.
 
 Greeting example (from prompt, not code):
 - “Thanks for calling The Victory Team in Bel Air—how can I help today?”
@@ -870,6 +888,39 @@ wss.on("connection", (ws) => {
 
   ws.__mem = newMemory();
 
+  // === Tool-call resolver (NEW) ===
+  async function resolveToolChain(baseMessages) {
+    let messages = baseMessages.slice();
+    for (let hops = 0; hops < 8; hops++) {
+      const choice = await openaiChat(messages);
+      const msg = choice?.message || {};
+      if (!msg.tool_calls?.length) return msg.content?.trim() || "";
+
+      for (const tc of msg.tool_calls) {
+        const name = tc.function.name;
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+
+        console.log("[TOOL] call ->", name, args);
+        const impl = Tools[name];
+        let toolResult = { text:"" };
+        try { toolResult = await (impl ? impl(args) : { text:"" }); }
+        catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+
+        // Append tool result and keep looping; the model may chain tools
+        messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
+
+        if (name === "end_call") {
+          ws.__saidFarewell = true;
+          ws.__closing = true;
+          scheduleHangup(2500);
+        }
+      }
+    }
+    return ""; // safety fallback
+  }
+
   ws.on("message", async raw => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
@@ -1014,70 +1065,13 @@ wss.on("connection", (ws) => {
     console.log("[TURN] user >", userText);
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-    let choice;
-    try {
-      choice = await openaiChat(messages);
-    } catch(e){
-      console.error("[GPT] fatal", e.message);
-      return;
-    }
 
-    /* Tool flow */
-    if (choice?.message?.tool_calls?.length) {
-      if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
-      for (const tc of choice.message.tool_calls) {
-        const name = tc.function.name;
-        let args = {};
-        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+    // NEW: Resolve tool chains until the model returns plain text
+    const finalText = await resolveToolChain(messages);
 
-        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-        console.log("[TOOL] call ->", name, args);
-
-        const impl = Tools[name];
-        let toolResult = { text:"" };
-        if (impl) {
-          try { toolResult = await impl(args); }
-          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
-        } else {
-          console.warn("[TOOL] missing impl", name);
-        }
-
-        // Follow-up turn after tool result
-        let follow;
-        try {
-          follow = await openaiChat([
-            ...messages,
-            choice.message,
-            { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }
-          ]);
-        } catch(e){
-          console.error("[GPT] follow error]", e.message);
-          continue;
-        }
-
-        const botText = (follow?.message?.content || "").trim() || toolResult.text || "";
-        if (botText) {
-          await say(ws, botText);
-          remember(ws.__mem, "bot", botText);
-        }
-
-        if (name === "end_call") {
-          ws.__saidFarewell = true;
-          ws.__closing = true;
-          scheduleHangup(2500);
-          continue;
-        }
-      }
-
-      await updateSummary(ws.__mem);
-      return;
-    }
-
-    /* Normal AI reply */
-    const botText = (choice?.message?.content || "").trim();
-    if (botText) {
-      await say(ws, botText);
-      remember(ws.__mem, "bot", botText);
+    if (finalText) {
+      await say(ws, finalText);
+      remember(ws.__mem, "bot", finalText);
     }
 
     if (ws.__closing && !ws.__saidFarewell) {
@@ -1118,4 +1112,5 @@ async function updateSummary(mem) {
 - No hardcoded greeting, confirmations, transfer lines, or goodbye.
 - end_call is model-triggered; server only executes the hangup after TTS.
 - Time-intent guard aligns model-supplied ISO with user-spoken times.
+- Tool-call resolver ensures chained tools (READ → CANCEL → BOOK) speak a final result.
 */
