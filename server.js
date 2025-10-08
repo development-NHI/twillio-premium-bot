@@ -848,7 +848,7 @@ if (!wss.__victory_handler_attached) {
 
   wss.on("connection", (ws) => {
     console.log("[WS] connection from Twilio]");
-    let dg = null;
+    let dg = null;             // outer handle used by flushULaw()
     let pendingULaw = [];
     const BATCH = 10; // ~200ms @ 8kHz
     let tailTimer = null;
@@ -1026,7 +1026,8 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        const dg = startDeepgram({
+        // === FIX: assign to outer dg (no shadowing) ===
+        dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
             // de-dupe
@@ -1092,7 +1093,7 @@ if (!wss.__victory_handler_attached) {
           }
         });
 
-        // store dg handle
+        // store dg handle for visibility if needed elsewhere
         ws.__dg = dg;
 
         // Prompt-driven greeting
@@ -1104,7 +1105,7 @@ if (!wss.__victory_handler_attached) {
       }
 
       if (msg.event === "media") {
-        if (!ws.__dg) return;
+        if (!dg) return; // if DG not ready yet, skip
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
@@ -1118,7 +1119,7 @@ if (!wss.__victory_handler_attached) {
         ws.__closing = true;
         ws.__stopSeenAt = Date.now();
         try { flushULaw(); } catch {}
-        try { ws.__dg?.close(); } catch {}
+        try { dg?.close(); } catch {}
         await postCallLogOnce(ws, "twilio stop");
         try { ws.close(); } catch {}
         return;
@@ -1126,7 +1127,7 @@ if (!wss.__victory_handler_attached) {
     });
 
     ws.on("close", async () => {
-      try { ws.__dg?.close(); } catch {}
+      try { dg?.close(); } catch {}
       clearHangTimer();
       clearInterval(hb);
       await postCallLogOnce(ws, "socket close");
@@ -1191,4 +1192,5 @@ async function updateSummary(mem) {
 - cancel_appointment searches 30 days when date is unknown.
 - read_availability now returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
 - Single WebSocketServer init guard prevents redeclaration on hot restarts/redeploys.
+- Deepgram handle fixed: assign to outer 'dg' so flushULaw() can send audio.
 */
