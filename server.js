@@ -38,7 +38,7 @@ const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
 /* Optional env-driven hours gate (code only checks; wording is prompt-driven) */
 const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
-const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || ""; // "17:00"
+const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "17:00";
 
 /* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
@@ -426,6 +426,9 @@ function newMemory() {
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
+/* ===== Track live websockets by call ===== */
+const CALLS = new Map(); // callSid => ws
+
 /* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
@@ -499,27 +502,65 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  async cancel_appointment({ event_id, name, phone }) {
+  // **** UPDATED: lookup first, then cancel by event_id
+  async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
-    if (!URLS.CAL_DELETE) return { text:"" };
-    try {
-      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+    if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
 
-      // Let backend handle either direct ID OR contact match (name+phone). Prompt dictates we must have both.
-      const { data, status } = await httpPost(URLS.CAL_DELETE,
-        {
-          intent:"DELETE",
+    const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+
+    try {
+      let id = event_id;
+
+      // If no event_id, look it up by name+phone (optionally narrow by date)
+      if (!id) {
+        const windowObj = dateISO
+          ? dayWindowLocal(dateISO, BIZ_TZ)
+          : dayWindowLocal(todayISOInTZ(BIZ_TZ), BIZ_TZ);
+
+        const readPayload = {
+          intent: "READ",
           biz: DASH_BIZ,
           source: DASH_SOURCE,
-          event_id: event_id || undefined,
-          name: name || undefined,
-          phone: normalizedPhone || undefined
-        },
-        { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+          timezone: BIZ_TZ,
+          window: {
+            start_local: windowObj.start_local,
+            end_local:   windowObj.end_local,
+            start_utc:   windowObj.start_utc,
+            end_utc:     windowObj.end_utc
+          },
+          contact_name: name || undefined,
+          contact_phone: normalizedPhone || undefined
+        };
 
-      const ok = (status>=200&&status<300) || data?.ok===true || data?.deleted===true;
-      return { data, ok };
-    } catch(e){ return { text:"", ok:false }; }
+        const { data: readData } = await httpPost(URLS.CAL_READ, readPayload,
+          { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+
+        const future = (readData?.events || []).filter(e => e.status !== "canceled");
+        if (future.length === 1) {
+          id = future[0].event_id;
+        } else {
+          return { ok:false, candidates: future.map(e => ({
+            event_id: e.event_id,
+            start_local: e.start_local,
+            event_name: e.event_name
+          })) };
+        }
+      }
+
+      // cancel by event_id
+      const { data, status } = await httpPost(URLS.CAL_DELETE, {
+        intent: "DELETE",
+        biz: DASH_BIZ,
+        source: DASH_SOURCE,
+        event_id: id
+      }, { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+
+      const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true;
+      return { ok, data };
+    } catch(e) {
+      return { text:"", ok:false };
+    }
   },
 
   async lead_upsert({ name, phone, intent, notes }) {
@@ -564,8 +605,30 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
+  // **** UPDATED: fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
-    console.log("[TOOL] end_call (signal only)", { callSid, reason });
+    console.log("[TOOL] end_call", { callSid, reason });
+
+    // Immediately prevent any further speech on this call
+    const w = CALLS.get(callSid);
+    if (w) w.__pendingHangupUntil = Date.now() + 999999;
+
+    // Hang up ASAP via Twilio
+    try {
+      if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
+        const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
+        const params = new URLSearchParams({ Status: "completed" });
+        await httpPost(url, params, {
+          auth: { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN },
+          timeout: 8000,
+          tag: "TWILIO_HANGUP",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          trace: { callSid, reason: "model end_call", convoId: currentTrace.convoId }
+        });
+      }
+    } catch (e) {
+      console.warn("[end_call] hangup error", e.message);
+    }
     return { text:"" };
   }
 };
@@ -597,7 +660,8 @@ const toolSchema = [
       parameters:{ type:"object", properties:{
         event_id:{type:"string"},
         name:{type:"string"},
-        phone:{type:"string"}
+        phone:{type:"string"},
+        dateISO:{type:"string", description:"Optional YYYY-MM-DD to narrow lookup in business timezone"}
       }, required:[] }
   }},
   { type:"function", function:{
@@ -797,6 +861,12 @@ wss.on("connection", (ws) => {
       ws.__callSid = cp.CallSid || cp.callSid || "";
       currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
       console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
+
+      // track socket by callSid (for fast hangup mute)
+      if (ws.__callSid) {
+        CALLS.set(ws.__callSid, ws);
+        ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
+      }
 
       // Fetch tenant-specific prompt if present
       ws.__tenantPrompt = "";
