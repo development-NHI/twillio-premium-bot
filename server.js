@@ -112,6 +112,8 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
+[Prompt-Version: 2025-10-08T23:45Z]
+
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
 Brand/Tone & Basics:
@@ -128,7 +130,7 @@ Interview style (anti-repeat):
 - If the caller talks while you’re speaking, accept it—don’t re-ask.
 
 Data to collect before booking:
-- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type, notes.
+- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type (in-person vs virtual; location if in-person), notes (special requests).
 
 Scheduling policy:
 - Use tools for read/hold/confirm. Resolve "today/tomorrow/next Tue" in America/New_York.
@@ -146,6 +148,16 @@ Cancel/Reschedule identity (name + phone only):
 - Only cancel/reschedule for the person on the booking (same name + phone).
 - Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour, not an all-day window. If the targeted read fails, then broaden (±1 day) and disambiguate briefly.
 
+Reschedule data integrity (must keep what the caller wants):
+- When rescheduling, preserve all prior details unless the caller changes them: service, meeting type (in-person vs virtual), location (office/property address), property/MLS, and notes/special requests.
+- If any of these are missing or ambiguous, ask one concise question to fill the gap **before** booking.
+- When calling \`book_appointment\`, include:
+  - \`service\` with the original/updated service name,
+  - \`notes\` summarizing key preferences (meeting type, location, property/MLS, special requests),
+  - the confirmed \`startISO\`/\`endISO\`,
+  - the same \`name\` and \`phone\` unless the caller updates them.
+- Read back the new plan once in a natural sentence (avoid listy tone): “Perfect—[day date time] for a [meeting type/service] [at location] about [property]. I’ll text a confirmation to [phone]. Anything else?”
+
 Wider search behavior (when caller gives no date/time):
 - Before rescheduling, call find_customer_events with name + phone (30 days). If you find any future bookings, read back short options and confirm which one to change; then use its "event_id".
 - Perform a contact-filtered READ across the next 30 days.
@@ -156,43 +168,38 @@ Wider search behavior (when caller gives no date/time):
 Tool rules:
 - Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
 - Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
-- **Availability interpretation:** When read_availability returns an empty "events" array **or** {summary:{free:true}}, treat the slot as **available**. When events.length>0 **or** {summary:{busy:true}}, it’s **unavailable**. Do not say a slot is taken if the array is empty.
+- **Availability interpretation:** When \`read_availability\` returns an empty \`events\` array **or** \`{summary:{free:true}}\`, the slot is **available**. When \`events.length>0\` **or** \`{summary:{busy:true}}\`, it’s **unavailable**. Do not say a slot is taken if the array is empty.
+- **Before saying any specific time is unavailable, ALWAYS call \`read_availability\` for that exact hour window the caller mentioned. Never guess.**
 - After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
-Operational guardrails (do not skip speaking):
+Operational guardrails:
 - After ANY tool call, ALWAYS speak. Never rely on silence to imply success.
-- When you decide the call should end, say one short goodbye line, then call "end_call".
+- One short goodbye only. When done, call \`end_call\`.
 
 Identity & phone handling:
-- If the caller gives partial digits (e.g., "443642" or "0617"), combine with known context:
-  - Use caller ID as the base if they’ve said "this number."
-  - Prefer last-4 for confirmation.
-  - Once you have a plausible full match from tools (name + phone), proceed without re-asking.
+- If the caller gives partial digits, combine with known context (use caller ID when they say “this number”, prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
 
 Cancel flow (candidate handling):
-- When cancel_appointment returns multiple candidates, read back SHORT options: "I found A) Wed 3–4 PM, B) Fri 11–12. Which should I cancel?"
-- When exactly one future match returns, cancel it and confirm plainly: "All set—your Wed 3 PM is canceled."
+- If cancel_appointment returns multiple candidates, read back SHORT options and ask which to cancel.
+- If exactly one future match is found, cancel it and confirm plainly.
 
 Error/empty results:
 - If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
 
 Brevity:
-- Ask one question at a time. Avoid repeating requests for the same digits once you have enough.
+- Ask one question at a time. Avoid repeating requests once you have enough.
 
-Reschedule readback + render data:
-- When rescheduling, after you book the new time you must read back the full details (name, phone, service, property if relevant, new date/time, meeting type, notes) and ensure the backend "Notes" includes the caller’s stated preferences like a normal new booking.
+End call:
+- One short goodbye, then call \`end_call\`, then remain silent.
 
-End call (fast):
-- One short goodbye, then call "end_call", then remain silent.
-
-Greeting example (from prompt, not code):
+Greeting example:
 - "Thanks for calling The Victory Team in Bel Air—how can I help today?"
 
 Output:
-- Short, natural voice responses.
+- Short, natural voice responses (avoid bullet lists in speech).
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -209,11 +216,11 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  // Twilio FIX: remove invalid/unsupported `track` attribute.
+  // Twilio supports inbound_track | outbound_track | both_tracks. We only send inbound.
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${host}">
+        <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
@@ -242,7 +249,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX: single WebSocketServer init guard === */
+/* === FIX: single WebSocketServer init guard (prevents 'Identifier "wss" already declared') === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -357,6 +364,7 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
+// Faster finalization: endpointing 900ms (was 1200)
 function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -366,7 +374,7 @@ function startDeepgram({ onFinal, wsRef }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200";
+    + "&endpointing=900";
   console.log("[Deepgram] connecting", url);
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -385,7 +393,7 @@ function startDeepgram({ onFinal, wsRef }) {
       onFinal?.(text);
     } else {
       const now = Date.now();
-      if (now - lastInterimLog > 1500) {
+      if (now - lastInterimLog > 1200) {
         console.log(`[ASR interim] ${text}`);
         lastInterimLog = now;
       }
@@ -403,10 +411,9 @@ function startDeepgram({ onFinal, wsRef }) {
 }
 
 /* === ElevenLabs TTS === */
-/* Barge-in guards: wait briefly for quiet before speaking */
-/* Latency tweak: slightly faster, still waits for silence */
-const QUIET_MS = 600;          // was 800
-const QUIET_TIMEOUT_MS = 900;  // was 1200
+/* Barge-in guards: wait briefly for quiet before TTS starts */
+const QUIET_MS = 500;          // required silence before TTS (was 800)
+const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency (was 1200)
 
 function cleanTTS(s=""){
   return String(s)
@@ -429,9 +436,10 @@ function formatPhoneForSpeech(s=""){
   }
   return s;
 }
+// Conversational readback (not a list)
 function compressReadback(text=""){
-  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
-  if (pairs.length >= 3) {
+  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Location|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
+  if (pairs.length >= 2) {
     const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
     const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
     const name = get("name");
@@ -441,14 +449,23 @@ function compressReadback(text=""){
     const prop  = get("property") || get("address") || get("mls");
     const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
     const meet  = get("meeting type");
-    const bits = [
-      name && `${name}`, phone && `${phone}`,
-      role && role, svc && svc, prop && prop, when && when, meet && meet
-    ].filter(Boolean);
-    if (bits.length) {
-      const base = `Confirming: ${bits.join(", ")}. Shall I book it?`;
-      return base;
+    const loc   = get("location");
+    const notes = get("notes");
+
+    const parts = [];
+    if (when) parts.push(`you're set for ${when}`);
+    if (svc || meet) {
+      const what = [meet, svc].filter(Boolean).join(" ");
+      if (what) parts.push(`for a ${what}`);
     }
+    if (prop) parts.push(`about ${prop}`);
+    if (loc) parts.push(`at ${loc}`);
+    if (name) parts.push(`for ${name}`);
+    if (phone) parts.push(`I'll text a confirmation to ${phone}`);
+    if (notes) parts.push(`note: ${notes}`);
+
+    const line = parts.filter(Boolean).join(", ") + ".";
+    return line.charAt(0).toUpperCase() + line.slice(1) + " Does that look right?";
   }
   return text;
 }
@@ -468,8 +485,8 @@ async function say(ws, text) {
     const since = Date.now() - lastHuman;
     if (since >= QUIET_MS) break;
     if (waited >= QUIET_TIMEOUT_MS) break;
-    await sleep(90); // was 100
-    waited += 90;
+    await sleep(100);
+    waited += 100;
   }
 
   let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
@@ -855,6 +872,38 @@ function buildMessages(mem, userText, tenantPrompt) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
+/* === Auto-verify helper: if model denies a caller’s requested hour, verify via read_availability === */
+function resolveRelativeDateFromText(text, tz) {
+  const s = (text||"").toLowerCase();
+  const base = todayISOInTZ(tz);
+  if (/\btomorrow\b/.test(s)) return addDaysISO(base, 1);
+  if (/\btoday\b/.test(s)) return base;
+  return null;
+}
+async function verifyHourAvailability({ text, replyText }) {
+  if (!/\b(not\s+available|isn['’]t\s+available|unavailable)\b/i.test(replyText||"")) return null;
+  if (LAST_TIME_HINT.hour24 == null || Date.now() - (LAST_TIME_HINT.ts||0) > 120000) return null;
+
+  const dateISO = resolveRelativeDateFromText(text, BIZ_TZ);
+  if (!dateISO) return null;
+
+  // Build a neutral 1h window at midnight UTC; adjustWindowToIntent will shift to LAST_TIME_HINT hour
+  const startISO = new Date(`${dateISO}T00:00:00Z`).toISOString();
+  const endISO   = new Date(`${dateISO}T01:00:00Z`).toISOString();
+
+  const check = await Tools.read_availability({ dateISO, startISO, endISO });
+  const busy = !!check?.summary?.busy;
+  if (!busy) {
+    const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
+    const hh12 = ((h + 11) % 12) + 1;
+    const mm = m ? `:${String(m).padStart(2,'0')}` : "";
+    const ampm = h >= 12 ? "PM" : "AM";
+    const dayWord = /\btomorrow\b/i.test(text) ? "tomorrow" : "that time";
+    return `Good news—${dayWord} at ${hh12}${mm} ${ampm} is open. Want me to lock it in?`;
+  }
+  return null;
+}
+
 /* Ensure one handler */
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
@@ -863,7 +912,7 @@ if (!wss.__victory_handler_attached) {
     console.log("[WS] connection from Twilio]");
     let dg = null;
     let pendingULaw = [];
-    const BATCH = 8; // was 10 → ~160ms @ 8kHz
+    const BATCH = 6; // ~120ms @ 8kHz (lower than 10 for faster ASR upstream)
     let tailTimer = null;
     let lastMediaLog = 0;
 
@@ -1123,7 +1172,7 @@ if (!wss.__victory_handler_attached) {
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 90); // was 120
+        tailTimer = setTimeout(flushULaw, 80); // faster tail flush (was 120)
         return;
       }
 
@@ -1153,7 +1202,11 @@ if (!wss.__victory_handler_attached) {
 
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
 
-      const finalText = await resolveToolChain(messages);
+      let finalText = await resolveToolChain(messages);
+
+      // NEW: if the model denied a requested time, verify that hour and correct if free
+      const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
+      if (corrected) finalText = corrected;
 
       if (finalText) {
         await say(ws, finalText);
@@ -1195,7 +1248,7 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Twilio fix: removed <Stream track="..."> entirely. Connect/Stream defaults to inbound audio; avoids “Unsupported value of track”.
-- Latency: QUIET_MS↓ (600), QUIET_TIMEOUT_MS↓ (900), media BATCH↓ (8), tail flush 90ms.
-- Barge-in protection remains: we still wait for short silence before speaking, so we don’t interrupt digits or times.
+- Auto-verify: when the model says a caller’s requested hour is “not available,” we confirm via read_availability and correct if free.
+- Faster, but polite: lower QUIET_MS + timeout, faster Deepgram endpointing, smaller μ-law batch + faster tail flush.
+- Readbacks sound natural (single sentence), not like a checklist.
 */
