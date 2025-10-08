@@ -258,7 +258,6 @@ function toLocalParts(iso, tz) {
     timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
     hour:"2-digit", minute:"2-digit", hour12:false
   });
-  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
@@ -274,7 +273,6 @@ function addDaysISO(dateISO, days) {
   const d = new Date(`${dateISO}T00:00:00`);
   d.setDate(d.getDate() + days);
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
-  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -292,7 +290,6 @@ function rangeWindowLocal(startDateISO, days, tz) {
 }
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -311,6 +308,8 @@ function withinBizHours(iso, tz){
 
 /* ===== Natural-time intent guard ===== */
 let LAST_UTTERANCE = "";
+let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 }; // recent parsed time
+
 function parseUserTime(text=""){
   const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
   let m, last=null;
@@ -334,7 +333,10 @@ function shiftISOByHours(iso, deltaHours){
   return d.toISOString();
 }
 function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
-  const intent = parseUserTime(lastText||"");
+  let intent = parseUserTime(lastText||"");
+  if (!intent && LAST_TIME_HINT.hour24 != null && (Date.now() - LAST_TIME_HINT.ts) < 120000) {
+    intent = { hour24: LAST_TIME_HINT.hour24, min: LAST_TIME_HINT.min };
+  }
   if (!intent) return {
     start_local: toLocalParts(startISO, tz),
     end_local:   toLocalParts(endISO, tz),
@@ -354,7 +356,7 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
-function startDeepgram({ onFinal }) {
+function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=mulaw"
@@ -386,6 +388,7 @@ function startDeepgram({ onFinal }) {
         console.log(`[ASR interim] ${text}`);
         lastInterimLog = now;
       }
+      try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
     }
   });
   dg.on("error", e => console.error("[Deepgram error]", e.message));
@@ -399,6 +402,10 @@ function startDeepgram({ onFinal }) {
 }
 
 /* === ElevenLabs TTS === */
+/* Barge-in guards: wait briefly for quiet before speaking */
+const QUIET_MS = 800;          // required silence before TTS starts
+const QUIET_TIMEOUT_MS = 1200; // max wait to avoid long latency
+
 function cleanTTS(s=""){
   return String(s)
     .replace(/\*\*(.*?)\*\*/g, "$1")
@@ -451,6 +458,18 @@ function shouldSpeak(ws, normalized=""){
 async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
+
+  // wait briefly for quiet so we don't interrupt live speech
+  let waited = 0;
+  while (true) {
+    const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
+    const since = Date.now() - lastHuman;
+    if (since >= QUIET_MS) break;
+    if (waited >= QUIET_TIMEOUT_MS) break;
+    await sleep(100);
+    waited += 100;
+  }
+
   let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
   const speak = cleanTTS(polished);
   if (!shouldSpeak(ws, speak)) return;
@@ -494,7 +513,6 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"", summary:{ busy:false, free:true } };
     try {
-      // Use caller ID if model passed "this number" (prompt handles wording)
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       let windowObj;
@@ -516,7 +534,6 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj,
-        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
         contact_name: name || undefined,
         contact_phone: normalizedPhone || undefined
       };
@@ -525,7 +542,6 @@ const Tools = {
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
 
-      // <<< FIX: surface explicit free/busy >>>
       const events = data?.events || [];
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
@@ -541,7 +557,7 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // The model will phrase any constraint; we just proceed or let the backend refuse.
+        // proceed; backend can refuse if needed
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -567,7 +583,6 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  // Lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
@@ -627,7 +642,6 @@ const Tools = {
     }
   },
 
-  // Contact-wide finder to list upcoming events (default 30 days)
   async find_customer_events({ name, phone, days = 30 }) {
     console.log("[TOOL] find_customer_events", { hasName: !!name, hasPhone: !!phone, days });
     if (!URLS.CAL_READ) return { ok:false, events:[] };
@@ -702,15 +716,12 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
-  // Fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
 
-    // Immediately prevent any further speech on this call
     const w = CALLS.get(callSid);
     if (w) w.__pendingHangupUntil = Date.now() + 999999;
 
-    // Hang up ASAP via Twilio
     try {
       if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
         const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
@@ -730,11 +741,11 @@ const Tools = {
   }
 };
 
-/* Tool schema advertised to the model (prompt drives what to ask; schema only enables actions) */
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
-      description:"Read calendar availability in a given window. Optionally filter by contact (name+phone) to verify identity or find existing bookings.",
+      description:"Read calendar availability in a given window. Optionally filter by contact (name+phone).",
       parameters:{ type:"object", properties:{
         dateISO:{type:"string", description:"YYYY-MM-DD in business timezone"},
         startISO:{type:"string", description:"ISO start"},
@@ -758,7 +769,7 @@ const toolSchema = [
         event_id:{type:"string"},
         name:{type:"string"},
         phone:{type:"string"},
-        dateISO:{type:"string", description:"Optional YYYY-MM-DD to narrow lookup in business timezone"}
+        dateISO:{type:"string", description:"Optional YYYY-MM-DD to narrow lookup"}
       }, required:[] }
   }},
   { type:"function", function:{
@@ -812,7 +823,7 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* Build system prompt with runtime facts; model handles all phrasing */
+/* Build system prompt with runtime facts */
 function buildSystemPrompt(mem, tenantPrompt) {
   const todayISO = todayISOInTZ(BIZ_TZ);
   const p = (tenantPrompt || RENDER_PROMPT);
@@ -829,7 +840,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
   ];
 }
 
-/* Turn user/bot text into chat messages */
+/* Messages */
 function buildMessages(mem, userText, tenantPrompt) {
   const sys = buildSystemPrompt(mem, tenantPrompt);
   const history = mem.transcript.slice(-12).map(m =>
@@ -842,13 +853,13 @@ function buildMessages(mem, userText, tenantPrompt) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
-/* Ensure we only attach one 'connection' handler */
+/* Ensure one handler */
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
 
   wss.on("connection", (ws) => {
     console.log("[WS] connection from Twilio]");
-    let dg = null;             // outer handle used by flushULaw()
+    let dg = null;
     let pendingULaw = [];
     const BATCH = 10; // ~200ms @ 8kHz
     let tailTimer = null;
@@ -861,6 +872,10 @@ if (!wss.__victory_handler_attached) {
     ws.__lastUserAt = 0;
     ws.__pendingFinal = "";
     ws.__finalTimer = null;
+
+    // Barge-in tracking
+    ws.__lastAudioAt = 0;
+    ws.__lastASRInterimAt = 0;
 
     // Closing state
     ws.__closing = false;
@@ -979,7 +994,6 @@ if (!wss.__victory_handler_attached) {
           try { toolResult = await (impl ? impl(args) : { text:"" }); }
           catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
 
-          // Append tool result and keep looping; the model may chain tools
           messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
 
           if (name === "end_call") {
@@ -989,7 +1003,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
       }
-      return ""; // safety fallback
+      return "";
     }
 
     ws.on("message", async raw => {
@@ -1005,13 +1019,11 @@ if (!wss.__victory_handler_attached) {
         currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
         console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-        // track socket by callSid (for fast hangup mute)
         if (ws.__callSid) {
           CALLS.set(ws.__callSid, ws);
           ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
         }
 
-        // Fetch tenant-specific prompt if present
         ws.__tenantPrompt = "";
         if (URLS.PROMPT_FETCH) {
           try {
@@ -1026,11 +1038,10 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // === FIX: assign to outer dg (no shadowing) ===
+        // assign to outer dg, pass wsRef for interim timestamps
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
-            // de-dupe
             if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
               console.log("[TURN] dropped duplicate final");
               return;
@@ -1039,13 +1050,13 @@ if (!wss.__victory_handler_attached) {
             ws.__lastUserAt = now;
 
             LAST_UTTERANCE = text;
+            const tHint = parseUserTime(text);
+            if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
 
-            // "this number" → capture caller ID (prompt decides when to say it)
             if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
               ws.__mem.entities.phone = ws.__from;
             }
 
-            // Debounce obviously incomplete finals to avoid back-to-back questions
             const looksPartial = (() => {
               const s = text.trim().toLowerCase();
               if (!s) return false;
@@ -1090,13 +1101,12 @@ if (!wss.__victory_handler_attached) {
               await handleTurn(ws, next);
               ws.__handling = false;
             }
-          }
+          },
+          wsRef: ws
         });
 
-        // store dg handle for visibility if needed elsewhere
         ws.__dg = dg;
 
-        // Prompt-driven greeting
         ws.__handling = true;
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
@@ -1105,7 +1115,8 @@ if (!wss.__victory_handler_attached) {
       }
 
       if (msg.event === "media") {
-        if (!dg) return; // if DG not ready yet, skip
+        if (!dg) return;
+        ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
@@ -1134,14 +1145,12 @@ if (!wss.__victory_handler_attached) {
       console.log("[WS] closed", { convoId: ws.__convoId });
     });
 
-    /* ===== Turn handler ===== */
     async function handleTurn(ws, userText) {
       if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
       console.log("[TURN] user >", userText);
 
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
 
-      // Resolve tool chains until the model returns plain text
       const finalText = await resolveToolChain(messages);
 
       if (finalText) {
@@ -1184,13 +1193,8 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- All caller-facing text is model-generated from the prompt.
-- No hardcoded greeting, confirmations, transfer lines, or goodbye.
-- end_call is model-triggered; server only executes the hangup after TTS.
-- Time-intent guard aligns model-supplied ISO with user-spoken times.
-- find_customer_events lets the model fetch all upcoming bookings for identification.
-- cancel_appointment searches 30 days when date is unknown.
-- read_availability now returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
-- Single WebSocketServer init guard prevents redeclaration on hot restarts/redeploys.
-- Deepgram handle fixed: assign to outer 'dg' so flushULaw() can send audio.
+- Barge-in guard waits for ~0.8s of silence (max 1.2s) before TTS. Normal turns stay fast.
+- Time-intent hint keeps “10 AM” aligned even after later messages like name/phone.
+- Single WebSocketServer guard prevents redeclaration on hot reloads.
+- Deepgram handle fixed (no shadowing).
 */
