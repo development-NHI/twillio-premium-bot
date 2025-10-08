@@ -241,7 +241,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX: single WebSocketServer init guard (prevents 'Identifier "wss" already declared') === */
+/* === FIX: single WebSocketServer init guard === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -308,7 +308,7 @@ function withinBizHours(iso, tz){
 
 /* ===== Natural-time intent guard ===== */
 let LAST_UTTERANCE = "";
-let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 }; // recent parsed time
+let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 };
 
 function parseUserTime(text=""){
   const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
@@ -381,6 +381,7 @@ function startDeepgram({ onFinal, wsRef }) {
     if (!text) return;
     if (ev.is_final || ev.speech_final) {
       console.log(`[ASR FINAL] ${text}`);
+      try { if (wsRef) wsRef.__lastASRFinalAt = Date.now(); } catch {}
       onFinal?.(text);
     } else {
       const now = Date.now();
@@ -389,6 +390,15 @@ function startDeepgram({ onFinal, wsRef }) {
         lastInterimLog = now;
       }
       try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
+      // If TTS is playing and caller speaks, interrupt TTS immediately
+      try {
+        if (wsRef?.__ttsActive && wsRef.__ttsStream) {
+          console.log("[TTS] interrupt: caller speaking");
+          wsRef.__ttsStream.destroy?.();
+          wsRef.__ttsActive = false;
+          wsRef.__ttsStream = null;
+        }
+      } catch {}
     }
   });
   dg.on("error", e => console.error("[Deepgram error]", e.message));
@@ -402,9 +412,9 @@ function startDeepgram({ onFinal, wsRef }) {
 }
 
 /* === ElevenLabs TTS === */
-/* Barge-in guards: wait briefly for quiet before speaking */
-const QUIET_MS = 800;          // required silence before TTS starts
-const QUIET_TIMEOUT_MS = 1200; // max wait to avoid long latency
+/* ASR-based barge-in: wait for ASR quiet; hard-stop if speech resumes */
+const QUIET_MS = 900;           // required ASR silence before TTS starts
+const QUIET_TIMEOUT_MS = 2500;  // max wait to avoid added latency
 
 function cleanTTS(s=""){
   return String(s)
@@ -459,10 +469,10 @@ async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
 
-  // wait briefly for quiet so we don't interrupt live speech
+  // Wait for ASR quiet
   let waited = 0;
   while (true) {
-    const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
+    const lastHuman = Math.max(ws.__lastASRInterimAt || 0, ws.__lastASRFinalAt || 0);
     const since = Date.now() - lastHuman;
     if (since >= QUIET_MS) break;
     if (waited >= QUIET_TIMEOUT_MS) break;
@@ -485,12 +495,18 @@ async function say(ws, text) {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
+    ws.__ttsActive = true;
+    ws.__ttsStream = resp.data;
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
-    resp.data.on("end", () => console.log("[TTS] stream end"));
+    resp.data.on("end", () => {
+      ws.__ttsActive = false;
+      ws.__ttsStream = null;
+      console.log("[TTS] stream end");
+    });
   } catch(e){ console.error("[TTS ERROR]", e.message); }
 }
 
@@ -874,8 +890,10 @@ if (!wss.__victory_handler_attached) {
     ws.__finalTimer = null;
 
     // Barge-in tracking
-    ws.__lastAudioAt = 0;
     ws.__lastASRInterimAt = 0;
+    ws.__lastASRFinalAt = 0;
+    ws.__ttsActive = false;
+    ws.__ttsStream = null;
 
     // Closing state
     ws.__closing = false;
@@ -1038,7 +1056,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // assign to outer dg, pass wsRef for interim timestamps
+        // Start Deepgram. Pass wsRef for ASR timestamps and TTS interrupt.
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
@@ -1116,7 +1134,6 @@ if (!wss.__victory_handler_attached) {
 
       if (msg.event === "media") {
         if (!dg) return;
-        ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
@@ -1193,8 +1210,7 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Barge-in guard waits for ~0.8s of silence (max 1.2s) before TTS. Normal turns stay fast.
+- ASR-based barge-in: the bot speaks only after ~0.9s ASR silence and stops instantly on new speech.
 - Time-intent hint keeps “10 AM” aligned even after later messages like name/phone.
 - Single WebSocketServer guard prevents redeclaration on hot reloads.
-- Deepgram handle fixed (no shadowing).
 */
