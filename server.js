@@ -112,7 +112,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
+You are an AI phone receptionist for The Victory Team (VictoryTeamSells.com) — Maryland real estate.
 
 Brand/Tone & Basics:
 - Friendly, concise, confident, local. Hours Mon–Fri 9–5 (America/New_York).
@@ -121,50 +121,53 @@ Brand/Tone & Basics:
 - Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1%; 5★ reviews.
 
 Interview style (anti-repeat):
-- Ask one question at a time. Keep answers <15 words unless reading back.
+- Ask one question at a time. Keep answers under ~15 words unless reading back.
 - Maintain a scratchpad: Name, Phone, Role, Service, Property/MLS, Date, Time, Meeting Type, Notes.
 - Before asking, check the scratchpad. If you have it, do not ask again.
-- If the caller gives partial data (e.g., “443…”), ask only for the missing part.
+- If the caller gives partial data (e.g., ‘443…’), ask only for the missing part.
 - If the caller talks while you’re speaking, accept it—don’t re-ask.
 
 Data to collect before booking:
 - Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type, notes.
 
 Scheduling policy:
-- Use tools for read/hold/confirm. Resolve “today/tomorrow/next Tue” in America/New_York.
-- Read back **once** then book. If slot taken, offer 2–3 nearby options.
-- If a slot shows “canceled,” you may offer it.
+- Use tools for read/hold/confirm. Resolve ‘today/tomorrow/next Tue’ in America/New_York.
+- Read back once then book. If slot taken, offer 2–3 nearby options.
+- If a slot shows ‘canceled,’ you may offer it.
 
 Cancel/Reschedule identity (name + phone only):
-- Require **full name + phone** on the booking. If caller says “this number,” use caller ID.
+- Require full name + phone on the booking. If caller says ‘this number,’ use caller ID.
 - Never call cancel blindly. Do this flow:
-  1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
+  1) READ with contact_name + contact_phone (and hour window via startISO/endISO if the caller gave a specific time) to find appointment(s).
   2) If exactly one future match, capture its 'event_id'.
-  3) For **cancel**: cancel by 'event_id'.
-  4) For **reschedule**: cancel by 'event_id', then propose 2–3 nearby times and book the chosen one.
-  5) If none or multiple matches: ask only for the missing disambiguator (e.g., “what date/time was it?”). If still unclear, offer transfer.
-- Only cancel/reschedule for the person on the booking (same name + phone).
-- **Important**: When the caller gives a specific time (e.g., “tomorrow at 3 PM”), prefer a targeted read using 'startISO'/'endISO' for that hour, not an all-day window. If the targeted read fails, *then* broaden (±1 day) and disambiguate briefly.
+  3) For cancel: cancel by 'event_id'.
+  4) For reschedule: cancel by 'event_id', then propose 2–3 nearby times and book the chosen one.
+  5) If none or multiple matches: ask only for the missing disambiguator (e.g., ‘what date/time was it?’). If still unclear, offer transfer.
+
+Wide search behavior (when caller gives no date/time):
+- Perform a contact-filtered READ over the next 30 days.
+- If you find any matches, read back short options like: ‘I found A) Wed 3–4 PM, B) Fri 11–12. Which one should I update?’
+- If none are found, ask for the date and approximate time.
 
 Tool rules:
-- Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
+- Always use tools for availability, booking, cancel/reschedule (via READ → CANCEL → BOOK), transfer, and logging.
 - Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
 Operational guardrails (do not skip speaking):
-- After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
+- After any tool call, always say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
 
 Identity & phone handling:
-- If the caller gives partial digits (e.g., “443642” or “0617”), combine with known context:
-  - Use caller ID as the base if they’ve said “this number.”
+- If the caller gives partial digits (e.g., ‘443642’ or ‘0617’), combine with known context:
+  - Use caller ID as the base if they’ve said ‘this number.’
   - If a 6–7 digit fragment is given, interpret it as mid/last digits; prefer last-4 for confirmation.
-  - Once you have a plausible full match from tools (name + phone), proceed without re-asking digits.
+  - Once you have a plausible full match from tools (name + phone), proceed without re-asking for digits.
 
 Cancel flow (candidate handling):
-- When cancel_appointment returns multiple candidates, read back SHORT options: “I found A) Wed 3–4 PM, B) Fri 11–12. Which should I cancel?”
-- When exactly one future match returns, cancel it without reading the event_id; then confirm plainly: “All set—your Wed 3 PM is canceled.”
+- When cancel_appointment returns multiple candidates, read back short options: ‘I found A) Wed 3–4 PM, B) Fri 11–12. Which should I cancel?’
+- When exactly one future match returns, cancel it without reading the event_id; then confirm plainly: ‘All set—your Wed 3 PM is canceled.’
 
 Error/empty results:
 - If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
@@ -176,7 +179,7 @@ End call (fast):
 - When done: one short goodbye, then call 'end_call', then remain silent.
 
 Greeting example (from prompt, not code):
-- “Thanks for calling The Victory Team in Bel Air—how can I help today?”
+- ‘Thanks for calling The Victory Team in Bel Air—how can I help today?’
 
 Output:
 - Short, natural voice responses.
@@ -285,6 +288,18 @@ function withinBizHours(iso, tz){
   const [eh,em]=BIZ_HOURS_END.split(":").map(Number);
   const startMin = sh*60+sm, endMin = eh*60+em;
   return nowMin >= startMin && nowMin < endMin;
+}
+
+/* Phone normalization (US/E.164-ish) */
+function normalizePhoneE164(s="") {
+  if (!s) return "";
+  const trimmed = String(s).trim();
+  if (trimmed.startsWith("+")) return trimmed;
+  const d = trimmed.replace(/\D+/g, "");
+  if (!d) return "";
+  if (d.length === 11 && d.startsWith("1")) return `+${d}`;
+  if (d.length === 10) return `+1${d}`;
+  return `+${d}`;
 }
 
 /* ===== Natural-time intent guard ===== */
@@ -472,8 +487,7 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"" };
     try {
-      // Use caller ID if model passed "this number" (prompt handles wording)
-      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+      const normalizedPhone = normalizePhoneE164((phone && phone.trim()) || CURRENT_FROM || "");
 
       let windowObj;
       if (startISO && endISO) {
@@ -483,8 +497,9 @@ const Tools = {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
         windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       } else {
+        // WIDENED: next 30 days when no date/time provided
         const today = todayISOInTZ(BIZ_TZ);
-        const w = dayWindowLocal(today, BIZ_TZ);
+        const w = rangeWindowLocal(today, 30, BIZ_TZ);
         windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       }
 
@@ -494,7 +509,6 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj,
-        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
         contact_name: name || undefined,
         contact_phone: normalizedPhone || undefined
       };
@@ -510,10 +524,10 @@ const Tools = {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
     if (!URLS.CAL_CREATE) return { text:"" };
     try {
-      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+      const normalizedPhone = normalizePhoneE164((phone && phone.trim()) || CURRENT_FROM || "");
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // The model will phrase any constraint; we just proceed or let the backend refuse.
+        // Let backend/prompt handle phrasing/validation
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -539,23 +553,22 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  // **** UPDATED: lookup first, then cancel by event_id; broaden search if date not supplied
+  // UPDATED: lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
 
-    const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+    const normalizedPhone = normalizePhoneE164((phone && phone.trim()) || CURRENT_FROM || "");
 
     try {
       let id = event_id;
 
       // If no event_id, look it up by name+phone (optionally narrow by date)
       if (!id) {
-        // If the model didn't pass a date, search a 3-day window starting today to catch “tomorrow” cases.
         const baseDate = todayISOInTZ(BIZ_TZ);
         const windowObj = dateISO
           ? dayWindowLocal(dateISO, BIZ_TZ)
-          : rangeWindowLocal(baseDate, 3, BIZ_TZ);
+          : rangeWindowLocal(baseDate, 30, BIZ_TZ); // widened to 30 days
 
         const readPayload = {
           intent: "READ",
@@ -607,7 +620,7 @@ const Tools = {
     if (!URLS.LEAD_UPSERT) return { text:"" };
     try {
       const { data } = await httpPost(URLS.LEAD_UPSERT,
-        { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes },
+        { biz:DASH_BIZ, source:DASH_SOURCE, name, phone: normalizePhoneE164(phone||""), intent, notes },
         { timeout: 8000, tag:"LEAD_UPSERT", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
     } catch { return { text:"" }; }
@@ -644,7 +657,7 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
-  // **** UPDATED: fast hangup that also mutes any further TTS
+  // fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
 
@@ -888,7 +901,7 @@ wss.on("connection", (ws) => {
 
   ws.__mem = newMemory();
 
-  // === Tool-call resolver (NEW) ===
+  // === Tool-call resolver (chains tools until plain text) ===
   async function resolveToolChain(baseMessages) {
     let messages = baseMessages.slice();
     for (let hops = 0; hops < 8; hops++) {
@@ -973,7 +986,7 @@ wss.on("connection", (ws) => {
             ws.__mem.entities.phone = ws.__from;
           }
 
-          // Debounce obviously incomplete finals to avoid back-to-back questions
+          // Debounce obviously incomplete finals
           const looksPartial = (() => {
             const s = text.trim().toLowerCase();
             if (!s) return false;
@@ -1066,7 +1079,7 @@ wss.on("connection", (ws) => {
 
     const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
 
-    // NEW: Resolve tool chains until the model returns plain text
+    // Resolve tool chains until the model returns plain text
     const finalText = await resolveToolChain(messages);
 
     if (finalText) {
@@ -1112,5 +1125,5 @@ async function updateSummary(mem) {
 - No hardcoded greeting, confirmations, transfer lines, or goodbye.
 - end_call is model-triggered; server only executes the hangup after TTS.
 - Time-intent guard aligns model-supplied ISO with user-spoken times.
-- Tool-call resolver ensures chained tools (READ → CANCEL → BOOK) speak a final result.
+- Wide 30-day search when date/time is not supplied; candidate readback handled by prompt.
 */
