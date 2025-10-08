@@ -159,11 +159,6 @@ Tool rules:
 - **Availability interpretation:** When read_availability returns an empty "events" array **or** {summary:{free:true}}, treat the slot as **available**. When events.length>0 **or** {summary:{busy:true}}, it’s **unavailable**. Do not say a slot is taken if the array is empty.
 - After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
 
-Reschedule specifics (preserve details & notes):
-- When rescheduling, **carry forward the original intent** (service, meeting type, property/MLS or address, and notes about what the caller wants).
-- Before booking the new time, **read back the full details exactly like a new booking**: Name, Phone, Service, Property/Address/MLS, Date, Time, Meeting Type, Notes. Ask for a single "yes" to confirm.
-- When you BOOK after a reschedule, **populate the Notes field** with a clear summary of what the caller wants, same as a fresh appointment (include service + any property/MLS + constraints/preferences).
-
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
@@ -211,10 +206,11 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  // FIX 1: use both_tracks so we receive caller audio AND can send outbound audio
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${host}" track="inbound_track">
+        <Stream url="wss://${host}" track="both_tracks">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
@@ -347,7 +343,7 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
-function startDeepgram({ onFinal, onInterim }) {
+function startDeepgram({ onFinal }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
     + "?encoding=mulaw"
@@ -378,7 +374,6 @@ function startDeepgram({ onFinal, onInterim }) {
       if (now - lastInterimLog > 1500) {
         console.log(`[ASR interim] ${text}`);
         lastInterimLog = now;
-        onInterim?.();
       }
     }
   });
@@ -415,7 +410,7 @@ function formatPhoneForSpeech(s=""){
   return s;
 }
 function compressReadback(text=""){
-  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
+  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 3) {
     const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
     const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
@@ -426,10 +421,9 @@ function compressReadback(text=""){
     const prop  = get("property") || get("address") || get("mls");
     const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
     const meet  = get("meeting type");
-    const notes = get("notes");
     const bits = [
       name && `${name}`, phone && `${phone}`,
-      role && role, svc && svc, prop && prop, when && when, meet && meet, notes && notes
+      role && role, svc && svc, prop && prop, when && when, meet && meet
     ].filter(Boolean);
     if (bits.length) {
       const base = `Confirming: ${bits.join(", ")}. Shall I book it?`;
@@ -464,7 +458,8 @@ async function say(ws, text) {
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
-      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
+      // FIX 2: tag outbound track so Twilio plays it
+      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, track:"outbound", media:{ payload:b64 } }));
     });
     resp.data.on("end", () => console.log("[TTS] stream end"));
   } catch(e){ console.error("[TTS ERROR]", e.message); }
@@ -533,7 +528,7 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // Model handles phrasing; backend may still accept or reject.
+        // Model decides phrasing; backend can still refuse.
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -829,6 +824,8 @@ function buildMessages(mem, userText, tenantPrompt) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
+const wss = new WebSocketServer({ server });
+
 wss.on("connection", (ws) => {
   console.log("[WS] connection from Twilio]");
   let dg = null;
@@ -860,27 +857,10 @@ wss.on("connection", (ws) => {
   ws.__hangTimer = null;
   ws.__pendingHangupUntil = 0;
 
-  // --- NEW: activity tracking for watchdog ---
-  ws.__lastHeardAt = Date.now();
-  ws.__lastMediaAt = Date.now();
-  ws.__lastPromptNudgeAt = 0;
-
   // Heartbeat
   const hb = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
   }, 15000);
-
-  // --- NEW: “still there?” watchdog nudges ---
-  const nudgeTimer = setInterval(async () => {
-    if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
-    const now = Date.now();
-    const sinceMedia = now - (ws.__lastMediaAt || 0);
-    const sinceWeSpoke = now - (ws.__lastBotAt || 0);
-    if (sinceWeSpoke > 6000 && sinceMedia > 8000 && now - (ws.__lastPromptNudgeAt || 0) > 20000) {
-      ws.__lastPromptNudgeAt = now;
-      await say(ws, "I’m not hearing you—are you still there?");
-    }
-  }, 3000);
 
   function clearHangTimer() {
     if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
@@ -1009,16 +989,6 @@ wss.on("connection", (ws) => {
         ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
       }
 
-      // Warn if no media arrives early
-      setTimeout(() => {
-        if (!ws.__lastMediaAt || (Date.now() - ws.__lastMediaAt) > 7000) {
-          console.warn("[AUDIO] No inbound media detected in first 7s of call", {
-            convoId: ws.__convoId, callSid: ws.__callSid
-          });
-        }
-      }, 7000);
-
-      // Fetch tenant-specific prompt if present
       ws.__tenantPrompt = "";
       if (URLS.PROMPT_FETCH) {
         try {
@@ -1035,8 +1005,6 @@ wss.on("connection", (ws) => {
 
       const dg = startDeepgram({
         onFinal: async (text) => {
-          ws.__lastHeardAt = Date.now();
-
           const now = Date.now();
           if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
             console.log("[TURN] dropped duplicate final");
@@ -1095,8 +1063,7 @@ wss.on("connection", (ws) => {
             await handleTurn(ws, next);
             ws.__handling = false;
           }
-        },
-        onInterim: () => { ws.__lastHeardAt = Date.now(); }
+        }
       });
 
       ws.__dg = dg;
@@ -1109,7 +1076,6 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "media") {
-      ws.__lastMediaAt = Date.now(); // NEW: mark inbound audio seen
       if (!ws.__dg) return;
       const ulaw = Buffer.from(msg.media?.payload || "", "base64");
       pendingULaw.push(ulaw);
@@ -1135,7 +1101,6 @@ wss.on("connection", (ws) => {
     try { ws.__dg?.close(); } catch {}
     clearHangTimer();
     clearInterval(hb);
-    clearInterval(nudgeTimer); // NEW: cleanup watchdog
     await postCallLogOnce(ws, "socket close");
     console.log("[WS] closed", { convoId: ws.__convoId });
   });
@@ -1194,6 +1159,5 @@ async function updateSummary(mem) {
 - Time-intent guard aligns model-supplied ISO with user-spoken times.
 - find_customer_events lets the model fetch all upcoming bookings for identification.
 - cancel_appointment searches 30 days when date is unknown.
-- read_availability returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
-- Audio watchdog nudges if no inbound speech/media, and logs if no media within first 7s.
+- read_availability now returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
 */
