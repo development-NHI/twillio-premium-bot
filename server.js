@@ -232,6 +232,25 @@ function dayWindowLocal(dateISO, tz) {
   const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
 }
+function addDaysISO(dateISO, days) {
+  const d = new Date(`${dateISO}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function rangeWindowLocal(startDateISO, days, tz) {
+  const start = dayWindowLocal(startDateISO, tz);
+  const endDateISO = addDaysISO(startDateISO, Math.max(0, days - 1));
+  const end = dayWindowLocal(endDateISO, tz);
+  return {
+    start_local: start.start_local,
+    end_local:   end.end_local,
+    start_utc:   start.start_utc,
+    end_utc:     end.end_utc,
+    timezone: tz
+  };
+}
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
@@ -502,7 +521,7 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
-  // **** UPDATED: lookup first, then cancel by event_id
+  // **** UPDATED: lookup first, then cancel by event_id; broaden search if date not supplied
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
@@ -514,9 +533,11 @@ const Tools = {
 
       // If no event_id, look it up by name+phone (optionally narrow by date)
       if (!id) {
+        // If the model didn't pass a date, search a 3-day window starting today to catch “tomorrow” cases.
+        const baseDate = todayISOInTZ(BIZ_TZ);
         const windowObj = dateISO
           ? dayWindowLocal(dateISO, BIZ_TZ)
-          : dayWindowLocal(todayISOInTZ(BIZ_TZ), BIZ_TZ);
+          : rangeWindowLocal(baseDate, 3, BIZ_TZ);
 
         const readPayload = {
           intent: "READ",
