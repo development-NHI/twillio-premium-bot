@@ -182,6 +182,9 @@ Error/empty results:
 Brevity:
 - Ask one question at a time. Avoid repeating requests for the same digits once you have enough to match.
 
+Reschedule readback + render data:
+- When rescheduling, after you book the new time you must read back the full details (name, phone, service, property if relevant, new date/time, meeting type, notes) and ensure the backend "Notes" includes the caller’s stated preferences like a normal new booking.
+
 End call (fast):
 - One short goodbye, then call "end_call", then remain silent.
 
@@ -206,11 +209,10 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  // FIX 1: use both_tracks so we receive caller audio AND can send outbound audio
   res.send(`
     <Response>
       <Connect>
-        <Stream url="wss://${host}" track="both_tracks">
+        <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
@@ -238,7 +240,13 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] URLS", URLS);
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
-const wss = new WebSocketServer({ server });
+
+/* === FIX: single WebSocketServer init guard (prevents 'Identifier "wss" already declared') === */
+let wss = globalThis.__victory_wss;
+if (!wss) {
+  wss = new WebSocketServer({ server });
+  globalThis.__victory_wss = wss;
+}
 
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -250,6 +258,7 @@ function toLocalParts(iso, tz) {
     timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
     hour:"2-digit", minute:"2-digit", hour12:false
   });
+  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
@@ -265,6 +274,7 @@ function addDaysISO(dateISO, days) {
   const d = new Date(`${dateISO}T00:00:00`);
   d.setDate(d.getDate() + days);
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
+  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -282,6 +292,7 @@ function rangeWindowLocal(startDateISO, days, tz) {
 }
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  // eslint-disable-next-line no-sequences
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -458,8 +469,7 @@ async function say(ws, text) {
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
-      // FIX 2: tag outbound track so Twilio plays it
-      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, track:"outbound", media:{ payload:b64 } }));
+      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
     resp.data.on("end", () => console.log("[TTS] stream end"));
   } catch(e){ console.error("[TTS ERROR]", e.message); }
@@ -484,6 +494,7 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { text:"", summary:{ busy:false, free:true } };
     try {
+      // Use caller ID if model passed "this number" (prompt handles wording)
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       let windowObj;
@@ -505,6 +516,7 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj,
+        // Optional contact filters for lookup (used by model during cancel/reschedule identity check)
         contact_name: name || undefined,
         contact_phone: normalizedPhone || undefined
       };
@@ -513,6 +525,7 @@ const Tools = {
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
 
+      // <<< FIX: surface explicit free/busy >>>
       const events = data?.events || [];
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
@@ -528,7 +541,7 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
       if (!withinBizHours(startISO, BIZ_TZ)) {
-        // Model decides phrasing; backend can still refuse.
+        // The model will phrase any constraint; we just proceed or let the backend refuse.
       }
 
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -554,6 +567,7 @@ const Tools = {
     } catch(e){ return { text:"", ok:false }; }
   },
 
+  // Lookup first, then cancel by event_id; broaden search if date not supplied (30 days)
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
@@ -613,6 +627,7 @@ const Tools = {
     }
   },
 
+  // Contact-wide finder to list upcoming events (default 30 days)
   async find_customer_events({ name, phone, days = 30 }) {
     console.log("[TOOL] find_customer_events", { hasName: !!name, hasPhone: !!phone, days });
     if (!URLS.CAL_READ) return { ok:false, events:[] };
@@ -687,12 +702,15 @@ const Tools = {
     } catch { return { text:"" }; }
   },
 
+  // Fast hangup that also mutes any further TTS
   async end_call({ callSid, reason }) {
     console.log("[TOOL] end_call", { callSid, reason });
 
+    // Immediately prevent any further speech on this call
     const w = CALLS.get(callSid);
     if (w) w.__pendingHangupUntil = Date.now() + 999999;
 
+    // Hang up ASAP via Twilio
     try {
       if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && callSid) {
         const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
@@ -824,309 +842,321 @@ function buildMessages(mem, userText, tenantPrompt) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
-const wss = new WebSocketServer({ server });
+/* Ensure we only attach one 'connection' handler */
+if (!wss.__victory_handler_attached) {
+  wss.__victory_handler_attached = true;
 
-wss.on("connection", (ws) => {
-  console.log("[WS] connection from Twilio]");
-  let dg = null;
-  let pendingULaw = [];
-  const BATCH = 10; // ~200ms @ 8kHz
-  let tailTimer = null;
-  let lastMediaLog = 0;
+  wss.on("connection", (ws) => {
+    console.log("[WS] connection from Twilio]");
+    let dg = null;
+    let pendingULaw = [];
+    const BATCH = 10; // ~200ms @ 8kHz
+    let tailTimer = null;
+    let lastMediaLog = 0;
 
-  // Per-call state
-  ws.__handling = false;
-  ws.__queuedTurn = null;
-  ws.__lastUserText = "";
-  ws.__lastUserAt = 0;
-  ws.__pendingFinal = "";
-  ws.__finalTimer = null;
+    // Per-call state
+    ws.__handling = false;
+    ws.__queuedTurn = null;
+    ws.__lastUserText = "";
+    ws.__lastUserAt = 0;
+    ws.__pendingFinal = "";
+    ws.__finalTimer = null;
 
-  // Closing state
-  ws.__closing = false;
-  ws.__saidFarewell = false;
+    // Closing state
+    ws.__closing = false;
+    ws.__saidFarewell = false;
 
-  // Dedup speech
-  ws.__lastBotText = "";
-  ws.__lastBotAt = 0;
+    // Dedup speech
+    ws.__lastBotText = "";
+    ws.__lastBotAt = 0;
 
-  // Logging
-  ws.__postedLog = false;
+    // Logging
+    ws.__postedLog = false;
 
-  // Graceful hangup window
-  ws.__hangTimer = null;
-  ws.__pendingHangupUntil = 0;
-
-  // Heartbeat
-  const hb = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
-  }, 15000);
-
-  function clearHangTimer() {
-    if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+    // Graceful hangup window
+    ws.__hangTimer = null;
     ws.__pendingHangupUntil = 0;
-  }
-  function scheduleHangup(ms = 2500) {
-    clearHangTimer();
-    ws.__pendingHangupUntil = Date.now() + ms;
-    ws.__hangTimer = setTimeout(async () => {
-      try {
-        if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && ws.__callSid) {
-          const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(ws.__callSid)}.json`;
-          const params = new URLSearchParams({ Status: "completed" });
-          const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
-          await httpPost(url, params, {
-            auth, timeout: 10000, tag:"TWILIO_HANGUP",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: currentTrace.convoId }
-          });
-        }
-      } catch(e) { console.warn("[HANGUP] error", e.message); }
-      try { ws.close(); } catch {}
-      setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
-    }, ms);
-  }
-  function flushULaw() {
-    if (!pendingULaw.length || !dg) return;
-    const chunk = Buffer.concat(pendingULaw);
-    pendingULaw = [];
-    const now = Date.now();
-    if (now - lastMediaLog > 2000) {
-      console.log("[MEDIA] flush", { frames: Math.round(chunk.length / 160), bytes: chunk.length });
-      lastMediaLog = now;
+
+    // Heartbeat
+    const hb = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) { try { ws.ping(); } catch {} }
+    }, 15000);
+
+    function clearHangTimer() {
+      if (ws.__hangTimer) { clearTimeout(ws.__hangTimer); ws.__hangTimer = null; }
+      ws.__pendingHangupUntil = 0;
     }
-    dg.sendULaw(chunk);
-  }
-
-  async function postCallLogOnce(ws, reason) {
-    if (ws.__postedLog) return;
-    ws.__postedLog = true;
-
-    const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
-
-    const transcriptArr = ws.__mem?.transcript || [];
-    const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
-
-    const payload = {
-      biz: DASH_BIZ,
-      source: DASH_SOURCE,
-      convoId: trace.convoId,
-      callSid: trace.callSid,
-      from: trace.from,
-      summary: ws.__mem?.summary || "",
-      transcript: transcriptText,
-      ended_reason: reason || ""
-    };
-
-    try {
-      if (URLS.CALL_LOG) {
-        await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
-      } else {
-        console.warn("[CALL_LOG] URL missing");
-      }
-    } catch {}
-
-    try {
-      if (URLS.CALL_SUMMARY) {
-        await httpPost(URLS.CALL_SUMMARY, payload, {
-          timeout: 8000, tag:"CALL_SUMMARY", trace
-        });
-      } else {
-        console.warn("[CALL_SUMMARY] URL missing");
-      }
-    } catch {}
-  }
-
-  ws.__mem = newMemory();
-
-  // === Tool-call resolver ===
-  async function resolveToolChain(baseMessages) {
-    let messages = baseMessages.slice();
-    for (let hops = 0; hops < 8; hops++) {
-      const choice = await openaiChat(messages);
-      const msg = choice?.message || {};
-      if (!msg.tool_calls?.length) return msg.content?.trim() || "";
-
-      for (const tc of msg.tool_calls) {
-        const name = tc.function.name;
-        let args = {};
-        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-
-        console.log("[TOOL] call ->", name, args);
-        const impl = Tools[name];
-        let toolResult = { text:"" };
-        try { toolResult = await (impl ? impl(args) : { text:"" }); }
-        catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
-
-        messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
-
-        if (name === "end_call") {
-          ws.__saidFarewell = true;
-          ws.__closing = true;
-          scheduleHangup(2500);
-        }
-      }
-    }
-    return "";
-  }
-
-  ws.on("message", async raw => {
-    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    if (msg.event === "start") {
-      ws.__streamSid = msg.start.streamSid;
-      ws.__convoId = uuidv4();
-      const cp = msg.start?.customParameters || {};
-      ws.__from = cp.from || "";
-      CURRENT_FROM = ws.__from || "";
-      ws.__callSid = cp.CallSid || cp.callSid || "";
-      currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
-      console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
-
-      if (ws.__callSid) {
-        CALLS.set(ws.__callSid, ws);
-        ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
-      }
-
-      ws.__tenantPrompt = "";
-      if (URLS.PROMPT_FETCH) {
+    function scheduleHangup(ms = 2500) {
+      clearHangTimer();
+      ws.__pendingHangupUntil = Date.now() + ms;
+      ws.__hangTimer = setTimeout(async () => {
         try {
-          const { data } = await httpGet(
-            `${URLS.PROMPT_FETCH}?biz=${encodeURIComponent(DASH_BIZ)}`,
-            { timeout: 10000, tag:"PROMPT_FETCH", trace:{ convoId: ws.__convoId, callSid: ws.__callSid } }
-          );
-          if (data?.prompt) ws.__tenantPrompt = data.prompt;
-          console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
-        } catch(e){
-          console.warn("[PROMPT_FETCH] error", e.message);
+          if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && ws.__callSid) {
+            const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(ws.__callSid)}.json`;
+            const params = new URLSearchParams({ Status: "completed" });
+            const auth = { username: TWILIO_ACCOUNT_SID, password: TWILIO_AUTH_TOKEN };
+            await httpPost(url, params, {
+              auth, timeout: 10000, tag:"TWILIO_HANGUP",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: currentTrace.convoId }
+            });
+          }
+        } catch(e) { console.warn("[HANGUP] error", e.message); }
+        try { ws.close(); } catch {}
+        setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
+      }, ms);
+    }
+    function flushULaw() {
+      if (!pendingULaw.length || !dg) return;
+      const chunk = Buffer.concat(pendingULaw);
+      pendingULaw = [];
+      const now = Date.now();
+      if (now - lastMediaLog > 2000) {
+        console.log("[MEDIA] flush", { frames: Math.round(chunk.length / 160), bytes: chunk.length });
+        lastMediaLog = now;
+      }
+      dg.sendULaw(chunk);
+    }
+
+    async function postCallLogOnce(ws, reason) {
+      if (ws.__postedLog) return;
+      ws.__postedLog = true;
+
+      const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
+
+      const transcriptArr = ws.__mem?.transcript || [];
+      const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
+
+      const payload = {
+        biz: DASH_BIZ,
+        source: DASH_SOURCE,
+        convoId: trace.convoId,
+        callSid: trace.callSid,
+        from: trace.from,
+        summary: ws.__mem?.summary || "",
+        transcript: transcriptText,
+        ended_reason: reason || ""
+      };
+
+      try {
+        if (URLS.CALL_LOG) {
+          await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
+        } else {
+          console.warn("[CALL_LOG] URL missing");
+        }
+      } catch {}
+
+      try {
+        if (URLS.CALL_SUMMARY) {
+          await httpPost(URLS.CALL_SUMMARY, payload, {
+            timeout: 8000, tag:"CALL_SUMMARY", trace
+          });
+        } else {
+          console.warn("[CALL_SUMMARY] URL missing");
+        }
+      } catch {}
+    }
+
+    ws.__mem = newMemory();
+
+    // === Tool-call resolver ===
+    async function resolveToolChain(baseMessages) {
+      let messages = baseMessages.slice();
+      for (let hops = 0; hops < 8; hops++) {
+        const choice = await openaiChat(messages);
+        const msg = choice?.message || {};
+        if (!msg.tool_calls?.length) return msg.content?.trim() || "";
+
+        for (const tc of msg.tool_calls) {
+          const name = tc.function.name;
+          let args = {};
+          try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+          if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+
+          console.log("[TOOL] call ->", name, args);
+          const impl = Tools[name];
+          let toolResult = { text:"" };
+          try { toolResult = await (impl ? impl(args) : { text:"" }); }
+          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+
+          // Append tool result and keep looping; the model may chain tools
+          messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
+
+          if (name === "end_call") {
+            ws.__saidFarewell = true;
+            ws.__closing = true;
+            scheduleHangup(2500);
+          }
         }
       }
+      return ""; // safety fallback
+    }
 
-      const dg = startDeepgram({
-        onFinal: async (text) => {
-          const now = Date.now();
-          if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-            console.log("[TURN] dropped duplicate final");
-            return;
-          }
-          ws.__lastUserText = text;
-          ws.__lastUserAt = now;
+    ws.on("message", async raw => {
+      let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-          LAST_UTTERANCE = text;
+      if (msg.event === "start") {
+        ws.__streamSid = msg.start.streamSid;
+        ws.__convoId = uuidv4();
+        const cp = msg.start?.customParameters || {};
+        ws.__from = cp.from || "";
+        CURRENT_FROM = ws.__from || "";
+        ws.__callSid = cp.CallSid || cp.callSid || "";
+        currentTrace = { convoId: ws.__convoId, callSid: ws.__callSid };
+        console.log("[CALL_START]", { convoId: ws.__convoId, streamSid: ws.__streamSid, from: ws.__from, callSid: ws.__callSid });
 
-          if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
-            ws.__mem.entities.phone = ws.__from;
-          }
+        // track socket by callSid (for fast hangup mute)
+        if (ws.__callSid) {
+          CALLS.set(ws.__callSid, ws);
+          ws.on("close", () => { if (ws.__callSid) CALLS.delete(ws.__callSid); });
+        }
 
-          const looksPartial = (() => {
-            const s = text.trim().toLowerCase();
-            if (!s) return false;
-            if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
-            if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
-            return false;
-          })();
-          if (looksPartial) {
-            clearTimeout(ws.__finalTimer);
-            ws.__pendingFinal = text;
-            ws.__finalTimer = setTimeout(async () => {
-              if (ws.__handling) { ws.__queuedTurn = ws.__pendingFinal; ws.__pendingFinal = ""; return; }
-              ws.__handling = true;
-              remember(ws.__mem, "user", ws.__pendingFinal);
-              await handleTurn(ws, ws.__pendingFinal);
-              ws.__pendingFinal = "";
-              ws.__handling = false;
-
-              if (ws.__queuedTurn) {
-                const next = ws.__queuedTurn; ws.__queuedTurn = null;
-                ws.__handling = true; remember(ws.__mem, "user", next);
-                await handleTurn(ws, next); ws.__handling = false;
-              }
-            }, 900);
-            return;
-          }
-
-          if (ws.__handling) {
-            ws.__queuedTurn = text;
-            return;
-          }
-          ws.__handling = true;
-          remember(ws.__mem, "user", text);
-          await handleTurn(ws, text);
-          ws.__handling = false;
-
-          if (ws.__queuedTurn) {
-            const next = ws.__queuedTurn;
-            ws.__queuedTurn = null;
-            ws.__handling = true;
-            remember(ws.__mem, "user", next);
-            await handleTurn(ws, next);
-            ws.__handling = false;
+        // Fetch tenant-specific prompt if present
+        ws.__tenantPrompt = "";
+        if (URLS.PROMPT_FETCH) {
+          try {
+            const { data } = await httpGet(
+              `${URLS.PROMPT_FETCH}?biz=${encodeURIComponent(DASH_BIZ)}`,
+              { timeout: 10000, tag:"PROMPT_FETCH", trace:{ convoId: ws.__convoId, callSid: ws.__callSid } }
+            );
+            if (data?.prompt) ws.__tenantPrompt = data.prompt;
+            console.log("[PROMPT_FETCH] ok", { hasPrompt: !!data?.prompt });
+          } catch(e){
+            console.warn("[PROMPT_FETCH] error", e.message);
           }
         }
-      });
 
-      ws.__dg = dg;
+        const dg = startDeepgram({
+          onFinal: async (text) => {
+            const now = Date.now();
+            // de-dupe
+            if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
+              console.log("[TURN] dropped duplicate final");
+              return;
+            }
+            ws.__lastUserText = text;
+            ws.__lastUserAt = now;
 
-      ws.__handling = true;
-      await handleTurn(ws, "<CALL_START>");
-      ws.__handling = false;
+            LAST_UTTERANCE = text;
 
-      return;
-    }
+            // "this number" → capture caller ID (prompt decides when to say it)
+            if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
+              ws.__mem.entities.phone = ws.__from;
+            }
 
-    if (msg.event === "media") {
-      if (!ws.__dg) return;
-      const ulaw = Buffer.from(msg.media?.payload || "", "base64");
-      pendingULaw.push(ulaw);
-      if (pendingULaw.length >= BATCH) flushULaw();
-      clearTimeout(tailTimer);
-      tailTimer = setTimeout(flushULaw, 120);
-      return;
-    }
+            // Debounce obviously incomplete finals to avoid back-to-back questions
+            const looksPartial = (() => {
+              const s = text.trim().toLowerCase();
+              if (!s) return false;
+              if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
+              if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
+              return false;
+            })();
+            if (looksPartial) {
+              clearTimeout(ws.__finalTimer);
+              ws.__pendingFinal = text;
+              ws.__finalTimer = setTimeout(async () => {
+                if (ws.__handling) { ws.__queuedTurn = ws.__pendingFinal; ws.__pendingFinal = ""; return; }
+                ws.__handling = true;
+                remember(ws.__mem, "user", ws.__pendingFinal);
+                await handleTurn(ws, ws.__pendingFinal);
+                ws.__pendingFinal = "";
+                ws.__handling = false;
 
-    if (msg.event === "stop") {
-      console.log("[CALL_STOP]", { convoId: ws.__convoId });
-      ws.__closing = true;
-      ws.__stopSeenAt = Date.now();
-      try { flushULaw(); } catch {}
+                if (ws.__queuedTurn) {
+                  const next = ws.__queuedTurn; ws.__queuedTurn = null;
+                  ws.__handling = true; remember(ws.__mem, "user", next);
+                  await handleTurn(ws, next); ws.__handling = false;
+                }
+              }, 900);
+              return;
+            }
+
+            if (ws.__handling) {
+              ws.__queuedTurn = text;
+              return;
+            }
+            ws.__handling = true;
+            remember(ws.__mem, "user", text);
+            await handleTurn(ws, text);
+            ws.__handling = false;
+
+            if (ws.__queuedTurn) {
+              const next = ws.__queuedTurn;
+              ws.__queuedTurn = null;
+              ws.__handling = true;
+              remember(ws.__mem, "user", next);
+              await handleTurn(ws, next);
+              ws.__handling = false;
+            }
+          }
+        });
+
+        // store dg handle
+        ws.__dg = dg;
+
+        // Prompt-driven greeting
+        ws.__handling = true;
+        await handleTurn(ws, "<CALL_START>");
+        ws.__handling = false;
+
+        return;
+      }
+
+      if (msg.event === "media") {
+        if (!ws.__dg) return;
+        const ulaw = Buffer.from(msg.media?.payload || "", "base64");
+        pendingULaw.push(ulaw);
+        if (pendingULaw.length >= BATCH) flushULaw();
+        clearTimeout(tailTimer);
+        tailTimer = setTimeout(flushULaw, 120);
+        return;
+      }
+
+      if (msg.event === "stop") {
+        console.log("[CALL_STOP]", { convoId: ws.__convoId });
+        ws.__closing = true;
+        ws.__stopSeenAt = Date.now();
+        try { flushULaw(); } catch {}
+        try { ws.__dg?.close(); } catch {}
+        await postCallLogOnce(ws, "twilio stop");
+        try { ws.close(); } catch {}
+        return;
+      }
+    });
+
+    ws.on("close", async () => {
       try { ws.__dg?.close(); } catch {}
-      await postCallLogOnce(ws, "twilio stop");
-      try { ws.close(); } catch {}
-      return;
+      clearHangTimer();
+      clearInterval(hb);
+      await postCallLogOnce(ws, "socket close");
+      console.log("[WS] closed", { convoId: ws.__convoId });
+    });
+
+    /* ===== Turn handler ===== */
+    async function handleTurn(ws, userText) {
+      if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
+      console.log("[TURN] user >", userText);
+
+      const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
+
+      // Resolve tool chains until the model returns plain text
+      const finalText = await resolveToolChain(messages);
+
+      if (finalText) {
+        await say(ws, finalText);
+        remember(ws.__mem, "bot", finalText);
+      }
+
+      if (ws.__closing && !ws.__saidFarewell) {
+        ws.__saidFarewell = true;
+        scheduleHangup(2500);
+      }
+
+      await updateSummary(ws.__mem);
     }
   });
-
-  ws.on("close", async () => {
-    try { ws.__dg?.close(); } catch {}
-    clearHangTimer();
-    clearInterval(hb);
-    await postCallLogOnce(ws, "socket close");
-    console.log("[WS] closed", { convoId: ws.__convoId });
-  });
-
-  /* ===== Turn handler ===== */
-  async function handleTurn(ws, userText) {
-    if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
-    console.log("[TURN] user >", userText);
-
-    const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-
-    const finalText = await resolveToolChain(messages);
-
-    if (finalText) {
-      await say(ws, finalText);
-      remember(ws.__mem, "bot", finalText);
-    }
-
-    if (ws.__closing && !ws.__saidFarewell) {
-      ws.__saidFarewell = true;
-      scheduleHangup(2500);
-    }
-
-    await updateSummary(ws.__mem);
-  }
-});
+}
 
 /* ===== Rolling summary ===== */
 async function updateSummary(mem) {
@@ -1160,4 +1190,5 @@ async function updateSummary(mem) {
 - find_customer_events lets the model fetch all upcoming bookings for identification.
 - cancel_appointment searches 30 days when date is unknown.
 - read_availability now returns summary {free:true|false, busy:true|false} to prevent misinterpretation of empty arrays.
+- Single WebSocketServer init guard prevents redeclaration on hot restarts/redeploys.
 */
