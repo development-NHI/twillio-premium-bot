@@ -560,8 +560,7 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
-      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
-
+      // IMPORTANT: availability should reflect *all* events; do NOT filter by contact
       let windowObj;
       if (startISO && endISO) {
         const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -580,9 +579,8 @@ const Tools = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
-        window: windowObj,
-        contact_name: name || undefined,
-        contact_phone: normalizedPhone || undefined
+        window: windowObj
+        // no contact filter for availability
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
         timeout:12000, tag:"CAL_READ",
@@ -657,7 +655,7 @@ const Tools = {
           const readPayload = {
             intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
             window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
-            contact_name: name || undefined,
+            // verify via phone only (name typos shouldn't block)
             contact_phone: (phone||CURRENT_FROM||"") || undefined
           };
           const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
@@ -709,7 +707,7 @@ const Tools = {
             start_utc:   windowObj.start_utc,
             end_utc:     windowObj.end_utc
           },
-          contact_name: name || undefined,
+          // prefer phone-only match to avoid name typos blocking lookup
           contact_phone: normalizedPhone || undefined
         };
 
@@ -753,7 +751,10 @@ const Tools = {
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
     try {
       const baseDate = todayISOInTZ(BIZ_TZ);
-      const w = rangeWindowLocal(baseDate, Math.max(1, Math.min(60, days)), BIZ_TZ);
+      // Expand horizon to include "tomorrow" at minimum; cap at 60
+      const mentionsTomorrow = /\btomorrow\b/i.test(LAST_UTTERANCE || "");
+      const daysToUse = Math.max(mentionsTomorrow ? 2 : 1, Math.min(60, days || 30));
+      const w = rangeWindowLocal(baseDate, daysToUse, BIZ_TZ);
       const payload = {
         intent: "READ",
         biz: DASH_BIZ,
@@ -765,7 +766,7 @@ const Tools = {
           start_utc:   w.start_utc,
           end_utc:     w.end_utc
         },
-        contact_name: name || undefined,
+        // Use phone-only to avoid name spelling mismatches blocking the lookup
         contact_phone: normalizedPhone || undefined
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
