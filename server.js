@@ -1,6 +1,7 @@
 /* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
-   - All caller-facing text is model-generated from the prompt (no hardcoded bot lines)
-   - Tools are generic; model decides when to call them
+   - Single-booking guarantee (no duplicate creates in same hour)
+   - Exact-hour verification before denying availability
+   - Natural readback + non-interrupting TTS latency
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
 */
@@ -112,7 +113,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-[Prompt-Version: 2025-10-08T23:45Z]
+[Prompt-Version: 2025-10-09T00:35Z]
 
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
@@ -156,7 +157,8 @@ Reschedule data integrity (must keep what the caller wants):
   - \`notes\` summarizing key preferences (meeting type, location, property/MLS, special requests),
   - the confirmed \`startISO\`/\`endISO\`,
   - the same \`name\` and \`phone\` unless the caller updates them.
-- Read back the new plan once in a natural sentence (avoid listy tone): “Perfect—[day date time] for a [meeting type/service] [at location] about [property]. I’ll text a confirmation to [phone]. Anything else?”
+- **Never create a second appointment to “add notes.” If the time is already booked for this caller, acknowledge they’re set and just confirm details conversationally.**
+- Read back the new plan once in a natural sentence: “Perfect—[day date time] for a [meeting type/service] [at location] about [property]. I’ll text a confirmation to [phone]. Anything else?”
 
 Wider search behavior (when caller gives no date/time):
 - Before rescheduling, call find_customer_events with name + phone (30 days). If you find any future bookings, read back short options and confirm which one to change; then use its "event_id".
@@ -170,7 +172,7 @@ Tool rules:
 - Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
 - **Availability interpretation:** When \`read_availability\` returns an empty \`events\` array **or** \`{summary:{free:true}}\`, the slot is **available**. When \`events.length>0\` **or** \`{summary:{busy:true}}\`, it’s **unavailable**. Do not say a slot is taken if the array is empty.
 - **Before saying any specific time is unavailable, ALWAYS call \`read_availability\` for that exact hour window the caller mentioned. Never guess.**
-- After ANY tool call, ALWAYS say something to the caller: either confirm the result, ask a single disambiguation question, or explain the next step. Never go silent after tools.
+- After ANY tool call, ALWAYS speak: confirm, ask one question, or explain next steps.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
@@ -278,8 +280,8 @@ function dayWindowLocal(dateISO, tz) {
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
 }
 function addDaysISO(dateISO, days) {
-  const d = new Date(`${dateISO}T00:00:00`);
-  d.setDate(d.getDate() + days);
+  const d = new Date(`${dateISO}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
@@ -364,7 +366,7 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
 }
 
 /* === Deepgram ASR (μ-law passthrough) === */
-// Faster finalization: endpointing 900ms (was 1200)
+// Faster finalization: endpointing 900ms
 function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -411,9 +413,8 @@ function startDeepgram({ onFinal, wsRef }) {
 }
 
 /* === ElevenLabs TTS === */
-/* Barge-in guards: wait briefly for quiet before TTS starts */
-const QUIET_MS = 500;          // required silence before TTS (was 800)
-const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency (was 1200)
+const QUIET_MS = 500;          // required silence before TTS
+const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency
 
 function cleanTTS(s=""){
   return String(s)
@@ -436,7 +437,6 @@ function formatPhoneForSpeech(s=""){
   }
   return s;
 }
-// Conversational readback (not a list)
 function compressReadback(text=""){
   const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Location|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 2) {
@@ -444,7 +444,6 @@ function compressReadback(text=""){
     const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
     const name = get("name");
     const phone = formatPhoneForSpeech(get("phone"));
-    const role  = get("role");
     const svc   = get("service");
     const prop  = get("property") || get("address") || get("mls");
     const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
@@ -464,7 +463,7 @@ function compressReadback(text=""){
     if (phone) parts.push(`I'll text a confirmation to ${phone}`);
     if (notes) parts.push(`note: ${notes}`);
 
-    const line = parts.filter(Boolean).join(", ") + ".";
+    const line = (parts.filter(Boolean).join(", ") || "All set") + ".";
     return line.charAt(0).toUpperCase() + line.slice(1) + " Does that look right?";
   }
   return text;
@@ -478,7 +477,6 @@ async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
 
-  // wait briefly for quiet so we don't interrupt live speech
   let waited = 0;
   while (true) {
     const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
@@ -489,13 +487,13 @@ async function say(ws, text) {
     waited += 100;
   }
 
-  let polished = compressReadback(text).replace(/\bPhone:\s*([^\s].*?)\b/i, (_,p)=>formatPhoneForSpeech(p));
-  const speak = cleanTTS(polished);
+  const speak = cleanTTS(compressReadback(text));
   if (!shouldSpeak(ws, speak)) return;
 
   ws.__lastBotText = speak;
   ws.__lastBotAt = Date.now();
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
+
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     console.warn("[TTS] missing ElevenLabs credentials]");
     return;
@@ -517,7 +515,6 @@ async function say(ws, text) {
 function newMemory() {
   return {
     transcript: [],
-    entities: { name:"", phone:"", service:"", date:"", time:"" },
     summary: ""
   };
 }
@@ -530,7 +527,7 @@ const CALLS = new Map(); // callSid => ws
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
-    if (!URLS.CAL_READ) return { text:"", summary:{ busy:false, free:true } };
+    if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
@@ -566,20 +563,29 @@ const Tools = {
       const summary = { busy, free: !busy };
 
       return { data: { ...data, events }, summary };
-    } catch(e){ return { text:"", summary:{ busy:false, free:true } }; }
+    } catch { return { summary:{ busy:false, free:true } }; }
   },
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
-    if (!URLS.CAL_CREATE) return { text:"", ok:false };
+    const ws = CALLS.get(currentTrace.callSid);
+    if (!URLS.CAL_CREATE) return { ok:false };
+
+    // Single-booking guarantee: if this hour already confirmed for this call, do not create again
+    if (ws?.__confirmedBooking) {
+      const b = ws.__confirmedBooking;
+      if (b?.start_utc && b.start_utc === asUTC(adjustWindowToIntent({startISO,endISO},BIZ_TZ,LAST_UTTERANCE).start_utc)) {
+        return { ok:true, already:true, data:b, message:"already booked; details confirmed" };
+      }
+    }
+
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
-
-      if (!withinBizHours(startISO, BIZ_TZ)) {
-        // proceed; backend can refuse if needed
-      }
-
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
+
+      // Soft-hours check (let backend decide final)
+      if (!withinBizHours(win.start_utc, BIZ_TZ)) { /* proceed */ }
+
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
@@ -598,13 +604,57 @@ const Tools = {
         timeout:12000, tag:"CAL_CREATE",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
-      return { data, ok:true };
-    } catch(e){ return { text:"", ok:false }; }
+
+      const booked = {
+        event_id: data?.event_id,
+        start_local: data?.start_local || payload.Start_Time_Local,
+        end_local:   data?.end_local   || payload.End_Time_Local,
+        start_utc:   data?.start_utc   || payload.Start_Time_UTC,
+        end_utc:     data?.end_utc     || payload.End_Time_UTC,
+        timezone:    data?.timezone    || BIZ_TZ,
+        service
+      };
+      if (ws) ws.__confirmedBooking = booked;
+      return { ok:true, data: booked };
+    } catch(e){
+      // If backend says "not available", verify it isn't already booked by this caller for this hour
+      const status = e.response?.status || 0;
+      const body = e.response?.data && JSON.stringify(e.response.data) || "";
+      if (status === 400 && /not available/i.test(body)) {
+        try {
+          const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
+          const readPayload = {
+            intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
+            window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
+            contact_name: name || undefined,
+            contact_phone: (phone||CURRENT_FROM||"") || undefined
+          };
+          const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
+            trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+          const ev = (r?.events||[]).find(ev => ev.start_utc === win.start_utc);
+          if (ev) {
+            const ws = CALLS.get(currentTrace.callSid);
+            const booked = {
+              event_id: ev.event_id,
+              start_local: ev.start_local,
+              end_local:   ev.end_local,
+              start_utc:   ev.start_utc,
+              end_utc:     ev.end_utc,
+              timezone:    ev.timezone || BIZ_TZ,
+              service
+            };
+            if (ws) ws.__confirmedBooking = booked;
+            return { ok:true, already:true, data: booked, message:"already booked; confirming details" };
+          }
+        } catch {}
+      }
+      return { ok:false, error:"create_failed" };
+    }
   },
 
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
-    if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { text:"", ok:false };
+    if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { ok:false };
 
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
@@ -655,9 +705,14 @@ const Tools = {
       }, { timeout:12000, tag:"CAL_DELETE", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
+
+      // clear single-booking locker if same event
+      const ws = CALLS.get(currentTrace.callSid);
+      if (ws?.__confirmedBooking?.event_id === id) ws.__confirmedBooking = null;
+
       return { ok, data };
-    } catch(e) {
-      return { text:"", ok:false };
+    } catch {
+      return { ok:false };
     }
   },
 
@@ -695,13 +750,13 @@ const Tools = {
 
   async lead_upsert({ name, phone, intent, notes }) {
     console.log("[TOOL] lead_upsert]", { name, intent });
-    if (!URLS.LEAD_UPSERT) return { text:"" };
+    if (!URLS.LEAD_UPSERT) return {};
     try {
       const { data } = await httpPost(URLS.LEAD_UPSERT,
         { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes },
         { timeout: 8000, tag:"LEAD_UPSERT", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
-    } catch { return { text:"" }; }
+    } catch { return {}; }
   },
 
   async faq({ topic, service }) {
@@ -718,7 +773,7 @@ const Tools = {
   async transfer({ reason, callSid }) {
     console.log("[TOOL] transfer", { reason, callSid, owner: OWNER_PHONE });
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) {
-      return { text:"" };
+      return {};
     }
     try {
       const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
@@ -731,8 +786,8 @@ const Tools = {
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         trace:{ callSid, convoId: currentTrace.convoId }
       });
-      return { text:"" };
-    } catch { return { text:"" }; }
+      return {};
+    } catch { return {}; }
   },
 
   async end_call({ callSid, reason }) {
@@ -756,7 +811,7 @@ const Tools = {
     } catch (e) {
       console.warn("[end_call] hangup error", e.message);
     }
-    return { text:"" };
+    return {};
   }
 };
 
@@ -775,7 +830,7 @@ const toolSchema = [
   }},
   { type:"function", function:{
       name:"book_appointment",
-      description:"Create a calendar event.",
+      description:"Create a calendar event. Single-booking guarantee prevents duplicates in the same hour for this caller.",
       parameters:{ type:"object", properties:{
         name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
         startISO:{type:"string"}, endISO:{type:"string"}, notes:{type:"string"}
@@ -887,7 +942,6 @@ async function verifyHourAvailability({ text, replyText }) {
   const dateISO = resolveRelativeDateFromText(text, BIZ_TZ);
   if (!dateISO) return null;
 
-  // Build a neutral 1h window at midnight UTC; adjustWindowToIntent will shift to LAST_TIME_HINT hour
   const startISO = new Date(`${dateISO}T00:00:00Z`).toISOString();
   const endISO   = new Date(`${dateISO}T01:00:00Z`).toISOString();
 
@@ -912,7 +966,7 @@ if (!wss.__victory_handler_attached) {
     console.log("[WS] connection from Twilio]");
     let dg = null;
     let pendingULaw = [];
-    const BATCH = 6; // ~120ms @ 8kHz (lower than 10 for faster ASR upstream)
+    const BATCH = 6;
     let tailTimer = null;
     let lastMediaLog = 0;
 
@@ -942,6 +996,10 @@ if (!wss.__victory_handler_attached) {
     // Graceful hangup window
     ws.__hangTimer = null;
     ws.__pendingHangupUntil = 0;
+
+    // Memory and booking-lock
+    ws.__mem = newMemory();
+    ws.__confirmedBooking = null; // single-booking locker
 
     // Heartbeat
     const hb = setInterval(() => {
@@ -989,43 +1047,14 @@ if (!wss.__victory_handler_attached) {
       ws.__postedLog = true;
 
       const trace = { convoId: ws.__convoId || "", callSid: ws.__callSid || "", from: ws.__from || "" };
-
       const transcriptArr = ws.__mem?.transcript || [];
       const transcriptText = transcriptArr.map(t => `${t.from}: ${t.text}`).join("\n");
+      const payload = { biz:DASH_BIZ, source:DASH_SOURCE, ...trace, summary: ws.__mem?.summary || "", transcript: transcriptText, ended_reason: reason || "" };
 
-      const payload = {
-        biz: DASH_BIZ,
-        source: DASH_SOURCE,
-        convoId: trace.convoId,
-        callSid: trace.callSid,
-        from: trace.from,
-        summary: ws.__mem?.summary || "",
-        transcript: transcriptText,
-        ended_reason: reason || ""
-      };
-
-      try {
-        if (URLS.CALL_LOG) {
-          await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace });
-        } else {
-          console.warn("[CALL_LOG] URL missing");
-        }
-      } catch {}
-
-      try {
-        if (URLS.CALL_SUMMARY) {
-          await httpPost(URLS.CALL_SUMMARY, payload, {
-            timeout: 8000, tag:"CALL_SUMMARY", trace
-          });
-        } else {
-          console.warn("[CALL_SUMMARY] URL missing");
-        }
-      } catch {}
+      try { if (URLS.CALL_LOG) await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace }); } catch {}
+      try { if (URLS.CALL_SUMMARY) await httpPost(URLS.CALL_SUMMARY, payload, { timeout: 8000, tag:"CALL_SUMMARY", trace }); } catch {}
     }
 
-    ws.__mem = newMemory();
-
-    // === Tool-call resolver ===
     async function resolveToolChain(baseMessages) {
       let messages = baseMessages.slice();
       for (let hops = 0; hops < 8; hops++) {
@@ -1041,9 +1070,9 @@ if (!wss.__victory_handler_attached) {
 
           console.log("[TOOL] call ->", name, args);
           const impl = Tools[name];
-          let toolResult = { text:"" };
-          try { toolResult = await (impl ? impl(args) : { text:"" }); }
-          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = { text:"" }; }
+          let toolResult = {};
+          try { toolResult = await (impl ? impl(args) : {}); }
+          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = {}; }
 
           messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
 
@@ -1055,6 +1084,30 @@ if (!wss.__victory_handler_attached) {
         }
       }
       return "";
+    }
+
+    async function handleTurn(ws, userText) {
+      if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
+      console.log("[TURN] user >", userText);
+
+      const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
+      let finalText = await resolveToolChain(messages);
+
+      // If the model denied a requested time, re-verify that hour and correct if free
+      const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
+      if (corrected) finalText = corrected;
+
+      if (finalText) {
+        await say(ws, finalText);
+        remember(ws.__mem, "bot", finalText);
+      }
+
+      if (ws.__closing && !ws.__saidFarewell) {
+        ws.__saidFarewell = true;
+        scheduleHangup(2500);
+      }
+
+      await updateSummary(ws.__mem);
     }
 
     ws.on("message", async raw => {
@@ -1089,7 +1142,6 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // assign to outer dg, pass wsRef for interim timestamps
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
@@ -1103,10 +1155,6 @@ if (!wss.__victory_handler_attached) {
             LAST_UTTERANCE = text;
             const tHint = parseUserTime(text);
             if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
-
-            if (/^\s*this\s+number\b/i.test(text) && ws.__from) {
-              ws.__mem.entities.phone = ws.__from;
-            }
 
             const looksPartial = (() => {
               const s = text.trim().toLowerCase();
@@ -1172,7 +1220,7 @@ if (!wss.__victory_handler_attached) {
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 80); // faster tail flush (was 120)
+        tailTimer = setTimeout(flushULaw, 80);
         return;
       }
 
@@ -1195,31 +1243,6 @@ if (!wss.__victory_handler_attached) {
       await postCallLogOnce(ws, "socket close");
       console.log("[WS] closed", { convoId: ws.__convoId });
     });
-
-    async function handleTurn(ws, userText) {
-      if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
-      console.log("[TURN] user >", userText);
-
-      const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-
-      let finalText = await resolveToolChain(messages);
-
-      // NEW: if the model denied a requested time, verify that hour and correct if free
-      const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
-      if (corrected) finalText = corrected;
-
-      if (finalText) {
-        await say(ws, finalText);
-        remember(ws.__mem, "bot", finalText);
-      }
-
-      if (ws.__closing && !ws.__saidFarewell) {
-        ws.__saidFarewell = true;
-        scheduleHangup(2500);
-      }
-
-      await updateSummary(ws.__mem);
-    }
   });
 }
 
@@ -1248,7 +1271,8 @@ async function updateSummary(mem) {
 }
 
 /* ===== Notes =====
-- Auto-verify: when the model says a caller’s requested hour is “not available,” we confirm via read_availability and correct if free.
-- Faster, but polite: lower QUIET_MS + timeout, faster Deepgram endpointing, smaller μ-law batch + faster tail flush.
-- Readbacks sound natural (single sentence), not like a checklist.
+- Single-booking guarantee: prevents duplicate creates for the same hour; verifies "already booked" on backend conflict.
+- Exact-hour verification: if model says “unavailable,” double-check that hour and correct if free.
+- Faster, polite latency: lowered QUIET_MS/timeout, endpointing 900ms, small μ-law batches.
+- Natural readbacks: single-sentence confirmations, no list tone.
 */
