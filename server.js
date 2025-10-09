@@ -5,6 +5,7 @@
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
    - Guard rails: blocks cancel-before-book on reschedules; injects exact availability check
+   - Pin-to-checked-slot, hard de-dupe, ASR debounce/merge, auto-hangup
 */
 
 import express from "express";
@@ -246,6 +247,15 @@ function withinBizHours(iso, tz){
   return nowMin >= startMin && nowMin < endMin;
 }
 
+/* Validate ISO hour/minute */
+function isValidISOHour(iso) {
+  const d = new Date(iso); if (isNaN(d)) return false;
+  const m = String(iso).match(/T(\d{2}):(\d{2}):/);
+  if (!m) return true;
+  const hh = +m[1], mm = +m[2];
+  return hh >= 0 && hh < 24 && mm >= 0 && mm < 60;
+}
+
 /* ===== Minimal Memory ===== */
 function newMemory() {
   return {
@@ -324,12 +334,75 @@ let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 let LAST_UTTERANCE = "";
 
+/* ===== Request-slot parser & guard ===== */
+function parseRequestedSlot(text, tz) {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  const today = todayISOInTZ(tz);
+  let baseDateISO = today;
+
+  if (/\btomorrow\b/.test(t)) baseDateISO = addDaysISO(today, 1);
+  else if (/\btoday\b/.test(t)) baseDateISO = today;
+  else {
+    const m = t.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (m) baseDateISO = `${m[1]}-${m[2]}-${m[3]}`;
+  }
+
+  // time (simple patterns)
+  const timeRe = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?/i;
+  const m2 = t.match(timeRe);
+  if (!m2) return null;
+  let hour = parseInt(m2[1],10);
+  let minute = m2[2] ? parseInt(m2[2],10) : 0;
+  const ampm = (m2[3]||"").replace(/\./g,"").toLowerCase();
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour === 12) hour = 0;
+
+  const pad = (n)=> String(n).padStart(2,"0");
+  const startISO = `${baseDateISO}T${pad(hour)}:${pad(minute)}:00${offsetForTZ(tz)}`;
+  const endISO   = `${baseDateISO}T${pad(Math.min(hour+1,23))}:${pad(minute)}:00${offsetForTZ(tz)}`;
+  return { dateISO: baseDateISO, startISO, endISO };
+}
+
+// Static offset helper (uses current offset; acceptable for intra-day scheduling)
+function offsetForTZ(tz){
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
+  const parts = fmt.formatToParts(now);
+  const off = parts.find(p=>p.type==='timeZoneName')?.value || 'GMT-04:00';
+  const m = off.match(/GMT([+-]\d{2}:\d{2})/);
+  return m ? m[1] : '-04:00';
+}
+
+async function ensureExactAvailabilityInjected(ws, messages, userText){
+  const slot = parseRequestedSlot(userText, BIZ_TZ);
+  if (!slot) return messages;
+  const key = `${slot.startISO}__${slot.endISO}`;
+  if (ws.__checkedWindows?.has(key)) return messages;
+  try {
+    const res = await Tools.read_availability(slot);
+    ws.__checkedWindows = ws.__checkedWindows || new Set();
+    ws.__checkedWindows.add(key);
+    const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify(slot) } }] };
+    const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
+    return [...messages, synthetic, toolMsg];
+  } catch {
+    return messages;
+  }
+}
+
 const Tools = {
   // Exact-window availability. No contact filter. No hidden time shifting.
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
+      // guard invalid hours from model
+      if ((startISO && !isValidISOHour(startISO)) || (endISO && !isValidISOHour(endISO))) {
+        console.warn("[TOOLS] invalid ISO; ignoring model window");
+        startISO = endISO = undefined;
+      }
+
       let windowObj;
       if (startISO && endISO) {
         windowObj = {
@@ -363,6 +436,15 @@ const Tools = {
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
 
+      // pin this checked slot (for hour-drift protection)
+      const ws = CALLS.get(currentTrace.callSid);
+      if (ws && windowObj.start_utc && windowObj.end_utc) {
+        ws.__lastCheckedSlot = {
+          startISO: windowObj.start_utc,
+          endISO:   windowObj.end_utc
+        };
+      }
+
       return { data: { ...data, events }, summary };
     } catch { return { summary:{ busy:false, free:true } }; }
   },
@@ -373,7 +455,25 @@ const Tools = {
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
-    // Single-booking guard for this call hour
+    // If model hour differs from last read_availability, override to that exact checked slot
+    if (ws?.__lastCheckedSlot) {
+      const wantStartUTC = asUTC(startISO);
+      const last = ws.__lastCheckedSlot;
+      const delta = Math.abs(new Date(wantStartUTC) - new Date(last.startISO));
+      if (isFinite(delta) && delta > 5 * 60 * 1000) {
+        startISO = last.startISO; // already UTC
+        endISO   = last.endISO;   // already UTC
+      }
+    }
+
+    // Hard de-dupe within 60s for the same hour
+    if (ws?.__lastBookedStartUTC && ws?.__lastBookedAt) {
+      const sameHour = ws.__lastBookedStartUTC === asUTC(startISO);
+      const recent   = (Date.now() - ws.__lastBookedAt) < 60_000;
+      if (sameHour && recent) return { ok:true, already:true, message:"dedup: already booked", data: ws.__confirmedBooking };
+    }
+
+    // Single-booking guard for this call hour (session level)
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
       if (b?.start_utc && b.start_utc === asUTC(startISO)) {
@@ -415,7 +515,11 @@ const Tools = {
         timezone:    data?.timezone    || BIZ_TZ,
         service
       };
-      if (ws) ws.__confirmedBooking = booked;
+      if (ws) {
+        ws.__confirmedBooking = booked;
+        ws.__lastBookedAt = Date.now();
+        ws.__lastBookedStartUTC = booked.start_utc;
+      }
       return { ok:true, data: booked };
     } catch(e){
       // On conflict, verify if already booked for this caller and hour
@@ -437,7 +541,6 @@ const Tools = {
             trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
           const ev = (r?.events||[]).find(ev => ev.start_utc === asUTC(startISO));
           if (ev) {
-            const ws = CALLS.get(currentTrace.callSid);
             const booked = {
               event_id: ev.event_id,
               start_local: ev.start_local,
@@ -447,7 +550,11 @@ const Tools = {
               timezone:    ev.timezone || BIZ_TZ,
               service
             };
-            if (ws) ws.__confirmedBooking = booked;
+            if (ws) {
+              ws.__confirmedBooking = booked;
+              ws.__lastBookedAt = Date.now();
+              ws.__lastBookedStartUTC = booked.start_utc;
+            }
             return { ok:true, already:true, data: booked, message:"already booked; confirming details" };
           }
         } catch {}
@@ -726,66 +833,6 @@ function buildMessages(mem, userText, tenantPrompt) {
   return [...sys, ...history, { role:"user", content:userText }];
 }
 
-/* ===== Request-slot parser & guard ===== */
-function parseRequestedSlot(text, tz) {
-  if (!text) return null;
-  const t = text.toLowerCase();
-  const today = todayISOInTZ(tz);
-  let baseDateISO = today;
-
-  // day keywords
-  if (/\btomorrow\b/.test(t)) baseDateISO = addDaysISO(today, 1);
-  else if (/\btoday\b/.test(t)) baseDateISO = today;
-  else {
-    const m = t.match(/(\d{4})-(\d{2})-(\d{2})/);
-    if (m) baseDateISO = `${m[1]}-${m[2]}-${m[3]}`;
-  }
-
-  // time (simple patterns)
-  const timeRe = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?/i;
-  const m2 = t.match(timeRe);
-  if (!m2) return null;
-  let hour = parseInt(m2[1],10);
-  let minute = m2[2] ? parseInt(m2[2],10) : 0;
-  const ampm = (m2[3]||"").replace(/\./g,"").toLowerCase();
-  if (ampm === "pm" && hour < 12) hour += 12;
-  if (ampm === "am" && hour === 12) hour = 0;
-  if (!ampm && hour <= 7) { /* ambiguous early number -> assume pm? keep as-is to avoid shift */ }
-
-  const pad = (n)=> String(n).padStart(2,"0");
-  const startISO = `${baseDateISO}T${pad(hour)}:${pad(minute)}:00${offsetForTZ(tz)}`;
-  const endISO   = `${baseDateISO}T${pad(Math.min(hour+1,23))}:${pad(minute)}:00${offsetForTZ(tz)}`;
-  return { dateISO: baseDateISO, startISO, endISO };
-}
-
-// Static offset helper (uses current offset; acceptable for intra-day scheduling)
-function offsetForTZ(tz){
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
-  const parts = fmt.formatToParts(now);
-  const off = parts.find(p=>p.type==='timeZoneName')?.value || 'GMT-04:00';
-  const m = off.match(/GMT([+-]\d{2}:\d{2})/);
-  return m ? m[1] : '-04:00';
-}
-
-async function ensureExactAvailabilityInjected(ws, messages, userText){
-  const slot = parseRequestedSlot(userText, BIZ_TZ);
-  if (!slot) return messages;
-  const key = `${slot.startISO}__${slot.endISO}`;
-  if (ws.__checkedWindows?.has(key)) return messages;
-  try {
-    const res = await Tools.read_availability(slot);
-    ws.__checkedWindows = ws.__checkedWindows || new Set();
-    ws.__checkedWindows.add(key);
-    // Push a synthetic tool result so the model can see the availability before responding
-    const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify(slot) } }] };
-    const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
-    return [...messages, synthetic, toolMsg];
-  } catch {
-    return messages;
-  }
-}
-
 /* ===== WS wiring ===== */
 function newSummaryPromptText(mem){
   return mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
@@ -856,6 +903,13 @@ if (!wss.__victory_handler_attached) {
     ws.__mem = newMemory();
     ws.__confirmedBooking = null;
     ws.__rescheduleRequested = false;
+
+    // Last *checked* availability slot
+    ws.__lastCheckedSlot = null;
+
+    // De-dupe booking
+    ws.__lastBookedAt = 0;
+    ws.__lastBookedStartUTC = "";
 
     // Heartbeat
     const hb = setInterval(() => {
@@ -928,7 +982,7 @@ if (!wss.__victory_handler_attached) {
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-          // Track if model indicates reschedule intent
+          // Track reschedule intent
           if (ws.__lastUserText && /resched|move|change.*(time|appt|appointment)/i.test(ws.__lastUserText)) {
             ws.__rescheduleRequested = true;
           }
@@ -962,6 +1016,15 @@ if (!wss.__victory_handler_attached) {
       if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
       console.log("[TURN] user >", userText);
 
+      // User explicit "done" → immediate goodbye & hangup
+      const doneIntent = /(?:that'?ll be it|that is all|that'?s all|nothing else|we'?re done|we are done|bye|goodbye|hang up|end the call)/i;
+      if (doneIntent.test(userText)) {
+        await say(ws, "Got it. Thanks for calling—goodbye.");
+        remember(ws.__mem, "bot", "Got it. Thanks for calling—goodbye.");
+        await Tools.end_call({ callSid: ws.__callSid, reason: "user_done" });
+        return;
+      }
+
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
       const finalText = await resolveToolChain(messages);
 
@@ -970,13 +1033,17 @@ if (!wss.__victory_handler_attached) {
         remember(ws.__mem, "bot", finalText);
       }
 
+      // Auto-hangup if the bot just said goodbye
+      if (/(?:goodbye|thanks.*(calling|time)|talk to you (later|soon)|have a (great|good) (day|one))\b/i.test(finalText || "")) {
+        ws.__saidFarewell = true;
+        ws.__closing = true;
+        scheduleHangup(1800);
+      }
+
       if (ws.__closing && !ws.__saidFarewell) {
         ws.__saidFarewell = true;
         scheduleHangup(2500);
       }
-
-      // Summaries only on stop/close (avoid mid-call drift)
-      // await updateSummary(ws.__mem);
     }
 
     ws.on("message", async raw => {
@@ -1011,35 +1078,43 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
+        // ASR with debounce/merge of finals
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
-            if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-              console.log("[TURN] dropped duplicate final");
-              return;
-            }
-            ws.__lastUserText = text;
-            ws.__lastUserAt = now;
 
-            LAST_UTTERANCE = text;
+            // Debounce/merge quick successive finals (fragment then completion)
+            if (ws.__debounceTimer) clearTimeout(ws.__debounceTimer);
+            const looksIncomplete = text.split(/\s+/).length < 6 || /(?:to|for|at|on|in|with|about)$/i.test(text);
+            ws.__pendingFinal = ws.__pendingFinal ? (ws.__pendingFinal + " " + text) : text;
 
-            if (ws.__handling) {
-              ws.__queuedTurn = text;
-              return;
-            }
-            ws.__handling = true;
-            remember(ws.__mem, "user", text);
-            await handleTurn(ws, text);
-            ws.__handling = false;
+            const delay = looksIncomplete ? 500 : 250;
+            ws.__debounceTimer = setTimeout(async () => {
+              const finalText = (ws.__pendingFinal || "").trim();
+              ws.__pendingFinal = "";
 
-            if (ws.__queuedTurn) {
-              const next = ws.__queuedTurn;
-              ws.__queuedTurn = null;
+              const now2 = Date.now();
+              if (finalText === ws.__lastUserText && (now2 - ws.__lastUserAt) < 1500) {
+                console.log("[TURN] dropped duplicate final");
+                return;
+              }
+              ws.__lastUserText = finalText;
+              ws.__lastUserAt = now2;
+
+              LAST_UTTERANCE = finalText;
+
+              if (ws.__handling) { ws.__queuedTurn = finalText; return; }
               ws.__handling = true;
-              remember(ws.__mem, "user", next);
-              await handleTurn(ws, next);
+              remember(ws.__mem, "user", finalText);
+              await handleTurn(ws, finalText);
               ws.__handling = false;
-            }
+
+              if (ws.__queuedTurn) {
+                const next = ws.__queuedTurn; ws.__queuedTurn = null;
+                ws.__handling = true; remember(ws.__mem, "user", next);
+                await handleTurn(ws, next); ws.__handling = false;
+              }
+            }, delay);
           },
           wsRef: ws
         });
@@ -1139,7 +1214,11 @@ function startDeepgram({ onFinal, wsRef }) {
 - Strict time: no auto “intent” hour shifting. Tools book the exact window provided.
 - Exact availability guard: before every model reply, we inject a read for the user’s requested window (if any).
 - Reschedule safety: cancel is blocked until a new booking is confirmed.
-- TTS: phones and numbers are left as numerals to keep speech clear.
+- Pin-to-checked-slot stops 2 PM drift after a 10 AM check.
+- De-dupe prevents double-create if the model retries within 60 seconds.
+- ASR debounce merges split finals and reduces “didn’t get that.”
+- Auto-hangup triggers on caller “done” or bot goodbye.
+- TTS leaves numerals intact for clarity.
 - Single WebSocketServer guard prevents redeclare crashes on hot restarts.
-- Summaries are generated on stop/close only to reduce drift & cost.
+- Summaries are generated on stop/close only.
 */
