@@ -416,31 +416,58 @@ function startDeepgram({ onFinal, wsRef }) {
 const QUIET_MS = 500;          // required silence before TTS
 const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency
 
-function cleanTTS(s=""){
-  // also make long digit groups speakable
-  const spacedDigits = (t) => t.replace(/\b\d{5,}\b/g, m => m.split("").join(" "));
-  return spacedDigits(
-    String(s)
-      .replace(/\*\*(.*?)\*\*/g, "$1")
-      .replace(/`{1,3}[^`]*`{1,3}/g, "")
-      .replace(/^-+\s*/gm, "")
-      .replace(/^\d+\.\s*/gm, "")
-      .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
-      .replace(/^#{1,6}\s*/gm, "")
-      .replace(/\s{2,}/g, " ")
-      .replace(/\n{2,}/g, ". ")
-      .replace(/\n/g, ", ")
-      .trim()
+/* === Improved number/phone speaking === */
+const DIGIT_WORD = { "0":"zero","1":"one","2":"two","3":"three","4":"four","5":"five","6":"six","7":"seven","8":"eight","9":"nine" };
+
+function digitsToWords(d) {
+  const words = d.split("").map(ch => DIGIT_WORD[ch] ?? ch);
+  if (d.length === 10) return `${words.slice(0,3).join(" ")} , ${words.slice(3,6).join(" ")} , ${words.slice(6).join(" ")}`;
+  if (d.length === 11 && d[0] === "1") return `one , ${words.slice(1,4).join(" ")} , ${words.slice(4,7).join(" ")} , ${words.slice(7).join(" ")}`;
+  return words.map((w,i)=> ((i>0 && i%4===0) ? `, ${w}` : w)).join(" ");
+}
+
+function phoneToWords(raw="") {
+  const s = (raw||"").replace(/[^\dxX+]/g,"").replace(/^(\+?1)(?=\d{10}\b)/, "1");
+  const m = s.match(/^(1)?(\d{3})(\d{3})(\d{4})(?:[xX](\d{2,6}))?$/);
+  if (!m) return null;
+  const [, c, a, b, c4, ext] = m;
+  const core = digitsToWords(`${c||""}${a}${b}${c4}`);
+  return ext ? `${core} , extension ${digitsToWords(ext)}` : core;
+}
+
+function normalizeNumbersForSpeech(text="") {
+  text = text.replace(
+    /(?:\+?1[\s-\.]?)?\(?\d{3}\)?[\s-\.]?\d{3}[\s-\.]?\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{2,6})?/gi,
+    (m) => phoneToWords(m) || m
   );
+  text = text.replace(/\b\d{5,}\b/g, (m) => digitsToWords(m));
+  return text;
+}
+
+function cleanTTS(s=""){
+  const base = String(s)
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+    .replace(/^-+\s*/gm, "")
+    .replace(/^\d+\.\s*/gm, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, ", ")
+    .trim();
+  return normalizeNumbersForSpeech(base);
 }
 function formatPhoneForSpeech(s=""){
-  const d = (s||"").replace(/\D+/g,"");
-  if (d.length >= 10) {
-    const ds = d.slice(-10);
-    return `(${ds.slice(0,3)}) ${ds.slice(3,6)}-${ds.slice(6)}`;
+  const only = (s||"").replace(/\D+/g,"");
+  if (only.length >= 10) {
+    const last10 = only.slice(-10);
+    const withCC  = (only.length===11 && only[0]==="1") ? `1${last10}` : last10;
+    return phoneToWords(withCC) || digitsToWords(withCC);
   }
-  return s;
+  return normalizeNumbersForSpeech(s);
 }
+
 function compressReadback(text=""){
   const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Location|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 2) {
