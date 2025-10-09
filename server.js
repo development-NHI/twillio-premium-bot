@@ -4,6 +4,7 @@
    - Natural readback with plain numerals (no digit spelling)
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
+   - Guard rails: blocks cancel-before-book on reschedules; injects exact availability check
 */
 
 import express from "express";
@@ -459,6 +460,12 @@ const Tools = {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { ok:false };
 
+    // Guard: if a reschedule is in-flight and no confirmed booking yet, block cancel to avoid orphaning
+    const ws = CALLS.get(currentTrace.callSid);
+    if (ws?.__rescheduleRequested && !ws?.__confirmedBooking) {
+      return { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
+    }
+
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
     try {
@@ -506,7 +513,6 @@ const Tools = {
 
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
 
-      const ws = CALLS.get(currentTrace.callSid);
       if (ws?.__confirmedBooking?.event_id === id) ws.__confirmedBooking = null;
 
       return { ok, data };
@@ -720,6 +726,66 @@ function buildMessages(mem, userText, tenantPrompt) {
   return [...sys, ...history, { role:"user", content:userText }];
 }
 
+/* ===== Request-slot parser & guard ===== */
+function parseRequestedSlot(text, tz) {
+  if (!text) return null;
+  const t = text.toLowerCase();
+  const today = todayISOInTZ(tz);
+  let baseDateISO = today;
+
+  // day keywords
+  if (/\btomorrow\b/.test(t)) baseDateISO = addDaysISO(today, 1);
+  else if (/\btoday\b/.test(t)) baseDateISO = today;
+  else {
+    const m = t.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (m) baseDateISO = `${m[1]}-${m[2]}-${m[3]}`;
+  }
+
+  // time (simple patterns)
+  const timeRe = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?/i;
+  const m2 = t.match(timeRe);
+  if (!m2) return null;
+  let hour = parseInt(m2[1],10);
+  let minute = m2[2] ? parseInt(m2[2],10) : 0;
+  const ampm = (m2[3]||"").replace(/\./g,"").toLowerCase();
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour === 12) hour = 0;
+  if (!ampm && hour <= 7) { /* ambiguous early number -> assume pm? keep as-is to avoid shift */ }
+
+  const pad = (n)=> String(n).padStart(2,"0");
+  const startISO = `${baseDateISO}T${pad(hour)}:${pad(minute)}:00${offsetForTZ(tz)}`;
+  const endISO   = `${baseDateISO}T${pad(Math.min(hour+1,23))}:${pad(minute)}:00${offsetForTZ(tz)}`;
+  return { dateISO: baseDateISO, startISO, endISO };
+}
+
+// Static offset helper (uses current offset; acceptable for intra-day scheduling)
+function offsetForTZ(tz){
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
+  const parts = fmt.formatToParts(now);
+  const off = parts.find(p=>p.type==='timeZoneName')?.value || 'GMT-04:00';
+  const m = off.match(/GMT([+-]\d{2}:\d{2})/);
+  return m ? m[1] : '-04:00';
+}
+
+async function ensureExactAvailabilityInjected(ws, messages, userText){
+  const slot = parseRequestedSlot(userText, BIZ_TZ);
+  if (!slot) return messages;
+  const key = `${slot.startISO}__${slot.endISO}`;
+  if (ws.__checkedWindows?.has(key)) return messages;
+  try {
+    const res = await Tools.read_availability(slot);
+    ws.__checkedWindows = ws.__checkedWindows || new Set();
+    ws.__checkedWindows.add(key);
+    // Push a synthetic tool result so the model can see the availability before responding
+    const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify(slot) } }] };
+    const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
+    return [...messages, synthetic, toolMsg];
+  } catch {
+    return messages;
+  }
+}
+
 /* ===== WS wiring ===== */
 function newSummaryPromptText(mem){
   return mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
@@ -789,6 +855,7 @@ if (!wss.__victory_handler_attached) {
     // Memory and booking-lock
     ws.__mem = newMemory();
     ws.__confirmedBooking = null;
+    ws.__rescheduleRequested = false;
 
     // Heartbeat
     const hb = setInterval(() => {
@@ -846,6 +913,10 @@ if (!wss.__victory_handler_attached) {
 
     async function resolveToolChain(baseMessages) {
       let messages = baseMessages.slice();
+
+      // Inject exact-window availability for this turn if user asked for a concrete time
+      messages = await ensureExactAvailabilityInjected(ws, messages, ws.__lastUserText || "");
+
       for (let hops = 0; hops < 8; hops++) {
         const choice = await openaiChat(messages);
         const msg = choice?.message || {};
@@ -856,6 +927,18 @@ if (!wss.__victory_handler_attached) {
           let args = {};
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+
+          // Track if model indicates reschedule intent
+          if (ws.__lastUserText && /resched|move|change.*(time|appt|appointment)/i.test(ws.__lastUserText)) {
+            ws.__rescheduleRequested = true;
+          }
+
+          // Guard: block cancel-before-book when rescheduling
+          if (name === "cancel_appointment" && ws.__rescheduleRequested && !ws.__confirmedBooking) {
+            const toolResult = { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
+            messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
+            continue;
+          }
 
           console.log("[TOOL] call ->", name, args);
           const impl = Tools[name];
@@ -892,7 +975,8 @@ if (!wss.__victory_handler_attached) {
         scheduleHangup(2500);
       }
 
-      await updateSummary(ws.__mem);
+      // Summaries only on stop/close (avoid mid-call drift)
+      // await updateSummary(ws.__mem);
     }
 
     ws.on("message", async raw => {
@@ -963,6 +1047,7 @@ if (!wss.__victory_handler_attached) {
         ws.__dg = dg;
 
         ws.__handling = true;
+        remember(ws.__mem, "user", "<CALL_START>");
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
 
@@ -986,6 +1071,7 @@ if (!wss.__victory_handler_attached) {
         ws.__stopSeenAt = Date.now();
         try { flushULaw(); } catch {}
         try { dg?.close(); } catch {}
+        await updateSummary(ws.__mem);
         await postCallLogOnce(ws, "twilio stop");
         try { ws.close(); } catch {}
         return;
@@ -996,6 +1082,7 @@ if (!wss.__victory_handler_attached) {
       try { dg?.close(); } catch {}
       clearHangTimer();
       clearInterval(hb);
+      await updateSummary(ws.__mem);
       await postCallLogOnce(ws, "socket close");
       console.log("[WS] closed", { convoId: ws.__convoId });
     });
@@ -1050,7 +1137,9 @@ function startDeepgram({ onFinal, wsRef }) {
 
 /* ===== Notes =====
 - Strict time: no auto “intent” hour shifting. Tools book the exact window provided.
-- Availability checks must target the requested window before denying it.
+- Exact availability guard: before every model reply, we inject a read for the user’s requested window (if any).
+- Reschedule safety: cancel is blocked until a new booking is confirmed.
 - TTS: phones and numbers are left as numerals to keep speech clear.
 - Single WebSocketServer guard prevents redeclare crashes on hot restarts.
+- Summaries are generated on stop/close only to reduce drift & cost.
 */
