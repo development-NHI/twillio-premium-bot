@@ -417,17 +417,21 @@ const QUIET_MS = 500;          // required silence before TTS
 const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency
 
 function cleanTTS(s=""){
-  return String(s)
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/`{1,3}[^`]*`{1,3}/g, "")
-    .replace(/^-+\s*/gm, "")
-    .replace(/^\d+\.\s*/gm, "")
-    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
-    .replace(/^#{1,6}\s*/gm, "")
-    .replace(/\s{2,}/g, " ")
-    .replace(/\n{2,}/g, ". ")
-    .replace(/\n/g, ", ")
-    .trim();
+  // also make long digit groups speakable
+  const spacedDigits = (t) => t.replace(/\b\d{5,}\b/g, m => m.split("").join(" "));
+  return spacedDigits(
+    String(s)
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/`{1,3}[^`]*`{1,3}/g, "")
+      .replace(/^-+\s*/gm, "")
+      .replace(/^\d+\.\s*/gm, "")
+      .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+      .replace(/^#{1,6}\s*/gm, "")
+      .replace(/\s{2,}/g, " ")
+      .replace(/\n{2,}/g, ". ")
+      .replace(/\n/g, ", ")
+      .trim()
+  );
 }
 function formatPhoneForSpeech(s=""){
   const d = (s||"").replace(/\D+/g,"");
