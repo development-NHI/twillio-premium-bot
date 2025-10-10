@@ -1,7 +1,8 @@
 /* server.js — Prompt-driven, tool-called voice agent (strict-time + clean-TTS)
+   - All replies are LLM-generated (no hardcoded speaks)
    - No hidden time shifting: books exactly the hour passed to tools
    - Targeted availability checks use the exact window requested
-   - Natural readback with plain numerals (no digit spelling)
+   - Natural readback with plain numerals, improved digit articulation
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
    - Guard rails: blocks cancel-before-book on reschedules; injects exact availability check
@@ -29,8 +30,8 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 /* Twilio (transfer + hangup) */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional outbound callerId
-const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transfer target
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
+const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
 
 /* Business / routing identifiers */
 const DASH_BIZ    = process.env.DASH_BIZ || "";
@@ -40,10 +41,10 @@ const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
 /* Optional env-driven hours gate */
-const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
-const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "17:00";
+const BIZ_HOURS_START = process.env.BIZ_HOURS_START || "";
+const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "";
 
-/* External endpoints (Replit-first, then DASH_* fallback) */
+/* External endpoints */
 const URLS = {
   CAL_READ:     process.env.REPLIT_READ_URL     || process.env.DASH_CAL_READ_URL     || "",
   CAL_CREATE:   process.env.REPLIT_CREATE_URL   || process.env.DASH_CAL_CREATE_URL   || "",
@@ -269,8 +270,8 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 const CALLS = new Map(); // callSid => ws
 
 /* ===== TTS helpers ===== */
-const QUIET_MS = 500;          // softened barge-in
-const QUIET_TIMEOUT_MS = 1200; // longer cap
+const QUIET_MS = 500;
+const QUIET_TIMEOUT_MS = 1200;
 
 function cleanTTS(s=""){
   return String(s)
@@ -299,7 +300,7 @@ function normalizeNumbersForTTS(s="") {
   // Long digit runs (7+)
   t = t.replace(/\b(\d{7,})\b/g, (m) => m.split("").join(" "));
 
-  // Small pause to help “2 PM”
+  // Help phrases like “at 2 PM”
   t = t.replace(/\bat\s+(\d{1,2})(:\d{2})?\s*(AM|PM)\b/gi, (_, h, mm="", ap) => `at, ${h}${mm} ${ap}`);
 
   return t;
@@ -314,6 +315,7 @@ async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
 
+  // Wait for caller silence
   let waited = 0;
   while (true) {
     const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
@@ -340,10 +342,10 @@ async function say(ws, text) {
     const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.55, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
 
-    // Drop frames if caller starts talking to avoid overtalk
+    // Pause frames if caller resumes talking
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
-      if (Date.now() - (ws.__lastASRInterimAt || 0) < 150) return; // pause on human speech
+      if (Date.now() - (ws.__lastASRInterimAt || 0) < 150) return;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
@@ -351,7 +353,7 @@ async function say(ws, text) {
   } catch(e){ console.error("[TTS ERROR]", e.message); }
 }
 
-/* ===== Tool Registry (strict time semantics) ===== */
+/* ===== Tool Registry ===== */
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 let LAST_UTTERANCE = "";
@@ -384,8 +386,6 @@ function parseRequestedSlot(text, tz) {
   const endISO   = `${baseDateISO}T${pad(Math.min(hour+1,23))}:${pad(minute)}:00${offsetForTZ(tz)}`;
   return { dateISO: baseDateISO, startISO, endISO };
 }
-
-// Static offset helper
 function offsetForTZ(tz){
   const now = new Date();
   const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
@@ -395,7 +395,7 @@ function offsetForTZ(tz){
   return m ? m[1] : '-04:00';
 }
 
-/* Availability injection, including generic today/tomorrow asks with no time */
+/* Inject availability for explicit hours or broad day asks */
 async function ensureExactAvailabilityInjected(ws, messages, userText){
   const slot = parseRequestedSlot(userText, BIZ_TZ);
 
@@ -1058,8 +1058,10 @@ if (!wss.__victory_handler_attached) {
 
       const doneIntent = /(?:that'?ll be it|that is all|that'?s all|nothing else|we'?re done|we are done|bye|goodbye|hang up|end the call)/i;
       if (doneIntent.test(userText)) {
-        await say(ws, "Got it. Thanks for calling—goodbye.");
-        remember(ws.__mem, "bot", "Got it. Thanks for calling—goodbye.");
+        // LLM still generates farewell. Pass to tools after speak.
+        const messages = buildMessages(ws.__mem, "User said they are done. Say goodbye.", ws.__tenantPrompt);
+        const finalText = await resolveToolChain(messages);
+        if (finalText) { await say(ws, finalText); remember(ws.__mem, "bot", finalText); }
         await Tools.end_call({ callSid: ws.__callSid, reason: "user_done" });
         return;
       }
@@ -1121,7 +1123,7 @@ if (!wss.__victory_handler_attached) {
           onFinal: async (text) => {
             const now = Date.now();
 
-            // debounce merge with softer thresholds
+            // debounce/merge with softer thresholds
             if (ws.__debounceTimer) clearTimeout(ws.__debounceTimer);
             const looksIncomplete = text.split(/\s+/).length < 6 || /(?:to|for|at|on|in|with|about)$/i.test(text);
             ws.__pendingFinal = ws.__pendingFinal ? (ws.__pendingFinal + " " + text) : text;
@@ -1131,18 +1133,12 @@ if (!wss.__victory_handler_attached) {
               const finalText = (ws.__pendingFinal || "").trim();
               ws.__pendingFinal = "";
 
-              // Micro-hold for ultra-short finals to capture continuation
+              // Micro-hold for ultra-short finals to catch continuation, but do not block real turns
               const tokenCount = finalText.split(/\s+/).filter(Boolean).length;
               const recentAudioGap = Date.now() - (ws.__lastAudioAt || 0);
-              if (tokenCount < 3 && recentAudioGap < 1000) {
-                await new Promise(r => setTimeout(r, 350));
-                if (Date.now() - (ws.__lastAudioAt || 0) < 500) return; // caller resumed
-              }
-
-              // Gentle handling for lone greetings
-              if (/^(hi|hello|hey)\.?$/i.test(finalText)) {
-                await new Promise(r => setTimeout(r, 400));
-                if (Date.now() - (ws.__lastAudioAt || 0) < 400) return;
+              if (tokenCount < 2 && recentAudioGap < 600) {
+                await new Promise(r => setTimeout(r, 250));
+                if (Date.now() - (ws.__lastAudioAt || 0) < 400) return; // caller resumed
               }
 
               const now2 = Date.now();
@@ -1172,10 +1168,7 @@ if (!wss.__victory_handler_attached) {
         });
         ws.__dg = dg;
 
-        // Immediate greet to cut first-turn latency
-        await say(ws, "Thanks for calling The Victory Team. How can I help today?");
-        remember(ws.__mem, "bot", "Thanks for calling The Victory Team. How can I help today?");
-
+        // Initial AI-driven greeting via LLM
         ws.__handling = true;
         remember(ws.__mem, "user", "<CALL_START>");
         await handleTurn(ws, "<CALL_START>");
@@ -1191,7 +1184,7 @@ if (!wss.__victory_handler_attached) {
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 120); // slower tail to respect pauses
+        tailTimer = setTimeout(flushULaw, 120);
         return;
       }
 
@@ -1219,7 +1212,7 @@ if (!wss.__victory_handler_attached) {
   });
 }
 
-/* === Deepgram ASR (μ-law passthrough) with ready guard and longer endpointing === */
+/* === Deepgram ASR (μ-law passthrough), longer endpointing === */
 function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -1229,7 +1222,7 @@ function startDeepgram({ onFinal, wsRef }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=1200"; // was 900
+    + "&endpointing=1200";
   console.log("[Deepgram] connecting", url);
   const dgWS = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -1272,15 +1265,10 @@ function startDeepgram({ onFinal, wsRef }) {
 }
 
 /* ===== Notes =====
-- Strict time: no auto “intent” hour shifting. Tools book the exact window provided.
-- Exact availability guard: inject reads for explicit times and generic today/tomorrow.
-- Reschedule safety: cancel is blocked until a new booking is confirmed.
-- Pin-to-checked-slot stops hour drift.
-- De-dupe prevents double-create within 60s.
+- 100% AI-driven speech: no hardcoded replies.
 - Softer barge-in and longer endpointing reduce cutoffs.
 - Number normalizer improves phone/ID articulation.
-- ElevenLabs low-latency streaming with mid-speech frame drop.
-- Strict farewell detection to avoid early hangups.
-- Single WebSocketServer guard prevents redeclare crashes.
-- Summaries generated on stop/close only.
+- Exact-window availability reads; strict-time booking.
+- Reschedule safety; de-dupe; pin-to-checked-slot.
+- Single WebSocketServer guard; summaries on stop/close.
 */
