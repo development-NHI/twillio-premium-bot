@@ -2,6 +2,7 @@
    - Fix: reliably answers every call (status callbacks + optional pre-connect greeting)
    - Fix: honors “next <weekday> at <time>” in the business timezone (no UTC drift)
    - Fix: never hang up right after asking a question
+   - Fix: Deepgram WS storm (single-connection guard + backoff + flush-on-open)
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Single-booking guarantee + exact-hour verification
    - Extra: robust timezone handling (DST-safe), weekday resolution in TZ, defensive logging
@@ -207,11 +208,13 @@ function todayISOInTZ(tz){
   return `${p.year}-${p.month}-${p.day}`;
 }
 function tzOffsetStringForDateISO(dateISO, tz) {
+  // Build offset via formatting (stable across Node versions)
   const probe = new Date(`${dateISO}T12:00:00Z`);
-  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" })
     .formatToParts(probe);
-  const name = parts.find(p => p.type === "timeZoneName")?.value || "";
-  const m = name.match(/(?:GMT|UTC)([+-]\d{1,2})(?::?(\d{2}))?/);
+  const off = parts.find(p => p.type === "timeZoneName")?.value || "UTC";
+  // Off looks like "UTC-4" or "GMT+1", normalize to ±HH:MM
+  const m = off.match(/([+-]\d{1,2})(?::?(\d{2}))?/);
   if (!m) return "-00:00";
   let hh = m[1];
   let mm = m[2] || "00";
@@ -450,7 +453,7 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 /* ===== Track live websockets by call ===== */
 const CALLS = new Map(); // callSid => ws
 
-/* === Deepgram ASR (μ-law) with lazy init === */
+/* === Deepgram ASR (μ-law) with lazy init + single-connection guard === */
 function newDeepgram(onFinal, wsRef) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -462,6 +465,7 @@ function newDeepgram(onFinal, wsRef) {
     + "&smart_format=true"
     + "&endpointing=900";
   console.log("[Deepgram] connecting", url);
+
   const dg = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
@@ -469,7 +473,12 @@ function newDeepgram(onFinal, wsRef) {
 
   dg.on("open", () => {
     console.log("[Deepgram] open");
-    if (wsRef) wsRef.__dgOpen = true;
+    if (wsRef) {
+      wsRef.__dgOpen = true;
+      wsRef.__dgState.connecting = false;
+      // Flush any buffered audio now that we're open
+      try { wsRef.__flushULaw?.(); } catch {}
+    }
   });
 
   let lastInterimLog = 0;
@@ -490,14 +499,28 @@ function newDeepgram(onFinal, wsRef) {
       try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
     }
   });
-  dg.on("error", e => console.error("[Deepgram error]", e.message));
+
+  dg.on("error", e => {
+    console.error("[Deepgram error]", e.message);
+  });
+
   dg.on("close", () => {
     console.log("[Deepgram] closed");
-    if (wsRef) wsRef.__dgOpen = false;
+    if (wsRef) {
+      wsRef.__dgOpen = false;
+      wsRef.__dg = null; // allow a future reconnect
+      wsRef.__dgState.connecting = false;
+      // no immediate auto-reconnect; we reconnect on next media flush with backoff
+    }
   });
 
   return {
-    sendULaw(buf){ try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); } },
+    sendULaw(buf){
+      try {
+        if (dg.readyState === WebSocket.OPEN) dg.send(buf);
+        else throw new Error(`readyState ${dg.readyState}`);
+      } catch(e){ console.error("[Deepgram send error]", e.message); }
+    },
     close(){ try { dg.close(); } catch {} },
     raw: dg
   };
@@ -633,8 +656,8 @@ let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
 const Tools = {
-  async read_availability({ dateISO, startISO, endISO }) {
-    console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
+  async read_availability({ dateISO, startISO, endISO, name, phone }) {
+    console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
       let windowObj;
@@ -650,7 +673,13 @@ const Tools = {
         windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
       }
 
-      const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window: windowObj };
+      const payload = {
+        intent:"READ",
+        biz: DASH_BIZ,
+        source: DASH_SOURCE,
+        timezone: BIZ_TZ,
+        window: windowObj
+      };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
         timeout:12000, tag:"CAL_READ",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
@@ -667,6 +696,7 @@ const Tools = {
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
 
+    // Re-align to utterance if weekday drifted (TZ-safe)
     const realigned = realignWindowToUtterance(startISO, endISO, LAST_UTTERANCE, BIZ_TZ);
     startISO = realigned.startISO;
     endISO   = realigned.endISO;
@@ -674,6 +704,7 @@ const Tools = {
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
+    // Single-booking guarantee: avoid duplicates within same hour for this call
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
       const adj = adjustWindowToIntent({startISO,endISO},BIZ_TZ,LAST_UTTERANCE);
@@ -686,6 +717,7 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
+      // Optional pre-check: verify exact hour is free
       try {
         const probe = await Tools.read_availability({ startISO: win.start_utc, endISO: win.end_utc });
         if (probe?.summary?.busy) return { ok:false, error:"time_unavailable" };
@@ -1083,14 +1115,11 @@ async function updateSummary(mem) {
 }
 
 /* ===== WS wiring ===== */
-let currentTraceInner = { convoId:"", callSid:"" }; // not used externally, kept for clarity
-
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
 
   wss.on("connection", (ws) => {
     console.log("[WS] connection from Twilio]");
-    let dg = null;
     let pendingULaw = [];
     const BATCH = 6;
     let tailTimer = null;
@@ -1126,9 +1155,10 @@ if (!wss.__victory_handler_attached) {
     ws.__mem = newMemory();
     ws.__confirmedBooking = null;
 
-    // Deepgram lazy init + health
+    // Deepgram lazy init + health (single-connection guard + backoff)
     ws.__dg = null;
     ws.__dgOpen = false;
+    ws.__dgState = { connecting:false, lastConnectAt:0 };
     ws.__sawMedia = false;
     let firstMediaTimer = setTimeout(() => {
       if (!ws.__sawMedia) console.warn("[MEDIA] no media received in first 5s");
@@ -1163,12 +1193,17 @@ if (!wss.__victory_handler_attached) {
         setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
       }, ms);
     }
-    function flushULaw() {
+
+    // Flush function that respects socket state; drains only when OPEN
+    ws.__flushULaw = function flushULaw() {
       if (!pendingULaw.length) return;
-      if (!ws.__dg || !ws.__dgOpen) {
-        dg = ws.__ensureDG?.();
-        if (!ws.__dgOpen) return;
-      }
+
+      // Ensure a single DG socket, with backoff
+      ws.__ensureDG();
+
+      // If still not open, keep buffering; we'll flush when 'open' fires
+      if (!ws.__dgOpen) return;
+
       const chunk = Buffer.concat(pendingULaw);
       pendingULaw = [];
       const now = Date.now();
@@ -1177,7 +1212,40 @@ if (!wss.__victory_handler_attached) {
         lastMediaLog = now;
       }
       ws.__dg.sendULaw(chunk);
-    }
+    };
+
+    ws.__ensureDG = function ensureDG() {
+      if (ws.__dg || ws.__dgState.connecting) return ws.__dg;
+
+      const now = Date.now();
+      if (now - ws.__dgState.lastConnectAt < 1500) return ws.__dg; // backoff
+
+      ws.__dgState.connecting = true;
+      ws.__dgState.lastConnectAt = now;
+      ws.__dg = newDeepgram(async (text) => {
+        const tnow = Date.now();
+        if (text === ws.__lastUserText && (tnow - ws.__lastUserAt) < 1500) {
+          console.log("[TURN] dropped duplicate final"); return;
+        }
+        ws.__lastUserText = text; ws.__lastUserAt = tnow;
+
+        LAST_UTTERANCE = text;
+        const tHint = parseUserTime(text);
+        if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
+
+        if (ws.__handling) { ws.__queuedTurn = text; return; }
+        ws.__handling = true; remember(ws.__mem, "user", text);
+        await handleTurn(ws, text);
+        ws.__handling = false;
+
+        if (ws.__queuedTurn) {
+          const next = ws.__queuedTurn; ws.__queuedTurn = null;
+          ws.__handling = true; remember(ws.__mem, "user", next);
+          await handleTurn(ws, next); ws.__handling = false;
+        }
+      }, ws);
+      return ws.__dg;
+    };
 
     async function postCallLogOnce(ws, reason) {
       if (ws.__postedLog) return;
@@ -1190,23 +1258,6 @@ if (!wss.__victory_handler_attached) {
 
       try { if (URLS.CALL_LOG) await httpPost(URLS.CALL_LOG, payload, { timeout: 10000, tag:"CALL_LOG", trace }); } catch {}
       try { if (URLS.CALL_SUMMARY) await httpPost(URLS.CALL_SUMMARY, payload, { timeout: 8000, tag:"CALL_SUMMARY", trace }); } catch {}
-    }
-
-    async function openaiChat(messages, options={}) {
-      const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
-      const body = {
-        model: "gpt-4o-mini",
-        temperature: 0.3,
-        messages,
-        tools: toolSchema,
-        tool_choice: "auto",
-        response_format: { type: "text" },
-        ...options
-      };
-      const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
-        headers, timeout: 30000, tag:"OPENAI_CHAT", trace: { convoId: currentTrace.convoId, callSid: currentTrace.callSid }
-      });
-      return data.choices?.[0];
     }
 
     async function resolveToolChain(baseMessages) {
@@ -1222,6 +1273,7 @@ if (!wss.__victory_handler_attached) {
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
+          // Don’t allow end_call immediately after a bot question
           if (name === "end_call" && ws.__awaitingReply) {
             console.log("[GUARD] Blocked premature end_call (awaiting reply)");
             continue;
@@ -1275,6 +1327,7 @@ if (!wss.__victory_handler_attached) {
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
       let finalText = await resolveToolChain(messages);
 
+      // If the model denied a requested time, re-verify that hour and correct if free
       const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
       if (corrected) finalText = corrected;
 
@@ -1325,33 +1378,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        ws.__ensureDG = () => {
-          if (ws.__dg && ws.__dgOpen) return ws.__dg;
-          ws.__dg = newDeepgram(async (text) => {
-            const now = Date.now();
-            if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
-              console.log("[TURN] dropped duplicate final"); return;
-            }
-            ws.__lastUserText = text; ws.__lastUserAt = now;
-
-            LAST_UTTERANCE = text;
-            const tHint = parseUserTime(text);
-            if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
-
-            if (ws.__handling) { ws.__queuedTurn = text; return; }
-            ws.__handling = true; remember(ws.__mem, "user", text);
-            await handleTurn(ws, text);
-            ws.__handling = false;
-
-            if (ws.__queuedTurn) {
-              const next = ws.__queuedTurn; ws.__queuedTurn = null;
-              ws.__handling = true; remember(ws.__mem, "user", next);
-              await handleTurn(ws, next); ws.__handling = false;
-            }
-          }, ws);
-          return ws.__dg;
-        };
-
+        // Greet immediately via AI (no need to wait for media)
         ws.__handling = true;
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
@@ -1361,17 +1388,14 @@ if (!wss.__victory_handler_attached) {
 
       if (msg.event === "media") {
         ws.__sawMedia = true;
-        if (!ws.__dg || !ws.__dgOpen) {
-          dg = ws.__ensureDG();
-        } else {
-          dg = ws.__dg;
-        }
+        // Buffer audio; ensure single DG; actual send when OPEN
+        ws.__ensureDG();
         ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
         pendingULaw.push(ulaw);
-        if (pendingULaw.length >= BATCH) flushULaw();
+        if (pendingULaw.length >= BATCH) ws.__flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 80);
+        tailTimer = setTimeout(ws.__flushULaw, 80);
         return;
       }
 
@@ -1379,7 +1403,7 @@ if (!wss.__victory_handler_attached) {
         console.log("[CALL_STOP]", { convoId: ws.__convoId });
         ws.__closing = true;
         ws.__stopSeenAt = Date.now();
-        try { flushULaw(); } catch {}
+        try { ws.__flushULaw(); } catch {}
         try { ws.__dg?.close(); } catch {}
         await postCallLogOnce(ws, "twilio stop");
         try { ws.close(); } catch {}
@@ -1390,6 +1414,9 @@ if (!wss.__victory_handler_attached) {
     ws.on("close", async () => {
       try { clearTimeout(firstMediaTimer); } catch {}
       try { ws.__dg?.close(); } catch {}
+      ws.__dg = null;
+      ws.__dgOpen = false;
+      ws.__dgState.connecting = false;
       clearHangTimer();
       clearInterval(hb);
       await postCallLogOnce(ws, "socket close");
@@ -1400,6 +1427,7 @@ if (!wss.__victory_handler_attached) {
 
 /* ===== Notes =====
 - TZ/DST-safe next-weekday + hour construction stops the “Thursday instead of next Monday” issue.
-- We build UTC instants from business-local components using the live GMT offset for that date.
-- Added logs [RELDATE] and [REALIGN] to verify what the model inferred vs. what we booked.
+- Single Deepgram socket per call with 1.5s backoff; flush audio only after OPEN -> no WS storm.
+- Blocks premature hangups if the last bot message was a question.
+- Greets on WS “start” (AI-driven, not hardcoded dialogs).
 */
