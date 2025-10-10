@@ -1,11 +1,10 @@
 /* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
-   - Single-booking guarantee (no duplicate creates in same hour)
-   - Exact-hour verification before denying availability
-   - Natural readback + non-interrupting TTS latency
-   - Deepgram μ-law passthrough with auto-reconnect + ElevenLabs TTS
-   - Robust Twilio streaming (both_tracks)
-   - Gate end_call so we don’t hang up right after asking a question
-   - Lazy OpenAI summary (after real user speech)
+   - Fix: reliably answers every call (status callbacks + optional pre-connect greeting)
+   - Fix: honors “next <weekday> at <time>” (no weekday drift)
+   - Fix: never hang up right after asking a question
+   - Keeps AI-driven speech (no hardcoded convo; optional greeting can be disabled)
+   - Deepgram μ-law passthrough + ElevenLabs TTS
+   - Single-booking guarantee + exact-hour verification
    - Verbose per-request logging for debugging external calls
 */
 
@@ -34,7 +33,7 @@ const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional out
 const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transfer target
 
 /* Business / routing identifiers */
-const DASH_BIZ    = process.env.DASH_BIZ || "";
+const DASH_BIZ    = process.env.DASH_BIZ || "The Victory Team";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 
 /* Business timezone */
@@ -43,6 +42,9 @@ const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 /* Optional env-driven hours gate (code only checks; wording is prompt-driven) */
 const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
 const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "17:00";
+
+/* Optional TwiML greeting (keeps AI-driven convo; this is just a hello+connect) */
+const PRE_CONNECT_GREETING = process.env.PRE_CONNECT_GREETING || ""; // e.g., "Thanks for calling—one moment."
 
 /* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
@@ -116,7 +118,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-[Prompt-Version: 2025-10-10T22:10Z]
+[Prompt-Version: 2025-10-10T23:05Z]
 
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
@@ -138,54 +140,53 @@ Data to collect before booking:
 
 Scheduling policy (HARD RULES):
 - Use tools for read/hold/confirm. Resolve relative dates in America/New_York.
-- **If the caller names a specific day+time (e.g., “next Monday at 2 PM”), treat that exact hour as the target. Do NOT change the weekday during booking.**
-- **“Next <weekday>” = the upcoming occurrence of that weekday (even if a few days away).**
-- Read availability for the **exact hour window** the caller mentioned **before** saying it’s unavailable.
+- **If the caller says “next <weekday> at <time>”, book that exact weekday and hour. Do NOT change the weekday.**
+- “Next <weekday>” = the upcoming occurrence of that weekday (even if several days away).
+- Always check availability for the exact hour window the caller mentioned **before** saying it’s unavailable.
 - When a slot is free, read back once, then book.
 - If the slot is taken, offer 2–3 nearby options.
 - If a slot shows "canceled," you may offer it.
 
 Cancel/Reschedule identity (name + phone only):
 - Require full name + phone on the booking. If caller says "this number," use caller ID.
-- Never call cancel blindly. Do this flow:
+- Never cancel blindly. Flow:
   1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
   2) If exactly one future match, capture its "event_id".
   3) For "cancel": cancel by "event_id".
   4) For "reschedule": cancel by "event_id", then propose 2–3 nearby times and book the chosen one.
   5) If none or multiple matches: ask only for the missing disambiguator (e.g., "what date/time was it?"). If still unclear, offer transfer.
 - Only cancel/reschedule for the person on the booking (same name + phone).
-- Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour, not an all-day window. If the targeted read fails, then broaden (±1 day) and disambiguate briefly.
+- When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour. If that fails, broaden (±1 day) and disambiguate briefly.
 
 Reschedule data integrity:
 - Preserve all prior details unless the caller changes them: service, meeting type, location, property/MLS, special requests.
 - If any are missing or ambiguous, ask one concise question before booking.
 - When calling \`book_appointment\`, include service, notes (meeting type, location, property/MLS, special requests), confirmed startISO/endISO, and same name/phone unless updated.
-- **Never create a second appointment to “add notes.” If time is already booked for this caller, acknowledge they’re set and confirm details conversationally.**
+- **Never create a second appointment to “add notes.” If the time is already booked for this caller, confirm details conversationally.**
 
-Wider search behavior (when caller gives no date/time):
-- Before rescheduling, call find_customer_events with name + phone (30 days). If you find future bookings, read back short options and confirm which one to change; then use its "event_id".
+Wider search behavior (no date/time given):
+- Before rescheduling, call find_customer_events with name + phone (30 days). If you find future bookings, read short options and confirm which to change; then use its "event_id".
 - Perform a contact-filtered READ across the next 30 days.
-- If you find matches, read back short options like: "I found A) Wed 3–4 PM, B) Fri 11–12. Which one?"
+- If you find matches, read short options like: "I found A) Wed 3–4, B) Fri 11–12. Which one?"
 - If exactly one sounds right, proceed using its "event_id".
 - If none are found, ask for the date and approximate time.
 
 Tool rules:
 - Always use tools for availability, booking, cancel/reschedule, transfer, and logging.
-- Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
-- **Availability interpretation:** When \`read_availability\` returns an empty \`events\` array **or** \`{summary:{free:true}}\`, the slot is **available**. When \`events.length>0\` **or** \`{summary:{busy:true}}\`, it’s **unavailable**.
-- **Before saying any specific time is unavailable, ALWAYS call \`read_availability\` for that exact hour window the caller mentioned. Never guess.**
+- Don’t invent tool outcomes. If a tool fails, say so briefly and offer next steps.
+- **Availability:** Empty \`events\` or \`{summary:{free:true}}\` ⇒ the slot is **available**. \`events.length>0\` or \`{summary:{busy:true}}\` ⇒ **unavailable**.
 - After ANY tool call, ALWAYS speak: confirm, ask one question, or explain next steps.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
 Operational guardrails:
-- After ANY tool call, ALWAYS speak. Never rely on silence to imply success.
-- Don’t end the call immediately after asking a question. Wait for the caller or offer a simple goodbye first.
+- After ANY tool call, ALWAYS speak.
+- Do **not** end the call right after asking a question. Wait for the caller or offer a goodbye first.
 - One short goodbye only. When done, call \`end_call\`.
 
 Identity & phone handling:
-- If the caller gives partial digits, combine with known context (use caller ID when they say “this number”, prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
+- If the caller gives partial digits, combine with known context (use caller ID for “this number”, prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
 
 Error/empty results:
 - If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
@@ -193,11 +194,11 @@ Error/empty results:
 Brevity:
 - Ask one question at a time. Avoid repeating requests once you have enough.
 
-Greeting example:
+Greeting example (model may paraphrase):
 - "Thanks for calling The Victory Team in Bel Air—how can I help today?"
 
 Output:
-- Short, natural voice responses (avoid bullet lists in speech).
+- Short, natural voice responses (no bullet lists aloud).
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -206,6 +207,7 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 app.get("/", (_req, res) => res.status(200).send("OK: AI Voice Agent up"));
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
 app.post("/twiml", (req, res) => {
   const from = req.body?.From || "";
@@ -214,20 +216,36 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  // Use both tracks for better stability when streaming TTS back
+
+  // Optional greeting helps confirm “it answered” even if WS handshake is slow.
+  const optSay = PRE_CONNECT_GREETING
+    ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>`
+    : "";
+
+  // Add status callback for visibility if Twilio can’t connect the WS.
+  const statusCb = process.env.STATUS_CALLBACK_URL
+    ? `<StatusCallback url="${process.env.STATUS_CALLBACK_URL}" />`
+    : "";
+
   res.send(`
     <Response>
+      ${optSay}
       <Connect>
-        <Stream url="wss://${host}" track="both_tracks">
+        <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
       </Connect>
+      ${statusCb}
     </Response>
   `.trim());
   console.log("[HTTP] TwiML served with host", host);
 });
+
+function escapeXml(s=""){
+  return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]));
+}
 
 /* TwiML handoff target used during live transfer (no hardcoded speech) */
 app.post("/handoff", (_req, res) => {
@@ -247,10 +265,10 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX: single WebSocketServer init guard === */
+/* === Single WebSocketServer init guard === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
-  wss = new WebSocketServer({ server });
+  wss = new WebSocketServer({ server, perMessageDeflate: false });
   globalThis.__victory_wss = wss;
 }
 
@@ -314,7 +332,7 @@ function withinBizHours(iso, tz){
 
 /* ===== Natural-time intent guard ===== */
 let LAST_UTTERANCE = "";
-let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 }; // recent parsed time
+let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 };
 
 function parseUserTime(text=""){
   const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
@@ -367,7 +385,7 @@ function nextWeekdayISO(baseDateISO, weekdayIdx) {
   const d = new Date(`${baseDateISO}T00:00:00Z`);
   const baseIdx = d.getUTCDay();
   let delta = (weekdayIdx - baseIdx + 7) % 7;
-  if (delta === 0) delta = 7; // upcoming occurrence (not today)
+  if (delta === 0) delta = 7; // upcoming occurrence, not today
   return addDaysISO(baseDateISO, delta);
 }
 function inferRelativeDateISOFromUtterance(text, tz) {
@@ -386,10 +404,9 @@ function inferRelativeDateISOFromUtterance(text, tz) {
 function realignWindowToUtterance(startISO, endISO, utterance, tz) {
   const inferredDateISO = inferRelativeDateISOFromUtterance(utterance, tz);
   if (!inferredDateISO) return { startISO, endISO };
-  // Keep hour/min from either LAST_TIME_HINT or provided ISO
   const t = LAST_TIME_HINT.hour24 != null ? { h:LAST_TIME_HINT.hour24, m:(LAST_TIME_HINT.min||0) } : null;
-  const d = new Date(`${inferredDateISO}T00:00:00-04:00`); // local base; tz offset won’t matter after toISOString
-  if (t) { d.setHours(t.h, t.m, 0, 0); }
+  const d = new Date(`${inferredDateISO}T00:00:00-04:00`); // TZ offset safe; we re-UTC below
+  if (t) d.setHours(t.h, t.m, 0, 0);
   else {
     const ph = new Date(startISO);
     d.setHours(ph.getHours(), ph.getMinutes(), 0, 0);
@@ -399,7 +416,7 @@ function realignWindowToUtterance(startISO, endISO, utterance, tz) {
   return { startISO: start, endISO: end };
 }
 
-/* === Deepgram ASR (μ-law) with lazy init + auto-reconnect === */
+/* === Deepgram ASR (μ-law) with lazy init === */
 function newDeepgram(onFinal, wsRef) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -453,19 +470,16 @@ function newDeepgram(onFinal, wsRef) {
 }
 
 /* === ElevenLabs TTS === */
-const QUIET_MS = 500;          // required silence before TTS
-const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency
+const QUIET_MS = 500;
+const QUIET_TIMEOUT_MS = 900;
 
-/* === Improved number/phone speaking === */
 const DIGIT_WORD = { "0":"zero","1":"one","2":"two","3":"three","4":"four","5":"five","6":"six","7":"seven","8":"eight","9":"nine" };
-
 function digitsToWords(d) {
   const words = d.split("").map(ch => DIGIT_WORD[ch] ?? ch);
   if (d.length === 10) return `${words.slice(0,3).join(" ")} , ${words.slice(3,6).join(" ")} , ${words.slice(6).join(" ")}`;
   if (d.length === 11 && d[0] === "1") return `one , ${words.slice(1,4).join(" ")} , ${words.slice(4,7).join(" ")} , ${words.slice(7).join(" ")}`;
   return words.map((w,i)=> ((i>0 && i%4===0) ? `, ${w}` : w)).join(" ");
 }
-
 function phoneToWords(raw="") {
   const s = (raw||"").replace(/[^\dxX+]/g,"").replace(/^(\+?1)(?=\d{10}\b)/, "1");
   const m = s.match(/^(1)?(\d{3})(\d{3})(\d{4})(?:[xX](\d{2,6}))?$/);
@@ -474,7 +488,6 @@ function phoneToWords(raw="") {
   const core = digitsToWords(`${c||""}${a}${b}${c4}`);
   return ext ? `${core} , extension ${digitsToWords(ext)}` : core;
 }
-
 function normalizeNumbersForSpeech(text="") {
   text = text.replace(
     /(?:\+?1[\s-\.]?)?\(?\d{3}\)?[\s-\.]?\d{3}[\s-\.]?\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{2,6})?/gi,
@@ -483,7 +496,6 @@ function normalizeNumbersForSpeech(text="") {
   text = text.replace(/\b\d{5,}\b/g, (m) => digitsToWords(m));
   return text;
 }
-
 function cleanTTS(s=""){
   const base = String(s)
     .replace(/\*\*(.*?)\*\*/g, "$1")
@@ -507,7 +519,6 @@ function formatPhoneForSpeech(s=""){
   }
   return normalizeNumbersForSpeech(s);
 }
-
 function compressReadback(text=""){
   const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Location|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
   if (pairs.length >= 2) {
@@ -563,7 +574,7 @@ async function say(ws, text) {
 
   ws.__lastBotText = speak;
   ws.__lastBotAt = Date.now();
-  ws.__awaitingReply = /[?]\s*$/.test(speak); // track if we asked a question
+  ws.__awaitingReply = /[?]\s*$/.test(speak);
   console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
 
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
@@ -577,6 +588,7 @@ async function say(ws, text) {
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
+      // Twilio will play packets we send back on the same WS
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
     resp.data.on("end", () => console.log("[TTS] stream end"));
@@ -585,10 +597,7 @@ async function say(ws, text) {
 
 /* ===== Minimal Memory ===== */
 function newMemory() {
-  return {
-    transcript: [],
-    summary: ""
-  };
+  return { transcript: [], summary: "" };
 }
 function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
 
@@ -601,7 +610,7 @@ const Tools = {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
-      // IMPORTANT: availability should reflect *all* events; do NOT filter by contact
+      // IMPORTANT: availability reflects *all* events; do NOT filter by contact
       let windowObj;
       if (startISO && endISO) {
         const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
@@ -638,7 +647,7 @@ const Tools = {
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
 
-    // Re-align to utterance if the model drifted weekday (prevents Thu vs Next Mon bug)
+    // Re-align to utterance if weekday drifted (fixes Thu vs “next Mon” bug)
     const realigned = realignWindowToUtterance(startISO, endISO, LAST_UTTERANCE, BIZ_TZ);
     startISO = realigned.startISO;
     endISO   = realigned.endISO;
@@ -646,7 +655,7 @@ const Tools = {
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
-    // Single-booking guarantee: if this hour already confirmed for this call, do not create again
+    // Single-booking guarantee: avoid duplicates within same hour for this call
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
       const adj = adjustWindowToIntent({startISO,endISO},BIZ_TZ,LAST_UTTERANCE);
@@ -659,15 +668,10 @@ const Tools = {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
-      // Soft-hours check (let backend decide final)
-      if (!withinBizHours(win.start_utc, BIZ_TZ)) { /* proceed */ }
-
-      // Verify the exact hour before booking (extra safety)
+      // Optional pre-check: verify exact hour is free
       try {
         const probe = await Tools.read_availability({ startISO: win.start_utc, endISO: win.end_utc });
-        if (probe?.summary?.busy) {
-          return { ok:false, error:"time_unavailable" };
-        }
+        if (probe?.summary?.busy) return { ok:false, error:"time_unavailable" };
       } catch {}
 
       const payload = {
@@ -848,7 +852,7 @@ const Tools = {
           { timeout:8000, tag:"FAQ_LOG", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       }
     } catch {}
-    return { data:{ topic, service } };
+    return { data:{ topic, service} };
   },
 
   async transfer({ reason, callSid }) {
@@ -955,7 +959,7 @@ const toolSchema = [
   }},
   { type:"function", function:{
       name:"end_call",
-      description:"Politely end the call immediately after your own spoken goodbye",
+      description:"Politely end the call after your goodbye",
       parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] }
   }}
 ];
@@ -990,7 +994,7 @@ function buildSystemPrompt(mem, tenantPrompt) {
        - Use tools for availability, booking, cancel/reschedule, transfer, FAQ logging, lead capture, and hangup.
        - Do not fabricate tool outcomes. If a tool fails, explain briefly and offer next steps.
        - Keep replies concise and natural. All caller-facing words are your choice.
-       - One goodbye only. Do not hang up immediately after asking a question. When done, call end_call.` },
+       - Do not hang up immediately after asking a question. When you decide the call should end, call end_call.` },
     { role:"system", content: `<memory_summary>${mem.summary}</memory_summary>` }
   ];
 }
@@ -1008,17 +1012,14 @@ function buildMessages(mem, userText, tenantPrompt) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
-/* === Auto-verify helper: if model denies a caller’s requested hour, verify via read_availability === */
+/* === Auto-verify helper: if model denies a requested hour, verify via read_availability === */
 function resolveRelativeDateFromText(text, tz) {
   const s = (text||"").toLowerCase();
   const base = todayISOInTZ(tz);
   if (/\btomorrow\b/.test(s)) return addDaysISO(base, 1);
   if (/\btoday\b/.test(s)) return base;
   const m = s.match(/\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
-  if (m) {
-    const idx = WD[m[1].slice(0,3)];
-    return nextWeekdayISO(base, idx);
-  }
+  if (m) return nextWeekdayISO(base, WD[m[1].slice(0,3)]);
   return null;
 }
 async function verifyHourAvailability({ text, replyText }) {
@@ -1110,7 +1111,7 @@ if (!wss.__victory_handler_attached) {
 
     // Memory and booking-lock
     ws.__mem = newMemory();
-    ws.__confirmedBooking = null; // single-booking locker
+    ws.__confirmedBooking = null;
 
     // Deepgram lazy init + health
     ws.__dg = null;
@@ -1152,7 +1153,6 @@ if (!wss.__victory_handler_attached) {
     function flushULaw() {
       if (!pendingULaw.length) return;
       if (!ws.__dg || !ws.__dgOpen) {
-        // attempt to (re)open
         dg = ws.__ensureDG?.();
         if (!ws.__dgOpen) return;
       }
@@ -1237,7 +1237,6 @@ if (!wss.__victory_handler_attached) {
         scheduleHangup(2500);
       }
 
-      // Skip summary until there’s real user speech (don’t do it on <CALL_START>)
       if (userText !== "<CALL_START>") {
         await updateSummary(ws.__mem);
       }
@@ -1275,7 +1274,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // Lazy Deepgram: create on demand
+        // Lazy Deepgram: create on demand (first media frame)
         ws.__ensureDG = () => {
           if (ws.__dg && ws.__dgOpen) return ws.__dg;
           ws.__dg = newDeepgram(async (text) => {
@@ -1303,7 +1302,7 @@ if (!wss.__victory_handler_attached) {
           return ws.__dg;
         };
 
-        // Greet
+        // Greet immediately via AI (no need to wait for media)
         ws.__handling = true;
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
@@ -1350,9 +1349,12 @@ if (!wss.__victory_handler_attached) {
   });
 }
 
+/* ===== Helper ===== */
+function escapeHtml(s=""){ return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+
 /* ===== Notes =====
-- Prevents wrong-day bookings by re-aligning booking time to “next <weekday>”/today/tomorrow from the last utterance.
+- Optional PRE_CONNECT_GREETING gives an immediate audible "answer"; AI takes over on WS start.
+- Weekday/time inference prevents wrong-day bookings (e.g., “next Monday 2pm” won’t drift).
 - Blocks premature hangups if the last bot message was a question.
-- Deepgram lazy init + auto-reconnect; Twilio both_tracks for stability.
-- Skips early summary until after real user speech.
+- Greets on WS “start” (AI-driven, not hardcoded dialogs).
 */
