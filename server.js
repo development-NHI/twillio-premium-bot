@@ -633,6 +633,25 @@ async function say(ws, text) {
 let currentTrace = { convoId:"", callSid:"" };
 let CURRENT_FROM = "";
 
+/* === Phone normalization + filtering helpers (FIX) === */
+function onlyDigits(s=""){ return (s||"").replace(/\D+/g,""); }
+function toE164US(s=""){
+  const d0 = onlyDigits(s);
+  if (!d0) return "";
+  let d = d0;
+  if (d.length === 11 && d.startsWith("1")) d = d.slice(1);
+  if (d.length === 10) return `+1${d}`;
+  if (s.startsWith("+")) return s; // already e164-ish
+  return s; // fallback (don’t break)
+}
+function last10(s=""){ const d = onlyDigits(s); return d.slice(-10); }
+function matchesPhoneLast10(event, target10){
+  if (!target10) return false;
+  const cand = event?.customer_phone || event?.Customer_Phone || event?.phone || event?.customerPhone || "";
+  if (!cand) return false;
+  return last10(cand) === target10;
+}
+
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
@@ -692,7 +711,7 @@ const Tools = {
     }
 
     try {
-      const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+      const normalizedPhone = toE164US((phone && phone.trim()) || CURRENT_FROM || "");
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
       // Optional pre-check: verify exact hour is free
@@ -740,7 +759,7 @@ const Tools = {
           const readPayload = {
             intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
             window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
-            contact_phone: (phone||CURRENT_FROM||"") || undefined
+            contact_phone: toE164US((phone||CURRENT_FROM||""))
           };
           const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
             trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
@@ -769,7 +788,7 @@ const Tools = {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { ok:false };
 
-    const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+    const normalizedPhone = toE164US((phone && phone.trim()) || CURRENT_FROM || "");
 
     try {
       let id = event_id;
@@ -797,7 +816,10 @@ const Tools = {
         const { data: readData } = await httpPost(URLS.CAL_READ, readPayload,
           { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
-        const future = (readData?.events || []).filter(e => e.status !== "canceled");
+        const target10 = last10(normalizedPhone);
+        const futureAll = (readData?.events || []).filter(e => e.status !== "canceled");
+        const future = futureAll.filter(e => matchesPhoneLast10(e, target10));
+
         if (future.length === 1) {
           id = future[0].event_id;
         } else {
@@ -830,7 +852,7 @@ const Tools = {
   async find_customer_events({ name, phone, days = 30 }) {
     console.log("[TOOL] find_customer_events", { hasName: !!name, hasPhone: !!phone, days });
     if (!URLS.CAL_READ) return { ok:false, events:[] };
-    const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+    const normalizedPhone = toE164US((phone && phone.trim()) || CURRENT_FROM || "");
     try {
       const baseDate = todayISOInTZ(BIZ_TZ);
       const mentionsTomorrow = /\btomorrow\b/i.test(LAST_UTTERANCE || "");
@@ -853,7 +875,9 @@ const Tools = {
         timeout:12000, tag:"CAL_READ_FIND",
         trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid }
       });
-      const events = (data?.events || []).filter(e => e.status !== "canceled");
+      const all = (data?.events || []).filter(e => e.status !== "canceled");
+      const target10 = last10(normalizedPhone);
+      const events = target10 ? all.filter(e => matchesPhoneLast10(e, target10)) : all;
       return { ok:true, events };
     } catch {
       return { ok:false, events:[] };
@@ -865,7 +889,7 @@ const Tools = {
     if (!URLS.LEAD_UPSERT) return {};
     try {
       const { data } = await httpPost(URLS.LEAD_UPSERT,
-        { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes },
+        { biz:DASH_BIZ, source:DASH_SOURCE, name, phone: toE164US(phone||CURRENT_FROM||""), intent, notes },
         { timeout: 8000, tag:"LEAD_UPSERT", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
       return { data };
     } catch { return {}; }
