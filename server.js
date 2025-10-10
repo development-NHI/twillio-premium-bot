@@ -194,7 +194,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX 1: single WebSocketServer init guard === */
+/* === single WebSocketServer init guard === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -269,8 +269,8 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 const CALLS = new Map(); // callSid => ws
 
 /* ===== TTS helpers ===== */
-const QUIET_MS = 300;          // faster speak
-const QUIET_TIMEOUT_MS = 700;  // lower cap
+const QUIET_MS = 500;          // softened barge-in
+const QUIET_TIMEOUT_MS = 1200; // longer cap
 
 function cleanTTS(s=""){
   return String(s)
@@ -339,8 +339,11 @@ async function say(ws, text) {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=0&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.55, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
+
+    // Drop frames if caller starts talking to avoid overtalk
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - (ws.__lastASRInterimAt || 0) < 150) return; // pause on human speech
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
@@ -401,7 +404,6 @@ async function ensureExactAvailabilityInjected(ws, messages, userText){
       const base = /\btomorrow\b/i.test(userText||"")
         ? addDaysISO(todayISOInTZ(BIZ_TZ),1)
         : todayISOInTZ(BIZ_TZ);
-      // Probe the requested day broadly to avoid false “fully booked” claims.
       const s = `${base}T09:00:00${offsetForTZ(BIZ_TZ)}`;
       const e = `${base}T17:00:00${offsetForTZ(BIZ_TZ)}`;
       try {
@@ -979,7 +981,7 @@ if (!wss.__victory_handler_attached) {
       }, ms);
     }
 
-    /* Flush μ-law only when DG is ready */
+    /* Flush μ-law with slightly slower tail */
     function flushULaw() {
       if (!pendingULaw.length || !dg) return;
       const chunk = Buffer.concat(pendingULaw);
@@ -1119,15 +1121,29 @@ if (!wss.__victory_handler_attached) {
           onFinal: async (text) => {
             const now = Date.now();
 
-            // faster debounce
+            // debounce merge with softer thresholds
             if (ws.__debounceTimer) clearTimeout(ws.__debounceTimer);
-            const looksIncomplete = text.split(/\s+/).length < 5 || /(?:to|for|at|on|in|with|about)$/i.test(text);
+            const looksIncomplete = text.split(/\s+/).length < 6 || /(?:to|for|at|on|in|with|about)$/i.test(text);
             ws.__pendingFinal = ws.__pendingFinal ? (ws.__pendingFinal + " " + text) : text;
 
-            const delay = looksIncomplete ? 300 : 150;
+            const delay = looksIncomplete ? 420 : 240;
             ws.__debounceTimer = setTimeout(async () => {
               const finalText = (ws.__pendingFinal || "").trim();
               ws.__pendingFinal = "";
+
+              // Micro-hold for ultra-short finals to capture continuation
+              const tokenCount = finalText.split(/\s+/).filter(Boolean).length;
+              const recentAudioGap = Date.now() - (ws.__lastAudioAt || 0);
+              if (tokenCount < 3 && recentAudioGap < 1000) {
+                await new Promise(r => setTimeout(r, 350));
+                if (Date.now() - (ws.__lastAudioAt || 0) < 500) return; // caller resumed
+              }
+
+              // Gentle handling for lone greetings
+              if (/^(hi|hello|hey)\.?$/i.test(finalText)) {
+                await new Promise(r => setTimeout(r, 400));
+                if (Date.now() - (ws.__lastAudioAt || 0) < 400) return;
+              }
 
               const now2 = Date.now();
               if (finalText === ws.__lastUserText && (now2 - ws.__lastUserAt) < 1500) {
@@ -1175,7 +1191,7 @@ if (!wss.__victory_handler_attached) {
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 80);
+        tailTimer = setTimeout(flushULaw, 120); // slower tail to respect pauses
         return;
       }
 
@@ -1203,7 +1219,7 @@ if (!wss.__victory_handler_attached) {
   });
 }
 
-/* === Deepgram ASR (μ-law passthrough) with ready guard === */
+/* === Deepgram ASR (μ-law passthrough) with ready guard and longer endpointing === */
 function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -1213,7 +1229,7 @@ function startDeepgram({ onFinal, wsRef }) {
     + "&model=nova-2-phonecall"
     + "&interim_results=true"
     + "&smart_format=true"
-    + "&endpointing=900";
+    + "&endpointing=1200"; // was 900
   console.log("[Deepgram] connecting", url);
   const dgWS = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
@@ -1261,9 +1277,9 @@ function startDeepgram({ onFinal, wsRef }) {
 - Reschedule safety: cancel is blocked until a new booking is confirmed.
 - Pin-to-checked-slot stops hour drift.
 - De-dupe prevents double-create within 60s.
-- Faster greet and debounce reduce perceived latency.
+- Softer barge-in and longer endpointing reduce cutoffs.
 - Number normalizer improves phone/ID articulation.
-- ElevenLabs low-latency streaming.
+- ElevenLabs low-latency streaming with mid-speech frame drop.
 - Strict farewell detection to avoid early hangups.
 - Single WebSocketServer guard prevents redeclare crashes.
 - Summaries generated on stop/close only.
