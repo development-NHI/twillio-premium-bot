@@ -1,11 +1,10 @@
 /* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
    - Fix: reliably answers every call (status callbacks + optional pre-connect greeting)
-   - Fix: honors “next <weekday> at <time>” (no weekday drift)
+   - Fix: honors “next <weekday> at <time>” in the business timezone (no UTC drift)
    - Fix: never hang up right after asking a question
-   - Keeps AI-driven speech (no hardcoded convo; optional greeting can be disabled)
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Single-booking guarantee + exact-hour verification
-   - Verbose per-request logging for debugging external calls
+   - Extra: robust timezone handling (DST-safe), weekday resolution in TZ, defensive logging
 */
 
 import express from "express";
@@ -116,164 +115,58 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
 }
 
-/* ===== Brain prompt (single source of truth) ===== */
-const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-[Prompt-Version: 2025-10-10T23:05Z]
-
-You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
-
-Brand/Tone & Basics:
-- Friendly, concise, confident, local. Hours Mon–Fri 9–5 (America/New_York).
-- Office: 1316 E Churchville Rd, Bel Air, MD 21014. Main phone if asked: 833-888-1754.
-- Services: buyer consults & tours, seller/listing consults (mention 1.75% model if asked), investors, general Q&A.
-- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1%; 5★ reviews.
-
-Interview style (anti-repeat):
-- Ask one question at a time. Keep answers <15 words unless reading back.
-- Maintain a scratchpad: Name, Phone, Role, Service, Property/MLS, Date, Time, Meeting Type, Location, Notes.
-- Before asking, check the scratchpad. If you have it, do not ask again.
-- If the caller gives partial data (e.g., "443…"), ask only for the missing part.
-- If the caller talks while you’re speaking, accept it—don’t re-ask.
-
-Data to collect before booking:
-- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type (in-person vs virtual; location if in-person), notes (special requests).
-
-Scheduling policy (HARD RULES):
-- Use tools for read/hold/confirm. Resolve relative dates in America/New_York.
-- **If the caller says “next <weekday> at <time>”, book that exact weekday and hour. Do NOT change the weekday.**
-- “Next <weekday>” = the upcoming occurrence of that weekday (even if several days away).
-- Always check availability for the exact hour window the caller mentioned **before** saying it’s unavailable.
-- When a slot is free, read back once, then book.
-- If the slot is taken, offer 2–3 nearby options.
-- If a slot shows "canceled," you may offer it.
-
-Cancel/Reschedule identity (name + phone only):
-- Require full name + phone on the booking. If caller says "this number," use caller ID.
-- Never cancel blindly. Flow:
-  1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
-  2) If exactly one future match, capture its "event_id".
-  3) For "cancel": cancel by "event_id".
-  4) For "reschedule": cancel by "event_id", then propose 2–3 nearby times and book the chosen one.
-  5) If none or multiple matches: ask only for the missing disambiguator (e.g., "what date/time was it?"). If still unclear, offer transfer.
-- Only cancel/reschedule for the person on the booking (same name + phone).
-- When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour. If that fails, broaden (±1 day) and disambiguate briefly.
-
-Reschedule data integrity:
-- Preserve all prior details unless the caller changes them: service, meeting type, location, property/MLS, special requests.
-- If any are missing or ambiguous, ask one concise question before booking.
-- When calling \`book_appointment\`, include service, notes (meeting type, location, property/MLS, special requests), confirmed startISO/endISO, and same name/phone unless updated.
-- **Never create a second appointment to “add notes.” If the time is already booked for this caller, confirm details conversationally.**
-
-Wider search behavior (no date/time given):
-- Before rescheduling, call find_customer_events with name + phone (30 days). If you find future bookings, read short options and confirm which to change; then use its "event_id".
-- Perform a contact-filtered READ across the next 30 days.
-- If you find matches, read short options like: "I found A) Wed 3–4, B) Fri 11–12. Which one?"
-- If exactly one sounds right, proceed using its "event_id".
-- If none are found, ask for the date and approximate time.
-
-Tool rules:
-- Always use tools for availability, booking, cancel/reschedule, transfer, and logging.
-- Don’t invent tool outcomes. If a tool fails, say so briefly and offer next steps.
-- **Availability:** Empty \`events\` or \`{summary:{free:true}}\` ⇒ the slot is **available**. \`events.length>0\` or \`{summary:{busy:true}}\` ⇒ **unavailable**.
-- After ANY tool call, ALWAYS speak: confirm, ask one question, or explain next steps.
-
-Outside hours:
-- Capture name, number, service, best time to reach; promise a callback during business hours.
-
-Operational guardrails:
-- After ANY tool call, ALWAYS speak.
-- Do **not** end the call right after asking a question. Wait for the caller or offer a goodbye first.
-- One short goodbye only. When done, call \`end_call\`.
-
-Identity & phone handling:
-- If the caller gives partial digits, combine with known context (use caller ID for “this number”, prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
-
-Error/empty results:
-- If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
-
-Brevity:
-- Ask one question at a time. Avoid repeating requests once you have enough.
-
-Greeting example (model may paraphrase):
-- "Thanks for calling The Victory Team in Bel Air—how can I help today?"
-
-Output:
-- Short, natural voice responses (no bullet lists aloud).
-`;
-
-/* ===== HTTP + TwiML ===== */
-const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-
-app.get("/", (_req, res) => res.status(200).send("OK: AI Voice Agent up"));
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-
-app.post("/twiml", (req, res) => {
-  const from = req.body?.From || "";
-  const callSid = req.body?.CallSid || "";
-  console.log("[HTTP] /twiml", { from, callSid });
-
-  res.set("Content-Type", "text/xml");
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-
-  // Optional greeting helps confirm “it answered” even if WS handshake is slow.
-  const optSay = PRE_CONNECT_GREETING
-    ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>`
-    : "";
-
-  // Add status callback for visibility if Twilio can’t connect the WS.
-  const statusCb = process.env.STATUS_CALLBACK_URL
-    ? `<StatusCallback url="${process.env.STATUS_CALLBACK_URL}" />`
-    : "";
-
-  res.send(`
-    <Response>
-      ${optSay}
-      <Connect>
-        <Stream url="wss://${host}" track="inbound_track">
-          <Parameter name="from" value="${from}"/>
-          <Parameter name="CallSid" value="${callSid}"/>
-          <Parameter name="callSid" value="${callSid}"/>
-        </Stream>
-      </Connect>
-      ${statusCb}
-    </Response>
-  `.trim());
-  console.log("[HTTP] TwiML served with host", host);
-});
-
-function escapeXml(s=""){
-  return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c]));
+/* ===== TZ helpers (DST-safe) ===== */
+function todayISOInTZ(tz){
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day}`;
 }
-
-/* TwiML handoff target used during live transfer (no hardcoded speech) */
-app.post("/handoff", (_req, res) => {
-  const from = TWILIO_CALLER_ID || "";
-  res.type("text/xml").send(`
-    <Response>
-      <Dial callerId="${from}">
-        <Number>${OWNER_PHONE}</Number>
-      </Dial>
-    </Response>
-  `.trim());
-});
-
-const server = app.listen(PORT, () => {
-  console.log(`[INIT] listening on ${PORT}`);
-  console.log("[INIT] URLS", URLS);
-  console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
-});
-
-/* === Single WebSocketServer init guard === */
-let wss = globalThis.__victory_wss;
-if (!wss) {
-  wss = new WebSocketServer({ server, perMessageDeflate: false });
-  globalThis.__victory_wss = wss;
+function tzOffsetStringForDateISO(dateISO, tz) {
+  // Format a midday UTC instant in the target TZ and parse "GMT±H" offset from the name.
+  const probe = new Date(`${dateISO}T12:00:00Z`);
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" })
+    .formatToParts(probe);
+  const name = parts.find(p => p.type === "timeZoneName")?.value || "";
+  // Expect "GMT-4" or "UTC+1"
+  const m = name.match(/(?:GMT|UTC)([+-]\d{1,2})(?::?(\d{2}))?/);
+  if (!m) return "-00:00";
+  let hh = m[1]; // e.g. "-4" or "+9"
+  let mm = m[2] || "00";
+  if (!/^[+-]\d{2}$/.test(hh)) {
+    // pad to two digits
+    hh = (hh[0] + hh.slice(1).padStart(2, "0"));
+  }
+  return `${hh}:${mm}`;
 }
-
-/* ===== Utilities ===== */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function buildZonedUTC(dateISO, hour=0, minute=0, tz=BIZ_TZ) {
+  const HH = String(hour).padStart(2,"0");
+  const MM = String(minute).padStart(2,"0");
+  const off = tzOffsetStringForDateISO(dateISO, tz);
+  // Create a string with the local offset, then convert to real UTC ISO
+  return new Date(`${dateISO}T${HH}:${MM}:00${off}`).toISOString();
+}
+function weekdayIndexInTZ(dateISO, tz) {
+  // Get weekday seen in the business timezone using a noon-UTC probe (avoids boundary issues)
+  const probe = new Date(`${dateISO}T12:00:00Z`);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(probe).toLowerCase();
+  const idx = { sun:0, mon:1, tue:2, wed:3, thu:4, fri:5, sat:6 }[wd.slice(0,3)];
+  return idx ?? new Date(probe).getUTCDay(); // fallback
+}
+function addDaysISO(dateISO, days) {
+  const d = new Date(`${dateISO}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
+  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function nextWeekdayInTZ(baseDateISO, weekdayIdx, tz) {
+  for (let i = 1; i <= 7; i++) {
+    const cand = addDaysISO(baseDateISO, i);
+    if (weekdayIndexInTZ(cand, tz) === weekdayIdx) return cand;
+  }
+  // Fallback (shouldn't happen)
+  return addDaysISO(baseDateISO, 1);
+}
 
 /* ---- Time helpers ---- */
 function toLocalParts(iso, tz) {
@@ -289,16 +182,9 @@ function asUTC(iso) { return new Date(iso).toISOString(); }
 function dayWindowLocal(dateISO, tz) {
   const start_local = `${dateISO} 00:00`;
   const end_local   = `${dateISO} 23:59`;
-  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
-  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
+  const start_utc = buildZonedUTC(dateISO, 0, 0, tz);
+  const end_utc   = buildZonedUTC(dateISO, 23, 59, tz);
   return { start_local, end_local, start_utc, end_utc, timezone: tz };
-}
-function addDaysISO(dateISO, days) {
-  const d = new Date(`${dateISO}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  const f = new Intl.DateTimeFormat("en-CA", { timeZone: "UTC", year:"numeric", month:"2-digit", day:"2-digit" });
-  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day}`;
 }
 function rangeWindowLocal(startDateISO, days, tz) {
   const start = dayWindowLocal(startDateISO, tz);
@@ -311,11 +197,6 @@ function rangeWindowLocal(startDateISO, days, tz) {
     end_utc:     end.end_utc,
     timezone: tz
   };
-}
-function todayISOInTZ(tz){
-  const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
-  const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return `${p.year}-${p.month}-${p.day}`;
 }
 function withinBizHours(iso, tz){
   if (!BIZ_HOURS_START || !BIZ_HOURS_END) return true;
@@ -379,15 +260,8 @@ function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
   };
 }
 
-/* === Weekday parsing to prevent wrong-day bookings === */
+/* === Weekday parsing to prevent wrong-day bookings (TZ-safe) === */
 const WD = { sun:0, mon:1, tue:2, wed:3, thu:4, fri:5, sat:6 };
-function nextWeekdayISO(baseDateISO, weekdayIdx) {
-  const d = new Date(`${baseDateISO}T00:00:00Z`);
-  const baseIdx = d.getUTCDay();
-  let delta = (weekdayIdx - baseIdx + 7) % 7;
-  if (delta === 0) delta = 7; // upcoming occurrence, not today
-  return addDaysISO(baseDateISO, delta);
-}
 function inferRelativeDateISOFromUtterance(text, tz) {
   const s = (text||"").toLowerCase();
   const base = todayISOInTZ(tz);
@@ -395,9 +269,12 @@ function inferRelativeDateISOFromUtterance(text, tz) {
   if (/\btoday\b/.test(s)) return base;
   const m = s.match(/\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
   if (m) {
-    const key = m[1].slice(0,3);
-    const idx = WD[key];
-    if (idx != null) return nextWeekdayISO(base, idx);
+    const idx = WD[m[1].slice(0,3)];
+    if (idx != null) {
+      const target = nextWeekdayInTZ(base, idx, tz);
+      console.log("[RELDATE] base", base, "-> next", m[1], "=", target, "in", tz);
+      return target;
+    }
   }
   return null;
 }
@@ -405,14 +282,11 @@ function realignWindowToUtterance(startISO, endISO, utterance, tz) {
   const inferredDateISO = inferRelativeDateISOFromUtterance(utterance, tz);
   if (!inferredDateISO) return { startISO, endISO };
   const t = LAST_TIME_HINT.hour24 != null ? { h:LAST_TIME_HINT.hour24, m:(LAST_TIME_HINT.min||0) } : null;
-  const d = new Date(`${inferredDateISO}T00:00:00-04:00`); // TZ offset safe; we re-UTC below
-  if (t) d.setHours(t.h, t.m, 0, 0);
-  else {
-    const ph = new Date(startISO);
-    d.setHours(ph.getHours(), ph.getMinutes(), 0, 0);
-  }
-  const start = d.toISOString();
+
+  // Build exact UTC instants representing the intended local time in TZ (DST-safe)
+  const start = buildZonedUTC(inferredDateISO, t ? t.h : new Date(startISO).getHours(), t ? t.m : new Date(startISO).getMinutes(), tz);
   const end = new Date(new Date(start).getTime() + 60*60*1000).toISOString();
+  console.log("[REALIGN] utterance:", utterance, "->", inferredDateISO, "startUTC:", start);
   return { startISO: start, endISO: end };
 }
 
@@ -588,7 +462,6 @@ async function say(ws, text) {
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
       const b64 = Buffer.from(chunk).toString("base64");
-      // Twilio will play packets we send back on the same WS
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
     resp.data.on("end", () => console.log("[TTS] stream end"));
@@ -647,7 +520,7 @@ const Tools = {
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
 
-    // Re-align to utterance if weekday drifted (fixes Thu vs “next Mon” bug)
+    // Re-align to utterance if weekday drifted (fixes “next Mon” bug across DST)
     const realigned = realignWindowToUtterance(startISO, endISO, LAST_UTTERANCE, BIZ_TZ);
     startISO = realigned.startISO;
     endISO   = realigned.endISO;
@@ -1019,7 +892,7 @@ function resolveRelativeDateFromText(text, tz) {
   if (/\btomorrow\b/.test(s)) return addDaysISO(base, 1);
   if (/\btoday\b/.test(s)) return base;
   const m = s.match(/\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
-  if (m) return nextWeekdayISO(base, WD[m[1].slice(0,3)]);
+  if (m) return nextWeekdayInTZ(base, WD[m[1].slice(0,3)], tz);
   return null;
 }
 async function verifyHourAvailability({ text, replyText }) {
@@ -1029,10 +902,11 @@ async function verifyHourAvailability({ text, replyText }) {
   const dateISO = resolveRelativeDateFromText(text, BIZ_TZ);
   if (!dateISO) return null;
 
-  const startISO = new Date(`${dateISO}T00:00:00Z`).toISOString();
-  const endISO   = new Date(`${dateISO}T01:00:00Z`).toISOString();
+  // Build the exact intended hour in UTC for availability verification
+  const startISO = buildZonedUTC(dateISO, LAST_TIME_HINT.hour24, LAST_TIME_HINT.min || 0, BIZ_TZ);
+  const endISO   = new Date(new Date(startISO).getTime() + 60*60*1000).toISOString();
 
-  const check = await Tools.read_availability({ dateISO, startISO, endISO });
+  const check = await Tools.read_availability({ startISO, endISO });
   const busy = !!check?.summary?.busy;
   if (!busy) {
     const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
@@ -1069,7 +943,82 @@ async function updateSummary(mem) {
   }
 }
 
+/* ===== HTTP + TwiML ===== */
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+app.get("/", (_req, res) => res.status(200).send("OK: AI Voice Agent up"));
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
+app.post("/twiml", (req, res) => {
+  const from = req.body?.From || "";
+  const callSid = req.body?.CallSid || "";
+  console.log("[HTTP] /twiml", { from, callSid });
+
+  res.set("Content-Type", "text/xml");
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+
+  const optSay = PRE_CONNECT_GREETING
+    ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>`
+    : "";
+
+  const statusCb = process.env.STATUS_CALLBACK_URL
+    ? `<StatusCallback url="${process.env.STATUS_CALLBACK_URL}" />`
+    : "";
+
+  res.send(`
+    <Response>
+      ${optSay}
+      <Connect>
+        <Stream url="wss://${host}" track="inbound_track">
+          <Parameter name="from" value="${from}"/>
+          <Parameter name="CallSid" value="${callSid}"/>
+          <Parameter name="callSid" value="${callSid}"/>
+        </Stream>
+      </Connect>
+      ${statusCb}
+    </Response>
+  `.trim());
+  console.log("[HTTP] TwiML served with host", host);
+});
+
+/* TwiML handoff target used during live transfer */
+app.post("/handoff", (_req, res) => {
+  const from = TWILIO_CALLER_ID || "";
+  res.type("text/xml").send(`
+    <Response>
+      <Dial callerId="${from}">
+        <Number>${OWNER_PHONE}</Number>
+      </Dial>
+    </Response>
+  `.trim());
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`[INIT] listening on ${PORT}`);
+  console.log("[INIT] URLS", URLS);
+  console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
+});
+
+/* === Single WebSocketServer init guard === */
+let wss = globalThis.__victory_wss;
+if (!wss) {
+  wss = new WebSocketServer({ server, perMessageDeflate: false });
+  globalThis.__victory_wss = wss;
+}
+
+/* ===== Utilities ===== */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function escapeXml(s=""){ return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c])); }
+function escapeHtml(s=""){ return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+
 /* ===== Connection handling ===== */
+function newMemory() { return { transcript: [], summary: "" }; }
+function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.transcript.length>200) mem.transcript.shift(); }
+
+const CALLS = new Map();
+
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
 
@@ -1086,8 +1035,6 @@ if (!wss.__victory_handler_attached) {
     ws.__queuedTurn = null;
     ws.__lastUserText = "";
     ws.__lastUserAt = 0;
-    ws.__pendingFinal = "";
-    ws.__finalTimer = null;
 
     // Barge-in tracking
     ws.__lastAudioAt = 0;
@@ -1349,12 +1296,8 @@ if (!wss.__victory_handler_attached) {
   });
 }
 
-/* ===== Helper ===== */
-function escapeHtml(s=""){ return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
-
 /* ===== Notes =====
-- Optional PRE_CONNECT_GREETING gives an immediate audible "answer"; AI takes over on WS start.
-- Weekday/time inference prevents wrong-day bookings (e.g., “next Monday 2pm” won’t drift).
-- Blocks premature hangups if the last bot message was a question.
-- Greets on WS “start” (AI-driven, not hardcoded dialogs).
+- TZ/DST-safe next-weekday + hour construction stops the “Thursday instead of next Monday” issue.
+- We build UTC instants from business-local components using the live GMT offset for that date.
+- Added logs [RELDATE] and [REALIGN] to verify what the model inferred vs. what we booked.
 */
