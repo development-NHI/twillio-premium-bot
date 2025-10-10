@@ -1,12 +1,9 @@
-/* server.js — Prompt-driven, tool-called voice agent (strict-time + clean-TTS)
-   - All replies are LLM-generated (no hardcoded speaks)
-   - No hidden time shifting: books exactly the hour passed to tools
-   - Targeted availability checks use the exact window requested
-   - Natural readback with plain numerals, improved digit articulation
+/* server.js — Prompt-driven, tool-called voice agent (brain-in-prompt edition)
+   - Single-booking guarantee (no duplicate creates in same hour)
+   - Exact-hour verification before denying availability
+   - Natural readback + non-interrupting TTS latency
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Verbose per-request logging for debugging external calls
-   - Guard rails: blocks cancel-before-book on reschedules; injects exact availability check
-   - Pin-to-checked-slot, hard de-dupe, ASR debounce/merge, auto-hangup
 */
 
 import express from "express";
@@ -30,8 +27,8 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 /* Twilio (transfer + hangup) */
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || ""; // optional outbound callerId
+const OWNER_PHONE        = process.env.OWNER_PHONE        || ""; // human transfer target
 
 /* Business / routing identifiers */
 const DASH_BIZ    = process.env.DASH_BIZ || "";
@@ -40,11 +37,11 @@ const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 /* Business timezone */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
-/* Optional env-driven hours gate */
-const BIZ_HOURS_START = process.env.BIZ_HOURS_START || "";
-const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "";
+/* Optional env-driven hours gate (code only checks; wording is prompt-driven) */
+const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
+const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "17:00";
 
-/* External endpoints */
+/* External endpoints (Replit-first, then DASH_* fallback) */
 const URLS = {
   CAL_READ:     process.env.REPLIT_READ_URL     || process.env.DASH_CAL_READ_URL     || "",
   CAL_CREATE:   process.env.REPLIT_CREATE_URL   || process.env.DASH_CAL_CREATE_URL   || "",
@@ -114,39 +111,97 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
   }
 }
 
-/* ===== Prompt ===== */
+/* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-[Prompt-Version: 2025-10-09T01:15Z]
+[Prompt-Version: 2025-10-09T00:35Z]
 
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
-Tone & basics:
+Brand/Tone & Basics:
 - Friendly, concise, confident, local. Hours Mon–Fri 9–5 (America/New_York).
 - Office: 1316 E Churchville Rd, Bel Air, MD 21014. Main phone if asked: 833-888-1754.
-- Services: buyer consults & tours, seller consults (mention 1.75% model if asked), investors, general Q&A.
+- Services: buyer consults & tours, seller/listing consults (mention 1.75% model if asked), investors, general Q&A.
+- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1%; 5★ reviews.
 
-Data to collect before booking:
-- Name, phone, role, service, property/MLS (if showing), date/time, meeting type (in-person vs virtual; location if in-person), notes.
-
-Scheduling policy:
-- Use tools for read/hold/confirm. Resolve “today/tomorrow/next Tue” in America/New_York.
-- Read back once then book. If a slot is taken, offer 2–3 nearby options.
-- If a slot shows “canceled,” you may offer it.
-
-Cancel/Reschedule identity:
-- Name + phone must match the booking. If caller says “this number,” use caller ID.
-
-Tool rules:
-- ALWAYS call tools for availability, booking, cancel/reschedule, transfer, logging.
-- Do NOT state a time is unavailable unless read_availability for that exact hour returns busy.
-- When rescheduling, CANCEL by event_id then BOOK the caller’s requested exact time.
-
-Brevity:
-- One question at a time. Keep answers <15 words unless reading back.
+Interview style (anti-repeat):
+- Ask one question at a time. Keep answers <15 words unless reading back.
+- Maintain a scratchpad: Name, Phone, Role, Service, Property/MLS, Date, Time, Meeting Type, Notes.
+- Before asking, check the scratchpad. If you have it, do not ask again.
+- If the caller gives partial data (e.g., "443…"), ask only for the missing part.
 - If the caller talks while you’re speaking, accept it—don’t re-ask.
 
-End:
-- One short goodbye, then end_call.
+Data to collect before booking:
+- Full name, phone, role, service type, property/MLS (if showing), preferred date/time, meeting type (in-person vs virtual; location if in-person), notes (special requests).
+
+Scheduling policy:
+- Use tools for read/hold/confirm. Resolve "today/tomorrow/next Tue" in America/New_York.
+- Read back once then book. If slot taken, offer 2–3 nearby options.
+- If a slot shows "canceled," you may offer it.
+
+Cancel/Reschedule identity (name + phone only):
+- Require full name + phone on the booking. If caller says "this number," use caller ID.
+- Never call cancel blindly. Do this flow:
+  1) READ with contact_name + contact_phone (and exact start time if provided) to find appointment(s).
+  2) If exactly one future match, capture its "event_id".
+  3) For "cancel": cancel by "event_id".
+  4) For "reschedule": cancel by "event_id", then propose 2–3 nearby times and book the chosen one.
+  5) If none or multiple matches: ask only for the missing disambiguator (e.g., "what date/time was it?"). If still unclear, offer transfer.
+- Only cancel/reschedule for the person on the booking (same name + phone).
+- Important: When the caller gives a specific time (e.g., "tomorrow at 3 PM"), prefer a targeted read using "startISO"/"endISO" for that hour, not an all-day window. If the targeted read fails, then broaden (±1 day) and disambiguate briefly.
+
+Reschedule data integrity (must keep what the caller wants):
+- When rescheduling, preserve all prior details unless the caller changes them: service, meeting type (in-person vs virtual), location (office/property address), property/MLS, and notes/special requests.
+- If any of these are missing or ambiguous, ask one concise question to fill the gap **before** booking.
+- When calling \`book_appointment\`, include:
+  - \`service\` with the original/updated service name,
+  - \`notes\` summarizing key preferences (meeting type, location, property/MLS, special requests),
+  - the confirmed \`startISO\`/\`endISO\`,
+  - the same \`name\` and \`phone\` unless the caller updates them.
+- **Never create a second appointment to “add notes.” If the time is already booked for this caller, acknowledge they’re set and just confirm details conversationally.**
+- Read back the new plan once in a natural sentence: “Perfect—[day date time] for a [meeting type/service] [at location] about [property]. I’ll text a confirmation to [phone]. Anything else?”
+
+Wider search behavior (when caller gives no date/time):
+- Before rescheduling, call find_customer_events with name + phone (30 days). If you find any future bookings, read back short options and confirm which one to change; then use its "event_id".
+- Perform a contact-filtered READ across the next 30 days.
+- If you find any matches, read back short options like: "I found A) Wed 3–4 PM, B) Fri 11–12. Are you talking about one of these?"
+- If exactly one sounds right, proceed using its "event_id".
+- If none are found, ask for the date and approximate time.
+
+Tool rules:
+- Always use tools for availability, booking, cancel/reschedule (via READ→CANCEL→BOOK), transfer, and logging.
+- Do not invent tool outcomes. If a tool fails, say so briefly and offer next steps.
+- **Availability interpretation:** When \`read_availability\` returns an empty \`events\` array **or** \`{summary:{free:true}}\`, the slot is **available**. When \`events.length>0\` **or** \`{summary:{busy:true}}\`, it’s **unavailable**. Do not say a slot is taken if the array is empty.
+- **Before saying any specific time is unavailable, ALWAYS call \`read_availability\` for that exact hour window the caller mentioned. Never guess.**
+- After ANY tool call, ALWAYS speak: confirm, ask one question, or explain next steps.
+
+Outside hours:
+- Capture name, number, service, best time to reach; promise a callback during business hours.
+
+Operational guardrails:
+- After ANY tool call, ALWAYS speak. Never rely on silence to imply success.
+- One short goodbye only. When done, call \`end_call\`.
+
+Identity & phone handling:
+- If the caller gives partial digits, combine with known context (use caller ID when they say “this number”, prefer last-4 for confirmation). Once you have a plausible match (name+phone from tools), don’t re-ask.
+
+Cancel flow (candidate handling):
+- If cancel_appointment returns multiple candidates, read back SHORT options and ask which to cancel.
+- If exactly one future match is found, cancel it and confirm plainly.
+
+Error/empty results:
+- If tools return empty or fail, say so briefly and propose one next step (try another date, transfer, or callback).
+
+Brevity:
+- Ask one question at a time. Avoid repeating requests once you have enough.
+
+End call:
+- One short goodbye, then call \`end_call\`, then remain silent.
+
+Greeting example:
+- "Thanks for calling The Victory Team in Bel Air—how can I help today?"
+
+Output:
+- Short, natural voice responses (avoid bullet lists in speech).
 `;
 
 /* ===== HTTP + TwiML ===== */
@@ -163,6 +218,7 @@ app.post("/twiml", (req, res) => {
 
   res.set("Content-Type", "text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  // Twilio supports inbound_track | outbound_track | both_tracks. We only send inbound.
   res.send(`
     <Response>
       <Connect>
@@ -177,7 +233,7 @@ app.post("/twiml", (req, res) => {
   console.log("[HTTP] TwiML served with host", host);
 });
 
-/* TwiML handoff target for live transfer */
+/* TwiML handoff target used during live transfer (no hardcoded speech) */
 app.post("/handoff", (_req, res) => {
   const from = TWILIO_CALLER_ID || "";
   res.type("text/xml").send(`
@@ -195,7 +251,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === single WebSocketServer init guard === */
+/* === FIX: single WebSocketServer init guard (prevents 'Identifier "wss" already declared') === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -205,7 +261,7 @@ if (!wss) {
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---- Time helpers (no auto-shift) ---- */
+/* ---- Time helpers ---- */
 function toLocalParts(iso, tz) {
   const d = new Date(iso);
   const f = new Intl.DateTimeFormat("en-CA", {
@@ -230,6 +286,18 @@ function addDaysISO(dateISO, days) {
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
   return `${p.year}-${p.month}-${p.day}`;
 }
+function rangeWindowLocal(startDateISO, days, tz) {
+  const start = dayWindowLocal(startDateISO, tz);
+  const endDateISO = addDaysISO(startDateISO, Math.max(0, days - 1));
+  const end = dayWindowLocal(endDateISO, tz);
+  return {
+    start_local: start.start_local,
+    end_local:   end.end_local,
+    start_utc:   start.start_utc,
+    end_utc:     end.end_utc,
+    timezone: tz
+  };
+}
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value, a), {});
@@ -248,13 +316,230 @@ function withinBizHours(iso, tz){
   return nowMin >= startMin && nowMin < endMin;
 }
 
-/* Validate ISO hour/minute */
-function isValidISOHour(iso) {
-  const d = new Date(iso); if (isNaN(d)) return false;
-  const m = String(iso).match(/T(\d{2}):(\d{2}):/);
-  if (!m) return true;
-  const hh = +m[1], mm = +m[2];
-  return hh >= 0 && hh < 24 && mm >= 0 && mm < 60;
+/* ===== Natural-time intent guard ===== */
+let LAST_UTTERANCE = "";
+let LAST_TIME_HINT = { hour24: null, min: 0, ts: 0 }; // recent parsed time
+
+function parseUserTime(text=""){
+  const rx = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/ig;
+  let m, last=null;
+  while ((m = rx.exec(text))) last = m;
+  if (!last) return null;
+  let [_, h, mm, ap] = last;
+  let hour = parseInt(h,10);
+  const min = parseInt(mm||"0",10);
+  const pm = /^p/i.test(ap);
+  if (hour === 12) hour = pm ? 12 : 0;
+  else if (pm) hour += 12;
+  return { hour24: hour, min };
+}
+function localHourFromISO(iso, tz){
+  const lp = toLocalParts(iso, tz);
+  return parseInt(lp.slice(11,13),10);
+}
+function shiftISOByHours(iso, deltaHours){
+  const d = new Date(iso);
+  d.setHours(d.getHours()+deltaHours);
+  return d.toISOString();
+}
+function adjustWindowToIntent({ startISO, endISO }, tz, lastText){
+  let intent = parseUserTime(lastText||"");
+  if (!intent && LAST_TIME_HINT.hour24 != null && (Date.now() - LAST_TIME_HINT.ts) < 120000) {
+    intent = { hour24: LAST_TIME_HINT.hour24, min: LAST_TIME_HINT.min };
+  }
+  if (!intent) return {
+    start_local: toLocalParts(startISO, tz),
+    end_local:   toLocalParts(endISO, tz),
+    start_utc:   asUTC(startISO),
+    end_utc:     asUTC(endISO)
+  };
+  const providedLocalHour = localHourFromISO(startISO, tz);
+  const delta = intent.hour24 - providedLocalHour;
+  const startUTCAdj = shiftISOByHours(startISO, delta);
+  const endUTCAdj   = shiftISOByHours(endISO,   delta);
+  return {
+    start_local: toLocalParts(startUTCAdj, tz),
+    end_local:   toLocalParts(endUTCAdj, tz),
+    start_utc:   startUTCAdj,
+    end_utc:     endUTCAdj
+  };
+}
+
+/* === Deepgram ASR (μ-law passthrough) === */
+// Faster finalization: endpointing 900ms
+function startDeepgram({ onFinal, wsRef }) {
+  const url =
+    "wss://api.deepgram.com/v1/listen"
+    + "?encoding=mulaw"
+    + "&sample_rate=8000"
+    + "&channels=1"
+    + "&model=nova-2-phonecall"
+    + "&interim_results=true"
+    + "&smart_format=true"
+    + "&endpointing=900";
+  console.log("[Deepgram] connecting", url);
+  const dg = new WebSocket(url, {
+    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    perMessageDeflate: false
+  });
+  dg.on("open", () => console.log("[Deepgram] open"));
+
+  let lastInterimLog = 0;
+  dg.on("message", (data) => {
+    let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
+    const alt = ev.channel?.alternatives?.[0];
+    const text = (alt?.transcript || "").trim();
+    if (!text) return;
+    if (ev.is_final || ev.speech_final) {
+      console.log(`[ASR FINAL] ${text}`);
+      onFinal?.(text);
+    } else {
+      const now = Date.now();
+      if (now - lastInterimLog > 1200) {
+        console.log(`[ASR interim] ${text}`);
+        lastInterimLog = now;
+      }
+      try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
+    }
+  });
+  dg.on("error", e => console.error("[Deepgram error]", e.message));
+  dg.on("close", () => console.log("[Deepgram] closed"));
+  return {
+    sendULaw(buf){
+      try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
+    },
+    close(){ try { dg.close(); } catch {} }
+  };
+}
+
+/* === ElevenLabs TTS === */
+const QUIET_MS = 500;          // required silence before TTS
+const QUIET_TIMEOUT_MS = 900;  // max wait to avoid long latency
+
+/* === Improved number/phone speaking === */
+const DIGIT_WORD = { "0":"zero","1":"one","2":"two","3":"three","4":"four","5":"five","6":"six","7":"seven","8":"eight","9":"nine" };
+
+function digitsToWords(d) {
+  const words = d.split("").map(ch => DIGIT_WORD[ch] ?? ch);
+  if (d.length === 10) return `${words.slice(0,3).join(" ")} , ${words.slice(3,6).join(" ")} , ${words.slice(6).join(" ")}`;
+  if (d.length === 11 && d[0] === "1") return `one , ${words.slice(1,4).join(" ")} , ${words.slice(4,7).join(" ")} , ${words.slice(7).join(" ")}`;
+  return words.map((w,i)=> ((i>0 && i%4===0) ? `, ${w}` : w)).join(" ");
+}
+
+function phoneToWords(raw="") {
+  const s = (raw||"").replace(/[^\dxX+]/g,"").replace(/^(\+?1)(?=\d{10}\b)/, "1");
+  const m = s.match(/^(1)?(\d{3})(\d{3})(\d{4})(?:[xX](\d{2,6}))?$/);
+  if (!m) return null;
+  const [, c, a, b, c4, ext] = m;
+  const core = digitsToWords(`${c||""}${a}${b}${c4}`);
+  return ext ? `${core} , extension ${digitsToWords(ext)}` : core;
+}
+
+function normalizeNumbersForSpeech(text="") {
+  text = text.replace(
+    /(?:\+?1[\s-\.]?)?\(?\d{3}\)?[\s-\.]?\d{3}[\s-\.]?\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{2,6})?/gi,
+    (m) => phoneToWords(m) || m
+  );
+  text = text.replace(/\b\d{5,}\b/g, (m) => digitsToWords(m));
+  return text;
+}
+
+function cleanTTS(s=""){
+  const base = String(s)
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/`{1,3}[^`]*`{1,3}/g, "")
+    .replace(/^-+\s*/gm, "")
+    .replace(/^\d+\.\s*/gm, "")
+    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, ", ")
+    .trim();
+  return normalizeNumbersForSpeech(base);
+}
+function formatPhoneForSpeech(s=""){
+  const only = (s||"").replace(/\D+/g,"");
+  if (only.length >= 10) {
+    const last10 = only.slice(-10);
+    const withCC  = (only.length===11 && only[0]==="1") ? `1${last10}` : last10;
+    return phoneToWords(withCC) || digitsToWords(withCC);
+  }
+  return normalizeNumbersForSpeech(s);
+}
+
+function compressReadback(text=""){
+  const pairs = [...text.matchAll(/(?:^|[\s,.-])(Name|Phone|Role|Service|Property|Address|MLS|Date\/Time|Date|Time|Meeting Type|Location|Notes)\s*:\s*([^.;\n]+?)(?=(?:\s{2,}|[,.;]|$))/gi)];
+  if (pairs.length >= 2) {
+    const mapped = pairs.map(([,k,v]) => [k.toLowerCase(), v.trim()]);
+    const get = key => (mapped.find(([k]) => k===key)?.[1] || "");
+    const name = get("name");
+    const phone = formatPhoneForSpeech(get("phone"));
+    const svc   = get("service");
+    const prop  = get("property") || get("address") || get("mls");
+    const when  = get("date/time") || `${get("date")} ${get("time")}`.trim();
+    const meet  = get("meeting type");
+    const loc   = get("location");
+    const notes = get("notes");
+
+    const parts = [];
+    if (when) parts.push(`you're set for ${when}`);
+    if (svc || meet) {
+      const what = [meet, svc].filter(Boolean).join(" ");
+      if (what) parts.push(`for a ${what}`);
+    }
+    if (prop) parts.push(`about ${prop}`);
+    if (loc) parts.push(`at ${loc}`);
+    if (name) parts.push(`for ${name}`);
+    if (phone) parts.push(`I'll text a confirmation to ${phone}`);
+    if (notes) parts.push(`note: ${notes}`);
+
+    const line = (parts.filter(Boolean).join(", ") || "All set") + ".";
+    return line.charAt(0).toUpperCase() + line.slice(1) + " Does that look right?";
+  }
+  return text;
+}
+function shouldSpeak(ws, normalized=""){
+  const now = Date.now();
+  if (ws.__pendingHangupUntil && now < ws.__pendingHangupUntil) return false;
+  return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
+}
+async function say(ws, text) {
+  if (!text || !ws.__streamSid) return;
+  if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
+
+  let waited = 0;
+  while (true) {
+    const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
+    const since = Date.now() - lastHuman;
+    if (since >= QUIET_MS) break;
+    if (waited >= QUIET_TIMEOUT_MS) break;
+    await sleep(100);
+    waited += 100;
+  }
+
+  const speak = cleanTTS(compressReadback(text));
+  if (!shouldSpeak(ws, speak)) return;
+
+  ws.__lastBotText = speak;
+  ws.__lastBotAt = Date.now();
+  console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
+
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    console.warn("[TTS] missing ElevenLabs credentials]");
+    return;
+  }
+  try {
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
+      { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
+    resp.data.on("data", chunk => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      const b64 = Buffer.from(chunk).toString("base64");
+      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
+    });
+    resp.data.on("end", () => console.log("[TTS] stream end"));
+  } catch(e){ console.error("[TTS ERROR]", e.message); }
 }
 
 /* ===== Minimal Memory ===== */
@@ -269,185 +554,17 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 /* ===== Track live websockets by call ===== */
 const CALLS = new Map(); // callSid => ws
 
-/* ===== TTS helpers ===== */
-const QUIET_MS = 500;
-const QUIET_TIMEOUT_MS = 1200;
-
-function cleanTTS(s=""){
-  return String(s)
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/`{1,3}[^`]*`{1,3}/g, "")
-    .replace(/^-+\s*/gm, "")
-    .replace(/^\d+\.\s*/gm, "")
-    .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
-    .replace(/^#{1,6}\s*/gm, "")
-    .replace(/\s{2,}/g, " ")
-    .replace(/\n{2,}/g, ". ")
-    .replace(/\n/g, ", ")
-    .trim();
-}
-
-/* Number clarity normalizer */
-function normalizeNumbersForTTS(s="") {
-  let t = s;
-
-  // Phone numbers → spaced digits
-  t = t.replace(
-    /(?:\+1[\s\-\.]?)?\(?(\d{3})\)?[\s\-\.]?(\d{3})[\s\-\.]?(\d{4})/g,
-    (_, a, b, c) => `${a.split("").join(" ")} ${b.split("").join(" ")} ${c.split("").join(" ")}`
-  );
-
-  // Long digit runs (7+)
-  t = t.replace(/\b(\d{7,})\b/g, (m) => m.split("").join(" "));
-
-  // Help phrases like “at 2 PM”
-  t = t.replace(/\bat\s+(\d{1,2})(:\d{2})?\s*(AM|PM)\b/gi, (_, h, mm="", ap) => `at, ${h}${mm} ${ap}`);
-
-  return t;
-}
-
-function shouldSpeak(ws, normalized=""){
-  const now = Date.now();
-  if (ws.__pendingHangupUntil && now < ws.__pendingHangupUntil) return false;
-  return !(ws.__lastBotText === normalized && now - (ws.__lastBotAt || 0) < 4000);
-}
-async function say(ws, text) {
-  if (!text || !ws.__streamSid) return;
-  if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
-
-  // Wait for caller silence
-  let waited = 0;
-  while (true) {
-    const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
-    const since = Date.now() - lastHuman;
-    if (since >= QUIET_MS) break;
-    if (waited >= QUIET_TIMEOUT_MS) break;
-    await sleep(100);
-    waited += 100;
-  }
-
-  const speak = normalizeNumbersForTTS(cleanTTS(text));
-  if (!shouldSpeak(ws, speak)) return;
-
-  ws.__lastBotText = speak;
-  ws.__lastBotAt = Date.now();
-  console.log(JSON.stringify({ event:"BOT_SAY", reply:speak }));
-
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
-    console.warn("[TTS] missing ElevenLabs credentials]");
-    return;
-  }
-  try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=0&output_format=ulaw_8000`;
-    const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.55, similarity_boost:0.8 } },
-      { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
-
-    // Pause frames if caller resumes talking
-    resp.data.on("data", chunk => {
-      if (ws.readyState !== WebSocket.OPEN) return;
-      if (Date.now() - (ws.__lastASRInterimAt || 0) < 150) return;
-      const b64 = Buffer.from(chunk).toString("base64");
-      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
-    });
-    resp.data.on("end", () => console.log("[TTS] stream end"));
-  } catch(e){ console.error("[TTS ERROR]", e.message); }
-}
-
-/* ===== Tool Registry ===== */
-let currentTrace = { convoId:"", callSid:"" };
-let CURRENT_FROM = "";
-let LAST_UTTERANCE = "";
-
-/* ===== Request-slot parser & guard ===== */
-function parseRequestedSlot(text, tz) {
-  if (!text) return null;
-  const t = text.toLowerCase();
-  const today = todayISOInTZ(tz);
-  let baseDateISO = today;
-
-  if (/\btomorrow\b/.test(t)) baseDateISO = addDaysISO(today, 1);
-  else if (/\btoday\b/.test(t)) baseDateISO = today;
-  else {
-    const m = t.match(/(\d{4})-(\d{2})-(\d{2})/);
-    if (m) baseDateISO = `${m[1]}-${m[2]}-${m[3]}`;
-  }
-
-  const timeRe = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?/i;
-  const m2 = t.match(timeRe);
-  if (!m2) return null;
-  let hour = parseInt(m2[1],10);
-  let minute = m2[2] ? parseInt(m2[2],10) : 0;
-  const ampm = (m2[3]||"").replace(/\./g,"").toLowerCase();
-  if (ampm === "pm" && hour < 12) hour += 12;
-  if (ampm === "am" && hour === 12) hour = 0;
-
-  const pad = (n)=> String(n).padStart(2,"0");
-  const startISO = `${baseDateISO}T${pad(hour)}:${pad(minute)}:00${offsetForTZ(tz)}`;
-  const endISO   = `${baseDateISO}T${pad(Math.min(hour+1,23))}:${pad(minute)}:00${offsetForTZ(tz)}`;
-  return { dateISO: baseDateISO, startISO, endISO };
-}
-function offsetForTZ(tz){
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
-  const parts = fmt.formatToParts(now);
-  const off = parts.find(p=>p.type==='timeZoneName')?.value || 'GMT-04:00';
-  const m = off.match(/GMT([+-]\d{2}:\d{2})/);
-  return m ? m[1] : '-04:00';
-}
-
-/* Inject availability for explicit hours or broad day asks */
-async function ensureExactAvailabilityInjected(ws, messages, userText){
-  const slot = parseRequestedSlot(userText, BIZ_TZ);
-
-  if (!slot) {
-    if (/\btoday\b/i.test(userText||"") || /\btomorrow\b/i.test(userText||"")) {
-      const base = /\btomorrow\b/i.test(userText||"")
-        ? addDaysISO(todayISOInTZ(BIZ_TZ),1)
-        : todayISOInTZ(BIZ_TZ);
-      const s = `${base}T09:00:00${offsetForTZ(BIZ_TZ)}`;
-      const e = `${base}T17:00:00${offsetForTZ(BIZ_TZ)}`;
-      try {
-        const res = await Tools.read_availability({ dateISO: base, startISO: s, endISO: e });
-        const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify({ dateISO: base, startISO: s, endISO: e }) } }] };
-        const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
-        return [...messages, synthetic, toolMsg];
-      } catch { return messages; }
-    }
-    return messages;
-  }
-
-  const key = `${slot.startISO}__${slot.endISO}`;
-  if (ws.__checkedWindows?.has(key)) return messages;
-  try {
-    const res = await Tools.read_availability(slot);
-    ws.__checkedWindows = ws.__checkedWindows || new Set();
-    ws.__checkedWindows.add(key);
-    const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify(slot) } }] };
-    const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
-    return [...messages, synthetic, toolMsg];
-  } catch {
-    return messages;
-  }
-}
-
+/* ===== Tool Registry (prompt-driven usage) ===== */
 const Tools = {
-  async read_availability({ dateISO, startISO, endISO }) {
-    console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
+  async read_availability({ dateISO, startISO, endISO, name, phone }) {
+    console.log("[TOOL] read_availability", { dateISO, startISO, endISO, name: !!name, phone: !!phone });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
-      if ((startISO && !isValidISOHour(startISO)) || (endISO && !isValidISOHour(endISO))) {
-        console.warn("[TOOLS] invalid ISO; ignoring model window");
-        startISO = endISO = undefined;
-      }
-
+      // IMPORTANT: availability should reflect *all* events; do NOT filter by contact
       let windowObj;
       if (startISO && endISO) {
-        windowObj = {
-          start_local: toLocalParts(startISO, BIZ_TZ),
-          end_local:   toLocalParts(endISO,   BIZ_TZ),
-          start_utc:   asUTC(startISO),
-          end_utc:     asUTC(endISO)
-        };
+        const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
+        windowObj = { ...win };
       } else if (dateISO) {
         const w = dayWindowLocal(dateISO, BIZ_TZ);
         windowObj = { start_local: w.start_local, end_local: w.end_local, start_utc: w.start_utc, end_utc: w.end_utc };
@@ -463,6 +580,7 @@ const Tools = {
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: windowObj
+        // no contact filter for availability
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
         timeout:12000, tag:"CAL_READ",
@@ -473,14 +591,6 @@ const Tools = {
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
 
-      const ws = CALLS.get(currentTrace.callSid);
-      if (ws && windowObj.start_utc && windowObj.end_utc) {
-        ws.__lastCheckedSlot = {
-          startISO: windowObj.start_utc,
-          endISO:   windowObj.end_utc
-        };
-      }
-
       return { data: { ...data, events }, summary };
     } catch { return { summary:{ busy:false, free:true } }; }
   },
@@ -490,43 +600,30 @@ const Tools = {
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
-    if (ws?.__lastCheckedSlot) {
-      const wantStartUTC = asUTC(startISO);
-      const last = ws.__lastCheckedSlot;
-      const delta = Math.abs(new Date(wantStartUTC) - new Date(last.startISO));
-      if (isFinite(delta) && delta > 5 * 60 * 1000) {
-        startISO = last.startISO;
-        endISO   = last.endISO;
-      }
-    }
-
-    if (ws?.__lastBookedStartUTC && ws?.__lastBookedAt) {
-      const sameHour = ws.__lastBookedStartUTC === asUTC(startISO);
-      const recent   = (Date.now() - ws.__lastBookedAt) < 60_000;
-      if (sameHour && recent) return { ok:true, already:true, message:"dedup: already booked", data: ws.__confirmedBooking };
-    }
-
+    // Single-booking guarantee: if this hour already confirmed for this call, do not create again
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
-      if (b?.start_utc && b.start_utc === asUTC(startISO)) {
+      if (b?.start_utc && b.start_utc === asUTC(adjustWindowToIntent({startISO,endISO},BIZ_TZ,LAST_UTTERANCE).start_utc)) {
         return { ok:true, already:true, data:b, message:"already booked; details confirmed" };
       }
     }
 
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
+      const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
-      if (!withinBizHours(startISO, BIZ_TZ)) { /* proceed */ }
+      // Soft-hours check (let backend decide final)
+      if (!withinBizHours(win.start_utc, BIZ_TZ)) { /* proceed */ }
 
       const payload = {
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
         Timezone: BIZ_TZ,
-        Start_Time_Local: toLocalParts(startISO, BIZ_TZ),
-        End_Time_Local:   toLocalParts(endISO,   BIZ_TZ),
-        Start_Time_UTC:   asUTC(startISO),
-        End_Time_UTC:     asUTC(endISO),
+        Start_Time_Local: win.start_local,
+        End_Time_Local:   win.end_local,
+        Start_Time_UTC:   win.start_utc,
+        End_Time_UTC:     win.end_utc,
         Customer_Name: name||"",
         Customer_Phone: normalizedPhone,
         Customer_Email: "",
@@ -546,31 +643,26 @@ const Tools = {
         timezone:    data?.timezone    || BIZ_TZ,
         service
       };
-      if (ws) {
-        ws.__confirmedBooking = booked;
-        ws.__lastBookedAt = Date.now();
-        ws.__lastBookedStartUTC = booked.start_utc;
-      }
+      if (ws) ws.__confirmedBooking = booked;
       return { ok:true, data: booked };
     } catch(e){
+      // If backend says "not available", verify it isn't already booked by this caller for this hour
       const status = e.response?.status || 0;
       const body = e.response?.data && JSON.stringify(e.response.data) || "";
       if (status === 400 && /not available/i.test(body)) {
         try {
+          const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
           const readPayload = {
             intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
-            window: {
-              start_local: toLocalParts(startISO, BIZ_TZ),
-              end_local:   toLocalParts(endISO,   BIZ_TZ),
-              start_utc:   asUTC(startISO),
-              end_utc:     asUTC(endISO)
-            },
+            window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
+            // verify via phone only (name typos shouldn't block)
             contact_phone: (phone||CURRENT_FROM||"") || undefined
           };
           const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
             trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
-          const ev = (r?.events||[]).find(ev => ev.start_utc === asUTC(startISO));
+          const ev = (r?.events||[]).find(ev => ev.start_utc === win.start_utc);
           if (ev) {
+            const ws = CALLS.get(currentTrace.callSid);
             const booked = {
               event_id: ev.event_id,
               start_local: ev.start_local,
@@ -580,11 +672,7 @@ const Tools = {
               timezone:    ev.timezone || BIZ_TZ,
               service
             };
-            if (ws) {
-              ws.__confirmedBooking = booked;
-              ws.__lastBookedAt = Date.now();
-              ws.__lastBookedStartUTC = booked.start_utc;
-            }
+            if (ws) ws.__confirmedBooking = booked;
             return { ok:true, already:true, data: booked, message:"already booked; confirming details" };
           }
         } catch {}
@@ -597,11 +685,6 @@ const Tools = {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { ok:false };
 
-    const ws = CALLS.get(currentTrace.callSid);
-    if (ws?.__rescheduleRequested && !ws?.__confirmedBooking) {
-      return { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
-    }
-
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
     try {
@@ -609,19 +692,22 @@ const Tools = {
 
       if (!id) {
         const baseDate = todayISOInTZ(BIZ_TZ);
-        const start = dateISO ? dateISO : baseDate;
-        const end   = addDaysISO(start, 30);
+        const windowObj = dateISO
+          ? dayWindowLocal(dateISO, BIZ_TZ)
+          : rangeWindowLocal(baseDate, 30, BIZ_TZ);
+
         const readPayload = {
           intent: "READ",
           biz: DASH_BIZ,
           source: DASH_SOURCE,
           timezone: BIZ_TZ,
           window: {
-            start_local: `${start} 00:00`,
-            end_local:   `${addDaysISO(end, -1)} 23:59`,
-            start_utc:   new Date(`${start}T00:00:00`).toISOString(),
-            end_utc:     new Date(`${end}T23:59:00`).toISOString()
+            start_local: windowObj.start_local,
+            end_local:   windowObj.end_local,
+            start_utc:   windowObj.start_utc,
+            end_utc:     windowObj.end_utc
           },
+          // prefer phone-only match to avoid name typos blocking lookup
           contact_phone: normalizedPhone || undefined
         };
 
@@ -649,6 +735,8 @@ const Tools = {
 
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
 
+      // clear single-booking locker if same event
+      const ws = CALLS.get(currentTrace.callSid);
       if (ws?.__confirmedBooking?.event_id === id) ws.__confirmedBooking = null;
 
       return { ok, data };
@@ -663,19 +751,22 @@ const Tools = {
     const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
     try {
       const baseDate = todayISOInTZ(BIZ_TZ);
-      const capped = Math.max(1, Math.min(60, days || 30));
-      const endISO = addDaysISO(baseDate, capped);
+      // Expand horizon to include "tomorrow" at minimum; cap at 60
+      const mentionsTomorrow = /\btomorrow\b/i.test(LAST_UTTERANCE || "");
+      const daysToUse = Math.max(mentionsTomorrow ? 2 : 1, Math.min(60, days || 30));
+      const w = rangeWindowLocal(baseDate, daysToUse, BIZ_TZ);
       const payload = {
         intent: "READ",
         biz: DASH_BIZ,
         source: DASH_SOURCE,
         timezone: BIZ_TZ,
         window: {
-          start_local: `${baseDate} 00:00`,
-          end_local:   `${addDaysISO(endISO, -1)} 23:59`,
-          start_utc:   new Date(`${baseDate}T00:00:00`).toISOString(),
-          end_utc:     new Date(`${endISO}T23:59:00`).toISOString()
+          start_local: w.start_local,
+          end_local:   w.end_local,
+          start_utc:   w.start_utc,
+          end_utc:     w.end_utc
         },
+        // Use phone-only to avoid name spelling mismatches blocking the lookup
         contact_phone: normalizedPhone || undefined
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, {
@@ -756,20 +847,22 @@ const Tools = {
   }
 };
 
-/* Tool schema */
+/* Tool schema advertised to the model */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
-      description:"Read calendar availability in a given window. No contact filter.",
+      description:"Read calendar availability in a given window. Optionally filter by contact (name+phone).",
       parameters:{ type:"object", properties:{
         dateISO:{type:"string", description:"YYYY-MM-DD in business timezone"},
-        startISO:{type:"string", description:"ISO start (with offset or Z)"},
-        endISO:{type:"string", description:"ISO end (with offset or Z)"}
+        startISO:{type:"string", description:"ISO start"},
+        endISO:{type:"string", description:"ISO end"},
+        name:{type:"string"},
+        phone:{type:"string"}
       }, required:[] }
   }},
   { type:"function", function:{
       name:"book_appointment",
-      description:"Create a calendar event for the exact window provided.",
+      description:"Create a calendar event. Single-booking guarantee prevents duplicates in the same hour for this caller.",
       parameters:{ type:"object", properties:{
         name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
         startISO:{type:"string"}, endISO:{type:"string"}, notes:{type:"string"}
@@ -863,46 +956,41 @@ function buildMessages(mem, userText, tenantPrompt) {
 }
 
 /* ===== WS wiring ===== */
-function newSummaryPromptText(mem){
-  return mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
-}
+let currentTrace = { convoId:"", callSid:"" };
+let CURRENT_FROM = "";
 
-async function updateSummary(mem) {
-  const last = newSummaryPromptText(mem);
-  try {
-    const { data } = await httpPost(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        temperature: 0.1,
-        messages: [
-          { role:"system", content:`Summarize the dialog in 2 lines. Include name, phone, service, date/time if known. TZ=${BIZ_TZ}.` },
-          { role:"user", content: last }
-        ]
-      },
-      { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout: 20000, tag:"OPENAI_SUMMARY",
-        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
-    );
-    mem.summary = data.choices?.[0]?.message?.content?.trim()?.slice(0, 500) || "";
-    console.log("[SUMMARY] len", mem.summary.length);
-  } catch(e){
-    console.warn("[SUMMARY] error", e.message);
+/* === Auto-verify helper: if model denies a caller’s requested hour, verify via read_availability === */
+function resolveRelativeDateFromText(text, tz) {
+  const s = (text||"").toLowerCase();
+  const base = todayISOInTZ(tz);
+  if (/\btomorrow\b/.test(s)) return addDaysISO(base, 1);
+  if (/\btoday\b/.test(s)) return base;
+  return null;
+}
+async function verifyHourAvailability({ text, replyText }) {
+  if (!/\b(not\s+available|isn['’]t\s+available|unavailable)\b/i.test(replyText||"")) return null;
+  if (LAST_TIME_HINT.hour24 == null || Date.now() - (LAST_TIME_HINT.ts||0) > 120000) return null;
+
+  const dateISO = resolveRelativeDateFromText(text, BIZ_TZ);
+  if (!dateISO) return null;
+
+  const startISO = new Date(`${dateISO}T00:00:00Z`).toISOString();
+  const endISO   = new Date(`${dateISO}T01:00:00Z`).toISOString();
+
+  const check = await Tools.read_availability({ dateISO, startISO, endISO });
+  const busy = !!check?.summary?.busy;
+  if (!busy) {
+    const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
+    const hh12 = ((h + 11) % 12) + 1;
+    const mm = m ? `:${String(m).padStart(2,'0')}` : "";
+    const ampm = h >= 12 ? "PM" : "AM";
+    const dayWord = /\btomorrow\b/i.test(text) ? "tomorrow" : "that time";
+    return `Good news—${dayWord} at ${hh12}${mm} ${ampm} is open. Want me to lock it in?`;
   }
+  return null;
 }
 
-let CURRENT_PROMPT = RENDER_PROMPT;
-
-/* Strict farewell detection */
-function isFarewell(s="") {
-  const t = String(s).trim();
-  if (!t) return false;
-  if (t.endsWith("?")) return false;
-  const farewell = /\b(?:goodbye|bye|talk to you (?:later|soon)|see you|take care|have a (?:great|good) (?:day|one))\b/i;
-  if (farewell.test(t)) return true;
-  if (/\bthank(?:s| you)\b/i.test(t) && /\b(?:goodbye|bye)\b/i.test(t)) return true;
-  return false;
-}
-
+/* Ensure one handler */
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
 
@@ -919,6 +1007,8 @@ if (!wss.__victory_handler_attached) {
     ws.__queuedTurn = null;
     ws.__lastUserText = "";
     ws.__lastUserAt = 0;
+    ws.__pendingFinal = "";
+    ws.__finalTimer = null;
 
     // Barge-in tracking
     ws.__lastAudioAt = 0;
@@ -941,15 +1031,7 @@ if (!wss.__victory_handler_attached) {
 
     // Memory and booking-lock
     ws.__mem = newMemory();
-    ws.__confirmedBooking = null;
-    ws.__rescheduleRequested = false;
-
-    // Last *checked* availability slot
-    ws.__lastCheckedSlot = null;
-
-    // De-dupe booking
-    ws.__lastBookedAt = 0;
-    ws.__lastBookedStartUTC = "";
+    ws.__confirmedBooking = null; // single-booking locker
 
     // Heartbeat
     const hb = setInterval(() => {
@@ -972,7 +1054,7 @@ if (!wss.__victory_handler_attached) {
             await httpPost(url, params, {
               auth, timeout: 10000, tag:"TWILIO_HANGUP",
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: ws.__convoId }
+              trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: currentTrace.convoId }
             });
           }
         } catch(e) { console.warn("[HANGUP] error", e.message); }
@@ -980,8 +1062,6 @@ if (!wss.__victory_handler_attached) {
         setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
       }, ms);
     }
-
-    /* Flush μ-law with slightly slower tail */
     function flushULaw() {
       if (!pendingULaw.length || !dg) return;
       const chunk = Buffer.concat(pendingULaw);
@@ -991,7 +1071,7 @@ if (!wss.__victory_handler_attached) {
         console.log("[MEDIA] flush", { frames: Math.round(chunk.length / 160), bytes: chunk.length });
         lastMediaLog = now;
       }
-      try { dg.sendULaw(chunk); } catch {}
+      dg.sendULaw(chunk);
     }
 
     async function postCallLogOnce(ws, reason) {
@@ -1009,10 +1089,6 @@ if (!wss.__victory_handler_attached) {
 
     async function resolveToolChain(baseMessages) {
       let messages = baseMessages.slice();
-
-      // availability injection
-      messages = await ensureExactAvailabilityInjected(ws, messages, ws.__lastUserText || "");
-
       for (let hops = 0; hops < 8; hops++) {
         const choice = await openaiChat(messages);
         const msg = choice?.message || {};
@@ -1023,16 +1099,6 @@ if (!wss.__victory_handler_attached) {
           let args = {};
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-
-          if (ws.__lastUserText && /resched|move|change.*(time|appt|appointment)/i.test(ws.__lastUserText)) {
-            ws.__rescheduleRequested = true;
-          }
-
-          if (name === "cancel_appointment" && ws.__rescheduleRequested && !ws.__confirmedBooking) {
-            const toolResult = { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
-            messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
-            continue;
-          }
 
           console.log("[TOOL] call ->", name, args);
           const impl = Tools[name];
@@ -1056,34 +1122,24 @@ if (!wss.__victory_handler_attached) {
       if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
       console.log("[TURN] user >", userText);
 
-      const doneIntent = /(?:that'?ll be it|that is all|that'?s all|nothing else|we'?re done|we are done|bye|goodbye|hang up|end the call)/i;
-      if (doneIntent.test(userText)) {
-        // LLM still generates farewell. Pass to tools after speak.
-        const messages = buildMessages(ws.__mem, "User said they are done. Say goodbye.", ws.__tenantPrompt);
-        const finalText = await resolveToolChain(messages);
-        if (finalText) { await say(ws, finalText); remember(ws.__mem, "bot", finalText); }
-        await Tools.end_call({ callSid: ws.__callSid, reason: "user_done" });
-        return;
-      }
-
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
-      const finalText = await resolveToolChain(messages);
+      let finalText = await resolveToolChain(messages);
+
+      // If the model denied a requested time, re-verify that hour and correct if free
+      const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
+      if (corrected) finalText = corrected;
 
       if (finalText) {
         await say(ws, finalText);
         remember(ws.__mem, "bot", finalText);
       }
 
-      if (isFarewell(finalText || "")) {
-        ws.__saidFarewell = true;
-        ws.__closing = true;
-        scheduleHangup(1800);
-      }
-
       if (ws.__closing && !ws.__saidFarewell) {
         ws.__saidFarewell = true;
         scheduleHangup(2500);
       }
+
+      await updateSummary(ws.__mem);
     }
 
     ws.on("message", async raw => {
@@ -1118,59 +1174,71 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // Start Deepgram
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
+            if (text === ws.__lastUserText && (now - ws.__lastUserAt) < 1500) {
+              console.log("[TURN] dropped duplicate final");
+              return;
+            }
+            ws.__lastUserText = text;
+            ws.__lastUserAt = now;
 
-            // debounce/merge with softer thresholds
-            if (ws.__debounceTimer) clearTimeout(ws.__debounceTimer);
-            const looksIncomplete = text.split(/\s+/).length < 6 || /(?:to|for|at|on|in|with|about)$/i.test(text);
-            ws.__pendingFinal = ws.__pendingFinal ? (ws.__pendingFinal + " " + text) : text;
+            LAST_UTTERANCE = text;
+            const tHint = parseUserTime(text);
+            if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
 
-            const delay = looksIncomplete ? 420 : 240;
-            ws.__debounceTimer = setTimeout(async () => {
-              const finalText = (ws.__pendingFinal || "").trim();
-              ws.__pendingFinal = "";
+            const looksPartial = (() => {
+              const s = text.trim().toLowerCase();
+              if (!s) return false;
+              if (/\b(let's do|do|set|make|schedule|tomorrow|today|on|for|at|around|before|after)$/.test(s)) return true;
+              if (/\b(tomorrow at|today at|next (mon|tue|wed|thu|fri|sat|sun) at)$/.test(s)) return true;
+              return false;
+            })();
+            if (looksPartial) {
+              clearTimeout(ws.__finalTimer);
+              ws.__pendingFinal = text;
+              ws.__finalTimer = setTimeout(async () => {
+                if (ws.__handling) { ws.__queuedTurn = ws.__pendingFinal; ws.__pendingFinal = ""; return; }
+                ws.__handling = true;
+                remember(ws.__mem, "user", ws.__pendingFinal);
+                await handleTurn(ws, ws.__pendingFinal);
+                ws.__pendingFinal = "";
+                ws.__handling = false;
 
-              // Micro-hold for ultra-short finals to catch continuation, but do not block real turns
-              const tokenCount = finalText.split(/\s+/).filter(Boolean).length;
-              const recentAudioGap = Date.now() - (ws.__lastAudioAt || 0);
-              if (tokenCount < 2 && recentAudioGap < 600) {
-                await new Promise(r => setTimeout(r, 250));
-                if (Date.now() - (ws.__lastAudioAt || 0) < 400) return; // caller resumed
-              }
+                if (ws.__queuedTurn) {
+                  const next = ws.__queuedTurn; ws.__queuedTurn = null;
+                  ws.__handling = true; remember(ws.__mem, "user", next);
+                  await handleTurn(ws, next); ws.__handling = false;
+                }
+              }, 900);
+              return;
+            }
 
-              const now2 = Date.now();
-              if (finalText === ws.__lastUserText && (now2 - ws.__lastUserAt) < 1500) {
-                console.log("[TURN] dropped duplicate final");
-                return;
-              }
-              ws.__lastUserText = finalText;
-              ws.__lastUserAt = now2;
+            if (ws.__handling) {
+              ws.__queuedTurn = text;
+              return;
+            }
+            ws.__handling = true;
+            remember(ws.__mem, "user", text);
+            await handleTurn(ws, text);
+            ws.__handling = false;
 
-              LAST_UTTERANCE = finalText;
-
-              if (ws.__handling) { ws.__queuedTurn = finalText; return; }
+            if (ws.__queuedTurn) {
+              const next = ws.__queuedTurn;
+              ws.__queuedTurn = null;
               ws.__handling = true;
-              remember(ws.__mem, "user", finalText);
-              await handleTurn(ws, finalText);
+              remember(ws.__mem, "user", next);
+              await handleTurn(ws, next);
               ws.__handling = false;
-
-              if (ws.__queuedTurn) {
-                const next = ws.__queuedTurn; ws.__queuedTurn = null;
-                ws.__handling = true; remember(ws.__mem, "user", next);
-                await handleTurn(ws, next); ws.__handling = false;
-              }
-            }, delay);
+            }
           },
           wsRef: ws
         });
+
         ws.__dg = dg;
 
-        // Initial AI-driven greeting via LLM
         ws.__handling = true;
-        remember(ws.__mem, "user", "<CALL_START>");
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
 
@@ -1184,7 +1252,7 @@ if (!wss.__victory_handler_attached) {
         pendingULaw.push(ulaw);
         if (pendingULaw.length >= BATCH) flushULaw();
         clearTimeout(tailTimer);
-        tailTimer = setTimeout(flushULaw, 120);
+        tailTimer = setTimeout(flushULaw, 80);
         return;
       }
 
@@ -1194,7 +1262,6 @@ if (!wss.__victory_handler_attached) {
         ws.__stopSeenAt = Date.now();
         try { flushULaw(); } catch {}
         try { dg?.close(); } catch {}
-        await updateSummary(ws.__mem);
         await postCallLogOnce(ws, "twilio stop");
         try { ws.close(); } catch {}
         return;
@@ -1205,70 +1272,39 @@ if (!wss.__victory_handler_attached) {
       try { dg?.close(); } catch {}
       clearHangTimer();
       clearInterval(hb);
-      await updateSummary(ws.__mem);
       await postCallLogOnce(ws, "socket close");
       console.log("[WS] closed", { convoId: ws.__convoId });
     });
   });
 }
 
-/* === Deepgram ASR (μ-law passthrough), longer endpointing === */
-function startDeepgram({ onFinal, wsRef }) {
-  const url =
-    "wss://api.deepgram.com/v1/listen"
-    + "?encoding=mulaw"
-    + "&sample_rate=8000"
-    + "&channels=1"
-    + "&model=nova-2-phonecall"
-    + "&interim_results=true"
-    + "&smart_format=true"
-    + "&endpointing=1200";
-  console.log("[Deepgram] connecting", url);
-  const dgWS = new WebSocket(url, {
-    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
-    perMessageDeflate: false
-  });
-
-  let dgReady = false;
-  dgWS.on("open", () => { dgReady = true; console.log("[Deepgram] open"); });
-
-  let lastInterimLog = 0;
-  dgWS.on("message", (data) => {
-    let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
-    const alt = ev.channel?.alternatives?.[0];
-    const text = (alt?.transcript || "").trim();
-    if (!text) return;
-    if (ev.is_final || ev.speech_final) {
-      console.log(`[ASR FINAL] ${text}`);
-      onFinal?.(text);
-    } else {
-      const now = Date.now();
-      if (now - lastInterimLog > 1200) {
-        console.log(`[ASR interim] ${text}`);
-        lastInterimLog = now;
-      }
-      try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
-    }
-  });
-  dgWS.on("error", e => console.error("[Deepgram error]", e.message));
-  dgWS.on("close", () => console.log("[Deepgram] closed"));
-
-  return {
-    sendULaw(buf){
-      try {
-        if (!dgReady) return;
-        dgWS.send(buf);
-      } catch(e){ console.error("[Deepgram send error]", e.message); }
-    },
-    close(){ try { dgWS.close(); } catch {} }
-  };
+/* ===== Rolling summary ===== */
+async function updateSummary(mem) {
+  const last = mem.transcript.slice(-16).map(m => `${m.from}: ${m.text}`).join("\n");
+  try {
+    const { data } = await httpPost(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.1,
+        messages: [
+          { role:"system", content:`Summarize the dialog in 2 lines. Include name, phone, service, date/time if known. TZ=${BIZ_TZ}.` },
+          { role:"user", content: last }
+        ]
+      },
+      { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout: 20000, tag:"OPENAI_SUMMARY",
+        trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } }
+    );
+    mem.summary = data.choices?.[0]?.message?.content?.trim()?.slice(0, 500) || "";
+    console.log("[SUMMARY] len", mem.summary.length);
+  } catch(e){
+    console.warn("[SUMMARY] error", e.message);
+  }
 }
 
 /* ===== Notes =====
-- 100% AI-driven speech: no hardcoded replies.
-- Softer barge-in and longer endpointing reduce cutoffs.
-- Number normalizer improves phone/ID articulation.
-- Exact-window availability reads; strict-time booking.
-- Reschedule safety; de-dupe; pin-to-checked-slot.
-- Single WebSocketServer guard; summaries on stop/close.
+- Single-booking guarantee: prevents duplicate creates for the same hour; verifies "already booked" on backend conflict.
+- Exact-hour verification: if model says “unavailable,” double-check that hour and correct if free.
+- Faster, polite latency: lowered QUIET_MS/timeout, endpointing 900ms, small μ-law batches.
+- Natural readbacks: single-sentence confirmations, no list tone.
 */
