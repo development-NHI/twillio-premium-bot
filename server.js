@@ -39,7 +39,7 @@ const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 /* Business timezone */
 const BIZ_TZ = process.env.BIZ_TZ || "America/New_York";
 
-/* Optional env-driven hours gate (soft check; backend is source of truth) */
+/* Optional env-driven hours gate */
 const BIZ_HOURS_START = process.env.BIZ_HOURS_START || ""; // "09:00"
 const BIZ_HOURS_END   = process.env.BIZ_HOURS_END   || "17:00";
 
@@ -194,7 +194,7 @@ const server = app.listen(PORT, () => {
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
 
-/* === FIX 1: single WebSocketServer init guard (prevents 'wss already declared') === */
+/* === FIX 1: single WebSocketServer init guard === */
 let wss = globalThis.__victory_wss;
 if (!wss) {
   wss = new WebSocketServer({ server });
@@ -268,9 +268,9 @@ function remember(mem, from, text){ mem.transcript.push({from, text}); if(mem.tr
 /* ===== Track live websockets by call ===== */
 const CALLS = new Map(); // callSid => ws
 
-/* ===== TTS helpers (clean numerals, no digit-by-digit words) ===== */
-const QUIET_MS = 500;
-const QUIET_TIMEOUT_MS = 900;
+/* ===== TTS helpers ===== */
+const QUIET_MS = 300;          // faster speak
+const QUIET_TIMEOUT_MS = 700;  // lower cap
 
 function cleanTTS(s=""){
   return String(s)
@@ -284,6 +284,25 @@ function cleanTTS(s=""){
     .replace(/\n{2,}/g, ". ")
     .replace(/\n/g, ", ")
     .trim();
+}
+
+/* Number clarity normalizer */
+function normalizeNumbersForTTS(s="") {
+  let t = s;
+
+  // Phone numbers → spaced digits
+  t = t.replace(
+    /(?:\+1[\s\-\.]?)?\(?(\d{3})\)?[\s\-\.]?(\d{3})[\s\-\.]?(\d{4})/g,
+    (_, a, b, c) => `${a.split("").join(" ")} ${b.split("").join(" ")} ${c.split("").join(" ")}`
+  );
+
+  // Long digit runs (7+)
+  t = t.replace(/\b(\d{7,})\b/g, (m) => m.split("").join(" "));
+
+  // Small pause to help “2 PM”
+  t = t.replace(/\bat\s+(\d{1,2})(:\d{2})?\s*(AM|PM)\b/gi, (_, h, mm="", ap) => `at, ${h}${mm} ${ap}`);
+
+  return t;
 }
 
 function shouldSpeak(ws, normalized=""){
@@ -305,7 +324,7 @@ async function say(ws, text) {
     waited += 100;
   }
 
-  const speak = cleanTTS(text);
+  const speak = normalizeNumbersForTTS(cleanTTS(text));
   if (!shouldSpeak(ws, speak)) return;
 
   ws.__lastBotText = speak;
@@ -317,8 +336,8 @@ async function say(ws, text) {
     return;
   }
   try {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-    const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.4, similarity_boost:0.8 } },
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=0&output_format=ulaw_8000`;
+    const resp = await httpPost(url, { text: speak, voice_settings:{ stability:0.55, similarity_boost:0.8 } },
       { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream: true }, timeout: 20000, tag:"TTS_STREAM", trace:{ streamSid: ws.__streamSid } });
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
@@ -348,7 +367,6 @@ function parseRequestedSlot(text, tz) {
     if (m) baseDateISO = `${m[1]}-${m[2]}-${m[3]}`;
   }
 
-  // time (simple patterns)
   const timeRe = /(\b\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?/i;
   const m2 = t.match(timeRe);
   if (!m2) return null;
@@ -364,7 +382,7 @@ function parseRequestedSlot(text, tz) {
   return { dateISO: baseDateISO, startISO, endISO };
 }
 
-// Static offset helper (uses current offset; acceptable for intra-day scheduling)
+// Static offset helper
 function offsetForTZ(tz){
   const now = new Date();
   const fmt = new Intl.DateTimeFormat('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
@@ -374,9 +392,28 @@ function offsetForTZ(tz){
   return m ? m[1] : '-04:00';
 }
 
+/* Availability injection, including generic today/tomorrow asks with no time */
 async function ensureExactAvailabilityInjected(ws, messages, userText){
   const slot = parseRequestedSlot(userText, BIZ_TZ);
-  if (!slot) return messages;
+
+  if (!slot) {
+    if (/\btoday\b/i.test(userText||"") || /\btomorrow\b/i.test(userText||"")) {
+      const base = /\btomorrow\b/i.test(userText||"")
+        ? addDaysISO(todayISOInTZ(BIZ_TZ),1)
+        : todayISOInTZ(BIZ_TZ);
+      // Probe the requested day broadly to avoid false “fully booked” claims.
+      const s = `${base}T09:00:00${offsetForTZ(BIZ_TZ)}`;
+      const e = `${base}T17:00:00${offsetForTZ(BIZ_TZ)}`;
+      try {
+        const res = await Tools.read_availability({ dateISO: base, startISO: s, endISO: e });
+        const synthetic = { role:"assistant", content:"", tool_calls:[{ id: rid(), type:"function", function:{ name: "read_availability", arguments: JSON.stringify({ dateISO: base, startISO: s, endISO: e }) } }] };
+        const toolMsg = { role:"tool", tool_call_id: synthetic.tool_calls[0].id, content: JSON.stringify(res) };
+        return [...messages, synthetic, toolMsg];
+      } catch { return messages; }
+    }
+    return messages;
+  }
+
   const key = `${slot.startISO}__${slot.endISO}`;
   if (ws.__checkedWindows?.has(key)) return messages;
   try {
@@ -392,12 +429,10 @@ async function ensureExactAvailabilityInjected(ws, messages, userText){
 }
 
 const Tools = {
-  // Exact-window availability. No contact filter. No hidden time shifting.
   async read_availability({ dateISO, startISO, endISO }) {
     console.log("[TOOL] read_availability", { dateISO, startISO, endISO });
     if (!URLS.CAL_READ) return { summary:{ busy:false, free:true } };
     try {
-      // guard invalid hours from model
       if ((startISO && !isValidISOHour(startISO)) || (endISO && !isValidISOHour(endISO))) {
         console.warn("[TOOLS] invalid ISO; ignoring model window");
         startISO = endISO = undefined;
@@ -436,7 +471,6 @@ const Tools = {
       const busy = events.length > 0;
       const summary = { busy, free: !busy };
 
-      // pin this checked slot (for hour-drift protection)
       const ws = CALLS.get(currentTrace.callSid);
       if (ws && windowObj.start_utc && windowObj.end_utc) {
         ws.__lastCheckedSlot = {
@@ -449,31 +483,27 @@ const Tools = {
     } catch { return { summary:{ busy:false, free:true } }; }
   },
 
-  // Book exactly the startISO/endISO passed. No auto-adjust.
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
-    // If model hour differs from last read_availability, override to that exact checked slot
     if (ws?.__lastCheckedSlot) {
       const wantStartUTC = asUTC(startISO);
       const last = ws.__lastCheckedSlot;
       const delta = Math.abs(new Date(wantStartUTC) - new Date(last.startISO));
       if (isFinite(delta) && delta > 5 * 60 * 1000) {
-        startISO = last.startISO; // already UTC
-        endISO   = last.endISO;   // already UTC
+        startISO = last.startISO;
+        endISO   = last.endISO;
       }
     }
 
-    // Hard de-dupe within 60s for the same hour
     if (ws?.__lastBookedStartUTC && ws?.__lastBookedAt) {
       const sameHour = ws.__lastBookedStartUTC === asUTC(startISO);
       const recent   = (Date.now() - ws.__lastBookedAt) < 60_000;
       if (sameHour && recent) return { ok:true, already:true, message:"dedup: already booked", data: ws.__confirmedBooking };
     }
 
-    // Single-booking guard for this call hour (session level)
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
       if (b?.start_utc && b.start_utc === asUTC(startISO)) {
@@ -484,7 +514,6 @@ const Tools = {
     try {
       const normalizedPhone = (phone && phone.trim()) || CURRENT_FROM || "";
 
-      // Soft-hours check (do not block; backend is source of truth)
       if (!withinBizHours(startISO, BIZ_TZ)) { /* proceed */ }
 
       const payload = {
@@ -522,7 +551,6 @@ const Tools = {
       }
       return { ok:true, data: booked };
     } catch(e){
-      // On conflict, verify if already booked for this caller and hour
       const status = e.response?.status || 0;
       const body = e.response?.data && JSON.stringify(e.response.data) || "";
       if (status === 400 && /not available/i.test(body)) {
@@ -567,7 +595,6 @@ const Tools = {
     console.log("[TOOL] cancel_appointment", { event_id_present: !!event_id, hasName: !!name });
     if (!URLS.CAL_DELETE || !URLS.CAL_READ) return { ok:false };
 
-    // Guard: if a reschedule is in-flight and no confirmed booking yet, block cancel to avoid orphaning
     const ws = CALLS.get(currentTrace.callSid);
     if (ws?.__rescheduleRequested && !ws?.__confirmedBooking) {
       return { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
@@ -727,7 +754,7 @@ const Tools = {
   }
 };
 
-/* Tool schema advertised to the model */
+/* Tool schema */
 const toolSchema = [
   { type:"function", function:{
       name:"read_availability",
@@ -863,15 +890,13 @@ async function updateSummary(mem) {
 
 let CURRENT_PROMPT = RENDER_PROMPT;
 
-/* === FIX 2: strict farewell detection to avoid greeting-triggered hangups === */
+/* Strict farewell detection */
 function isFarewell(s="") {
   const t = String(s).trim();
   if (!t) return false;
-  if (t.endsWith("?")) return false; // greetings often end in a question
-  // Primary farewell tokens
+  if (t.endsWith("?")) return false;
   const farewell = /\b(?:goodbye|bye|talk to you (?:later|soon)|see you|take care|have a (?:great|good) (?:day|one))\b/i;
   if (farewell.test(t)) return true;
-  // “Thanks … goodbye/bye” but not plain “Thanks for calling …”
   if (/\bthank(?:s| you)\b/i.test(t) && /\b(?:goodbye|bye)\b/i.test(t)) return true;
   return false;
 }
@@ -953,6 +978,8 @@ if (!wss.__victory_handler_attached) {
         setTimeout(() => { try { ws.terminate?.(); } catch {} }, 1500);
       }, ms);
     }
+
+    /* Flush μ-law only when DG is ready */
     function flushULaw() {
       if (!pendingULaw.length || !dg) return;
       const chunk = Buffer.concat(pendingULaw);
@@ -962,7 +989,7 @@ if (!wss.__victory_handler_attached) {
         console.log("[MEDIA] flush", { frames: Math.round(chunk.length / 160), bytes: chunk.length });
         lastMediaLog = now;
       }
-      dg.sendULaw(chunk);
+      try { dg.sendULaw(chunk); } catch {}
     }
 
     async function postCallLogOnce(ws, reason) {
@@ -981,7 +1008,7 @@ if (!wss.__victory_handler_attached) {
     async function resolveToolChain(baseMessages) {
       let messages = baseMessages.slice();
 
-      // Inject exact-window availability for this turn if user asked for a concrete time
+      // availability injection
       messages = await ensureExactAvailabilityInjected(ws, messages, ws.__lastUserText || "");
 
       for (let hops = 0; hops < 8; hops++) {
@@ -995,12 +1022,10 @@ if (!wss.__victory_handler_attached) {
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-          // Track reschedule intent
           if (ws.__lastUserText && /resched|move|change.*(time|appt|appointment)/i.test(ws.__lastUserText)) {
             ws.__rescheduleRequested = true;
           }
 
-          // Guard: block cancel-before-book when rescheduling
           if (name === "cancel_appointment" && ws.__rescheduleRequested && !ws.__confirmedBooking) {
             const toolResult = { ok:false, blocked:true, reason:"blocked_until_new_confirmed" };
             messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
@@ -1029,7 +1054,6 @@ if (!wss.__victory_handler_attached) {
       if (ws.__closing || ws.readyState !== WebSocket.OPEN) return;
       console.log("[TURN] user >", userText);
 
-      // User explicit "done" → immediate goodbye & hangup
       const doneIntent = /(?:that'?ll be it|that is all|that'?s all|nothing else|we'?re done|we are done|bye|goodbye|hang up|end the call)/i;
       if (doneIntent.test(userText)) {
         await say(ws, "Got it. Thanks for calling—goodbye.");
@@ -1046,7 +1070,6 @@ if (!wss.__victory_handler_attached) {
         remember(ws.__mem, "bot", finalText);
       }
 
-      // Auto-hangup only on clear farewells, not greetings like “Thanks for calling…”
       if (isFarewell(finalText || "")) {
         ws.__saidFarewell = true;
         ws.__closing = true;
@@ -1091,17 +1114,17 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // ASR with debounce/merge of finals
+        // Start Deepgram
         dg = startDeepgram({
           onFinal: async (text) => {
             const now = Date.now();
 
-            // Debounce/merge quick successive finals (fragment then completion)
+            // faster debounce
             if (ws.__debounceTimer) clearTimeout(ws.__debounceTimer);
-            const looksIncomplete = text.split(/\s+/).length < 6 || /(?:to|for|at|on|in|with|about)$/i.test(text);
+            const looksIncomplete = text.split(/\s+/).length < 5 || /(?:to|for|at|on|in|with|about)$/i.test(text);
             ws.__pendingFinal = ws.__pendingFinal ? (ws.__pendingFinal + " " + text) : text;
 
-            const delay = looksIncomplete ? 500 : 250;
+            const delay = looksIncomplete ? 300 : 150;
             ws.__debounceTimer = setTimeout(async () => {
               const finalText = (ws.__pendingFinal || "").trim();
               ws.__pendingFinal = "";
@@ -1131,8 +1154,11 @@ if (!wss.__victory_handler_attached) {
           },
           wsRef: ws
         });
-
         ws.__dg = dg;
+
+        // Immediate greet to cut first-turn latency
+        await say(ws, "Thanks for calling The Victory Team. How can I help today?");
+        remember(ws.__mem, "bot", "Thanks for calling The Victory Team. How can I help today?");
 
         ws.__handling = true;
         remember(ws.__mem, "user", "<CALL_START>");
@@ -1177,7 +1203,7 @@ if (!wss.__victory_handler_attached) {
   });
 }
 
-/* === Deepgram ASR (μ-law passthrough) === */
+/* === Deepgram ASR (μ-law passthrough) with ready guard === */
 function startDeepgram({ onFinal, wsRef }) {
   const url =
     "wss://api.deepgram.com/v1/listen"
@@ -1189,14 +1215,16 @@ function startDeepgram({ onFinal, wsRef }) {
     + "&smart_format=true"
     + "&endpointing=900";
   console.log("[Deepgram] connecting", url);
-  const dg = new WebSocket(url, {
+  const dgWS = new WebSocket(url, {
     headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
   });
-  dg.on("open", () => console.log("[Deepgram] open"));
+
+  let dgReady = false;
+  dgWS.on("open", () => { dgReady = true; console.log("[Deepgram] open"); });
 
   let lastInterimLog = 0;
-  dg.on("message", (data) => {
+  dgWS.on("message", (data) => {
     let ev; try { ev = JSON.parse(data.toString()); } catch { return; }
     const alt = ev.channel?.alternatives?.[0];
     const text = (alt?.transcript || "").trim();
@@ -1213,25 +1241,30 @@ function startDeepgram({ onFinal, wsRef }) {
       try { if (wsRef) wsRef.__lastASRInterimAt = now; } catch {}
     }
   });
-  dg.on("error", e => console.error("[Deepgram error]", e.message));
-  dg.on("close", () => console.log("[Deepgram] closed"));
+  dgWS.on("error", e => console.error("[Deepgram error]", e.message));
+  dgWS.on("close", () => console.log("[Deepgram] closed"));
+
   return {
     sendULaw(buf){
-      try { dg.send(buf); } catch(e){ console.error("[Deepgram send error]", e.message); }
+      try {
+        if (!dgReady) return;
+        dgWS.send(buf);
+      } catch(e){ console.error("[Deepgram send error]", e.message); }
     },
-    close(){ try { dg.close(); } catch {} }
+    close(){ try { dgWS.close(); } catch {} }
   };
 }
 
 /* ===== Notes =====
 - Strict time: no auto “intent” hour shifting. Tools book the exact window provided.
-- Exact availability guard: before every model reply, we inject a read for the user’s requested window (if any).
+- Exact availability guard: inject reads for explicit times and generic today/tomorrow.
 - Reschedule safety: cancel is blocked until a new booking is confirmed.
-- Pin-to-checked-slot stops 2 PM drift after a 10 AM check.
-- De-dupe prevents double-create if the model retries within 60 seconds.
-- ASR debounce merges split finals and reduces “didn’t get that.”
-- Auto-hangup triggers only on clear farewells (not greetings like “Thanks for calling…”).
-- TTS leaves numerals intact for clarity.
-- Single WebSocketServer guard prevents redeclare crashes on hot restarts.
-- Summaries are generated on stop/close only.
+- Pin-to-checked-slot stops hour drift.
+- De-dupe prevents double-create within 60s.
+- Faster greet and debounce reduce perceived latency.
+- Number normalizer improves phone/ID articulation.
+- ElevenLabs low-latency streaming.
+- Strict farewell detection to avoid early hangups.
+- Single WebSocketServer guard prevents redeclare crashes.
+- Summaries generated on stop/close only.
 */
