@@ -863,6 +863,19 @@ async function updateSummary(mem) {
 
 let CURRENT_PROMPT = RENDER_PROMPT;
 
+/* === FIX 2: strict farewell detection to avoid greeting-triggered hangups === */
+function isFarewell(s="") {
+  const t = String(s).trim();
+  if (!t) return false;
+  if (t.endsWith("?")) return false; // greetings often end in a question
+  // Primary farewell tokens
+  const farewell = /\b(?:goodbye|bye|talk to you (?:later|soon)|see you|take care|have a (?:great|good) (?:day|one))\b/i;
+  if (farewell.test(t)) return true;
+  // “Thanks … goodbye/bye” but not plain “Thanks for calling …”
+  if (/\bthank(?:s| you)\b/i.test(t) && /\b(?:goodbye|bye)\b/i.test(t)) return true;
+  return false;
+}
+
 if (!wss.__victory_handler_attached) {
   wss.__victory_handler_attached = true;
 
@@ -932,7 +945,7 @@ if (!wss.__victory_handler_attached) {
             await httpPost(url, params, {
               auth, timeout: 10000, tag:"TWILIO_HANGUP",
               headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: currentTrace.convoId }
+              trace:{ callSid: ws.__callSid, reason: "model end_call", convoId: ws.__convoId }
             });
           }
         } catch(e) { console.warn("[HANGUP] error", e.message); }
@@ -1033,8 +1046,8 @@ if (!wss.__victory_handler_attached) {
         remember(ws.__mem, "bot", finalText);
       }
 
-      // Auto-hangup if the bot just said goodbye
-      if (/(?:goodbye|thanks.*(calling|time)|talk to you (later|soon)|have a (great|good) (day|one))\b/i.test(finalText || "")) {
+      // Auto-hangup only on clear farewells, not greetings like “Thanks for calling…”
+      if (isFarewell(finalText || "")) {
         ws.__saidFarewell = true;
         ws.__closing = true;
         scheduleHangup(1800);
@@ -1217,7 +1230,7 @@ function startDeepgram({ onFinal, wsRef }) {
 - Pin-to-checked-slot stops 2 PM drift after a 10 AM check.
 - De-dupe prevents double-create if the model retries within 60 seconds.
 - ASR debounce merges split finals and reduces “didn’t get that.”
-- Auto-hangup triggers on caller “done” or bot goodbye.
+- Auto-hangup triggers only on clear farewells (not greetings like “Thanks for calling…”).
 - TTS leaves numerals intact for clarity.
 - Single WebSocketServer guard prevents redeclare crashes on hot restarts.
 - Summaries are generated on stop/close only.
