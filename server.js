@@ -9,7 +9,6 @@ import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import WebSocket, { WebSocketServer } from "ws";
 import axios from "axios";
-import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
 
@@ -50,7 +49,6 @@ requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
-// Calendar URLs optional per deployment. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
@@ -165,7 +163,6 @@ if (!wss) {
 
 /* ===== Transport state ===== */
 const CALLS = new Map();
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
 /* ===== Deepgram (single connection) ===== */
 function newDeepgram(onFinal) {
@@ -273,7 +270,7 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* ===== Tool implementations (thin wrappers, no logic) ===== */
+/* ===== Tools (thin wrappers) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
@@ -387,11 +384,10 @@ Rules:
 - Include name, phone, service, and notes when booking if available.
 - Keep confirmations short and natural.
 `;
-
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
 
 async function fetchTenantPrompt() {
-  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
+  if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
@@ -409,14 +405,7 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
-/* ===== Generic tool runner (with status lines + watchdog) ===== */
-const STATUS_LINES = {
-  read_availability: "One sec—checking that time.",
-  book_appointment:  "Got it—booking now.",
-  cancel_appointment:"One moment—canceling that.",
-  find_customer_events:"One sec—looking that up."
-};
-
+/* ===== Generic tool runner ===== */
 async function runTools(ws, baseMessages) {
   let messages = baseMessages.slice();
   for (let hops=0; hops<8; hops++){
@@ -428,32 +417,51 @@ async function runTools(ws, baseMessages) {
       const name = tc.function.name;
       let args = {};
       try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-
-      // Immediate UX status line (no business logic)
-      if (STATUS_LINES[name]) {
-        try { await speakULaw(ws, STATUS_LINES[name]); } catch {}
-      }
-
-      // 3s watchdog to avoid silence on slow HTTP
-      let saidStillChecking = false;
-      const watchdog = setTimeout(async () => {
-        if (!saidStillChecking) {
-          saidStillChecking = true;
-          try { await speakULaw(ws, "Still checking."); } catch {}
-        }
-      }, 3000);
-
       if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
       const impl = Tools[name];
       let result = {};
       try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
       catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
-      clearTimeout(watchdog);
-
       messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
     }
   }
   return "";
+}
+
+/* ===== Action nudge + watchdog ===== */
+const FOLLOWUP_PAT = /(checking that time|booking now)/i;
+function buildNudge(hint){
+  return [
+    { role:"system", content: "You just said a status line. Now immediately invoke the required tool." },
+    hint ? { role:"system", content: hint } : null
+  ].filter(Boolean);
+}
+
+async function llmTurn(ws, userOrSyntheticText, { nudgeHint } = {}) {
+  const base = [
+    ...systemMessages(ws.__tenantPrompt),
+    ...ws.__mem.slice(-12),
+    { role:"user", content: userOrSyntheticText }
+  ];
+  let reply = await runTools(ws, base);
+
+  if (reply) {
+    await speakULaw(ws, reply);
+    ws.__mem.push({ role:"user", content:userOrSyntheticText }, { role:"assistant", content:reply });
+
+    // If model said “checking…” or “booking now” without tool calls, nudge it.
+    if (FOLLOWUP_PAT.test(reply)) {
+      const nudged = await runTools(ws, [
+        ...systemMessages(ws.__tenantPrompt),
+        ...ws.__mem.slice(-12),
+        ...buildNudge(nudgeHint || "Proceed using pinned startISO/endISO from the last availability check.")
+      ]);
+      if (nudged) {
+        await speakULaw(ws, nudged);
+        ws.__mem.push({ role:"assistant", content:nudged });
+      }
+    }
+  }
 }
 
 /* ===== Call loop ===== */
@@ -486,33 +494,14 @@ wss.on("connection", (ws) => {
       ws.__callSid = cp.CallSid || cp.callSid || "";
       CALLS.set(ws.__callSid, ws);
 
-      // Fetch prompt once
       ws.__tenantPrompt = await fetchTenantPrompt();
 
-      // Proactive AI greeting before the caller speaks
-      const boot = [
-        ...systemMessages(ws.__tenantPrompt),
-        ...ws.__mem.slice(-12),
-        { role:"user", content:"<CALL_START>" }
-      ];
-      const hello = await runTools(ws, boot);
-      if (hello) {
-        await speakULaw(ws, hello);
-        ws.__mem.push({ role:"user", content:"<CALL_START>" }, { role:"assistant", content:hello });
-      }
+      // Proactive greeting
+      await llmTurn(ws, "<CALL_START>");
 
-      // Start Deepgram once
+      // Start Deepgram
       dg = newDeepgram(async (text) => {
-        const base = [
-          ...systemMessages(ws.__tenantPrompt),
-          ...ws.__mem.slice(-12),
-          { role:"user", content: text }
-        ];
-        const reply = await runTools(ws, base);
-        if (reply) {
-          await speakULaw(ws, reply);
-          ws.__mem.push({ role:"user", content:text }, { role:"assistant", content:reply });
-        }
+        await llmTurn(ws, text);
       });
 
       return;
