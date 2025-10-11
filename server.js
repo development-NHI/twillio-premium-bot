@@ -6,6 +6,7 @@
    - Deepgram μ-law passthrough + ElevenLabs TTS
    - Single-booking guarantee + exact-hour verification
    - Extra: robust timezone handling (DST-safe), weekday resolution in TZ, defensive logging
+   - NEW: ZIP/address readback cleanup (no stray commas); strip “Ending the call now.”
 */
 
 import express from "express";
@@ -165,10 +166,6 @@ Reschedule integrity:
 
 Availability interpretation:
 - \`{events:[]}\` or \`{summary:{free:true}}\` ⇒ available. Otherwise unavailable.
-
-Identity matching (soft match policy):
-- Prefer phone last-10 match when present.
-- If no phone on the event or no phone match is found, treat **near-match names** as matches (minor spelling/ordering differences are ok). If multiple soft matches, ask for a disambiguator (date/time/location) instead of assuming no appointment.
 
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
@@ -424,15 +421,7 @@ if (!wss) {
 
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function escapeHtml(s = "") {
-  return s.replace(/[&<>'"]/g, c => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    "'": '&#39;',
-    '"': '&quot;'
-  })[c]);
-}
+function escapeHtml(s=""){ return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 
 /* ===== Minimal Memory ===== */
 function newMemory() { return { transcript: [], summary: "" }; }
@@ -460,11 +449,10 @@ function newDeepgram(onFinal, wsRef) {
   });
 
   dg.on("open", () => {
-    console.log("[Deepgram] open");
+    console.log("[Deepgram] open]");
     if (wsRef) {
       wsRef.__dgOpen = true;
       wsRef.__dgState.connecting = false;
-      // Flush any buffered audio now that we're open
       try { wsRef.__flushULaw?.(); } catch {}
     }
   });
@@ -496,9 +484,8 @@ function newDeepgram(onFinal, wsRef) {
     console.log("[Deepgram] closed");
     if (wsRef) {
       wsRef.__dgOpen = false;
-      wsRef.__dg = null; // allow a future reconnect
+      wsRef.__dg = null;
       wsRef.__dgState.connecting = false;
-      // no immediate auto-reconnect; we reconnect on next media flush with backoff
     }
   });
 
@@ -519,8 +506,9 @@ const QUIET_MS = 500;
 const QUIET_TIMEOUT_MS = 900;
 
 const DIGIT_WORD = { "0":"zero","1":"one","2":"two","3":"three","4":"four","5":"five","6":"six","7":"seven","8":"eight","9":"nine" };
-function digitsToWords(d) {
+function digitsToWords(d, {noCommas=false} = {}) {
   const words = d.split("").map(ch => DIGIT_WORD[ch] ?? ch);
+  if (noCommas) return words.join(" ");
   if (d.length === 10) return `${words.slice(0,3).join(" ")} , ${words.slice(3,6).join(" ")} , ${words.slice(6).join(" ")}`;
   if (d.length === 11 && d[0] === "1") return `one , ${words.slice(1,4).join(" ")} , ${words.slice(4,7).join(" ")} , ${words.slice(7).join(" ")}`;
   return words.map((w,i)=> ((i>0 && i%4===0) ? `, ${w}` : w)).join(" ");
@@ -531,24 +519,31 @@ function phoneToWords(raw="") {
   if (!m) return null;
   const [, c, a, b, c4, ext] = m;
   const core = digitsToWords(`${c||""}${a}${b}${c4}`);
-  return ext ? `${core} , extension ${digitsToWords(ext)}` : core;
+  return ext ? `${core} , extension ${digitsToWords(ext, {noCommas:true})}` : core;
 }
 function normalizeNumbersForSpeech(text="") {
+  // Phones first (keeps grouping)
   text = text.replace(
     /(?:\+?1[\s-\.]?)?\(?\d{3}\)?[\s-\.]?\d{3}[\s-\.]?\d{4}(?:\s*(?:x|ext\.?|extension)\s*\d{2,6})?/gi,
     (m) => phoneToWords(m) || m
   );
-  text = text.replace(/\b\d{5,}\b/g, (m) => digitsToWords(m));
+  // ZIP codes: exactly 5 digits -> no commas, clean spacing
+  text = text.replace(/\b\d{5}\b/g, (m) => digitsToWords(m, {noCommas:true}));
+  // Other long numbers (IDs etc.)
+  text = text.replace(/\b\d{6,}\b/g, (m) => digitsToWords(m));
   return text;
 }
+// Remove stage directions & keep speech natural
 function cleanTTS(s=""){
-  const base = String(s)
-    .replace(/\*\*(.*?)\*\*/g, "$1")
+  let base = String(s)
+    .replace(/\*\*(.*?)\*\*/g, "$1")       // bold
+    .replace(/\*(.*?)\*/g, "$1")           // italics / stage directions
     .replace(/`{1,3}[^`]*`{1,3}/g, "")
     .replace(/^-+\s*/gm, "")
     .replace(/^\d+\.\s*/gm, "")
     .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
     .replace(/^#{1,6}\s*/gm, "")
+    .replace(/\b(?:ending the call now|hanging up( the call)?|i(?:'|’)m ending the call)\b\.?/gi, "") // no meta signoffs
     .replace(/\s{2,}/g, " ")
     .replace(/\n{2,}/g, ". ")
     .replace(/\n/g, ", ")
@@ -604,6 +599,7 @@ async function say(ws, text) {
   if (!text || !ws.__streamSid) return;
   if (ws.readyState !== WebSocket.OPEN) { console.warn("[TTS] WS not open; drop speak"); return; }
 
+  // Wait for a brief quiet window (barge-in friendly)
   let waited = 0;
   while (true) {
     const lastHuman = Math.max(ws.__lastAudioAt || 0, ws.__lastASRInterimAt || 0);
@@ -668,7 +664,6 @@ function softNameMatch(a="", b=""){
   const A = nameTokens(a), B = nameTokens(b);
   const sim = jaccard(A,B);
   if (sim >= 0.5) return true;
-  // fallback: first-token exact
   const a1 = [...A][0], b1 = [...B][0];
   return a1 && b1 && a1 === b1;
 }
@@ -777,13 +772,12 @@ const Tools = {
       if (status === 400 && /not available/i.test(body)) {
         try {
           const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
-          const readPayload = {
-            intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
-            window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
-            contact_phone: toE164US((phone||CURRENT_FROM||""))
-          };
-          const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
-            trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+          const { data: r } = await httpPost(URLS.CAL_READ, {
+              intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
+              window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
+              contact_phone: toE164US((phone||CURRENT_FROM||""))
+            }, { timeout:12000, tag:"CAL_READ_VERIFY",
+              trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
           const ev = (r?.events||[]).find(ev => ev.start_utc === win.start_utc);
           if (ev) {
             const ws = CALLS.get(currentTrace.callSid);
@@ -821,21 +815,19 @@ const Tools = {
           ? dayWindowLocal(dateISO, BIZ_TZ)
           : rangeWindowLocal(baseDate, 30, BIZ_TZ);
 
-        const readPayload = {
-          intent: "READ",
-          biz: DASH_BIZ,
-          source: DASH_SOURCE,
-          timezone: BIZ_TZ,
-          window: {
-            start_local: windowObj.start_local,
-            end_local:   windowObj.end_local,
-            start_utc:   windowObj.start_utc,
-            end_utc:     windowObj.end_utc
+        const { data: readData } = await httpPost(URLS.CAL_READ, {
+            intent: "READ",
+            biz: DASH_BIZ,
+            source: DASH_SOURCE,
+            timezone: BIZ_TZ,
+            window: {
+              start_local: windowObj.start_local,
+              end_local:   windowObj.end_local,
+              start_utc:   windowObj.start_utc,
+              end_utc:     windowObj.end_utc
+            },
+            contact_phone: normalizedPhone || undefined
           },
-          contact_phone: normalizedPhone || undefined
-        };
-
-        const { data: readData } = await httpPost(URLS.CAL_READ, readPayload,
           { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
         const all = (readData?.events || []).filter(e => e.status !== "canceled");
@@ -1232,16 +1224,10 @@ if (!wss.__victory_handler_attached) {
       }, ms);
     }
 
-    // Flush function that respects socket state; drains only when OPEN
     ws.__flushULaw = function flushULaw() {
       if (!pendingULaw.length) return;
-
-      // Ensure a single DG socket, with backoff
       ws.__ensureDG();
-
-      // If still not open, keep buffering; we'll flush when 'open' fires
       if (!ws.__dgOpen) return;
-
       const chunk = Buffer.concat(pendingULaw);
       pendingULaw = [];
       const now = Date.now();
@@ -1254,10 +1240,8 @@ if (!wss.__victory_handler_attached) {
 
     ws.__ensureDG = function ensureDG() {
       if (ws.__dg || ws.__dgState.connecting) return ws.__dg;
-
       const now = Date.now();
-      if (now - ws.__dgState.lastConnectAt < 1500) return ws.__dg; // backoff
-
+      if (now - ws.__dgState.lastConnectAt < 1500) return ws.__dg;
       ws.__dgState.connecting = true;
       ws.__dgState.lastConnectAt = now;
       ws.__dg = newDeepgram(async (text) => {
@@ -1271,7 +1255,7 @@ if (!wss.__victory_handler_attached) {
         const tHint = parseUserTime(text);
         if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
 
-        // ★ Key line: caller has spoken; allow end_call after wrap-up
+        // caller has spoken; allow end_call after wrap-up
         ws.__awaitingReply = false;
 
         if (ws.__handling) { ws.__queuedTurn = text; return; }
@@ -1324,7 +1308,7 @@ if (!wss.__victory_handler_attached) {
           const impl = Tools[name];
           let toolResult = {};
           try { toolResult = await (impl ? impl(args) : {}); }
-          catch(e){ console.error("[TOOL] error]", name, e.message); toolResult = {}; }
+          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = {}; }
 
           messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
 
@@ -1419,7 +1403,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // Greet immediately via AI (no need to wait for media)
+        // Greet immediately via AI
         ws.__handling = true;
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
@@ -1429,7 +1413,6 @@ if (!wss.__victory_handler_attached) {
 
       if (msg.event === "media") {
         ws.__sawMedia = true;
-        // Buffer audio; ensure single DG; actual send when OPEN
         ws.__ensureDG();
         ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
@@ -1468,7 +1451,9 @@ if (!wss.__victory_handler_attached) {
 
 /* ===== Notes =====
 - TZ/DST-safe next-weekday + hour construction stops the “Thursday instead of next Monday” issue.
+- ZIP “21014” readback no longer inserts awkward commas.
 - Single Deepgram socket per call with 1.5s backoff; flush audio only after OPEN -> no WS storm.
 - Blocks premature hangups if the last bot message was a question.
+- Strips any “Ending the call now” stage direction before TTS.
 - Greets on WS “start” (AI-driven, not hardcoded dialogs).
 */
