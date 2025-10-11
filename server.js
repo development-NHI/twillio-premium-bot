@@ -57,7 +57,12 @@ const DEBUG_MEDIA = (process.env.DEBUG_MEDIA ?? "false") === "true";
 
 /* ===== HTTP helpers ===== */
 function rid(){ return Math.random().toString(36).slice(2,8); }
-function preview(obj, max=320){ try { const s = typeof obj==="string"?obj:JSON.stringify(obj); return s.length>max? s.slice(0,max)+"…" : s; } catch { return ""; } }
+function preview(obj, max=320){
+  try {
+    const s = typeof obj==="string"?obj:JSON.stringify(obj);
+    return s.length>max? s.slice(0,max)+"…" : s;
+  } catch { return ""; }
+}
 async function httpPost(url, data, { headers={}, timeout=12000, auth, tag } = {}) {
   const id = rid(), t = Date.now();
   if (DEBUG_HTTP) console.log(JSON.stringify({ evt:"HTTP_REQ", id, tag, method:"POST", url, timeout, payload_len: Buffer.byteLength(preview(data, 1<<20),"utf8") }));
@@ -198,8 +203,6 @@ function newDeepgram(onFinal) {
       const alt = ev.channel?.alternatives?.[0];
       const text = (alt?.transcript || "").trim();
       if (!text) return;
-      // If call is ending or ended, ignore transcripts
-      if (dg.__ws_ref && (dg.__ws_ref.__ending || dg.__ws_ref.__ended)) return;
       if (ev.is_final || ev.speech_final) onFinal?.(text);
     }catch(err){
       console.warn(JSON.stringify({ evt:"DG_PARSE_ERR", err: String(err) }));
@@ -209,22 +212,20 @@ function newDeepgram(onFinal) {
 }
 
 /* ===== ElevenLabs TTS (μ-law passthrough) ===== */
-// never speak tool names, code, ISO blobs, or full phone numbers; normalize meta sign-offs
+// never speak tool names, code, ISO blobs, or full phone numbers
 function sanitizeSpoken(raw=""){
   let s = String(raw);
   s = s.replace(/`{1,3}[\s\S]*?`{1,3}/g, " "); // code fences
   s = s.replace(/\b(read_availability|book_appointment|cancel_appointment|find_customer_events|transfer|end_call)\b[\s\S]*/i, " ");
   s = s.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]");
   s = s.replace(/[A-Z]{2,}\d{2,}[-:T.\dZ+]*\)?/g, " ");
-  s = s.replace(/\b(call (has )?ended( successfully)?|ending (the )?call|call complete(d)?)\b/ig,
-                "Thanks for calling The Victory Team. Goodbye.");
   s = s.replace(/\[(.*?)\]\((.*?)\)/g,"$1");
   s = s.replace(/\s{2,}/g," ").trim();
   if (!s) s = "One moment.";
   return s;
 }
 async function speakULaw(ws, text){
-  if (!text || !ws.__streamSid || ws.__ending || ws.__ended) return;
+  if (!text || !ws.__streamSid || ws.__ended) return;
   const clean = sanitizeSpoken(text);
   try{
     console.log(JSON.stringify({ evt:"TTS_START", chars: clean.length, preview: clean.slice(0,80) }));
@@ -232,7 +233,7 @@ async function speakULaw(ws, text){
     const resp = await httpPost(url, { text: clean }, { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true }, timeout:20000, tag:"TTS_STREAM" });
     let bytes = 0;
     resp.data.on("data", chunk => {
-      if (ws.readyState !== WebSocket.OPEN || ws.__ending || ws.__ended) return;
+      if (ws.readyState !== WebSocket.OPEN) return;
       bytes += chunk.length;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
@@ -511,8 +512,6 @@ function statusLineForTool(name){
   if (name === "read_availability") return "One sec, checking that time.";
   if (name === "book_appointment")  return "Got it, booking now.";
   if (name === "cancel_appointment")return "Cancelling now.";
-  if (name === "transfer")          return "One moment.";
-  if (name === "end_call")          return "One moment.";
   return "One moment.";
 }
 
@@ -525,7 +524,6 @@ async function forceNaturalReply(messages) {
 
 /* ===== Generic tool runner with mutex and pinned-window echo ===== */
 async function runTools(ws, baseMessages) {
-  if (ws.__ending || ws.__ended) return "";
   if (ws.__llmBusy) { ws.__queued = baseMessages; console.log(JSON.stringify({ evt:"RUNTOOLS_QUEUE" })); return ""; }
   ws.__llmBusy = true;
 
@@ -534,7 +532,6 @@ async function runTools(ws, baseMessages) {
     console.log(JSON.stringify({ evt:"RUNTOOLS_BEGIN", hops:0, mem_len: ws.__mem?.length||0 }));
 
     for (let hops=0; hops<8; hops++){
-      if (ws.__ending || ws.__ended) return "";
       const choice = await openaiChat(messages);
       const msg = choice?.message || {};
       const calls = msg.tool_calls || [];
@@ -561,7 +558,7 @@ async function runTools(ws, baseMessages) {
             ...messages,
             msg,
             { role:"system",
-              content:"You just ended the conversation. In THIS SAME TURN, speak a friendly goodbye, then call end_call(callSid) immediately." }
+              content:"You just ended the conversation. In THIS SAME TURN, call end_call(callSid) immediately after a brief goodbye." }
           ];
           continue;
         }
@@ -615,18 +612,6 @@ async function runTools(ws, baseMessages) {
         // Attach tool result
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
 
-        // If we just ended the call, short-circuit the loop
-        if (name === "end_call" && result?.ok) {
-          ws.__ending = true;
-          try { ws.send(JSON.stringify({ event:"mark", mark:{ name:"ending" } })); } catch {}
-          setTimeout(async () => {
-            if (ws.readyState === ws.OPEN) { try { ws.close(); } catch {} }
-            ws.__ended = true;
-            try { await postSummary(ws, "end_call"); } catch {}
-          }, 50);
-          return "";
-        }
-
         // Pinned-window echo after successful availability read
         if (name === "read_availability") {
           try {
@@ -641,6 +626,26 @@ async function runTools(ws, baseMessages) {
               console.log(JSON.stringify({ evt:"PINNED_WINDOW", start: pinStart, end: pinEnd }));
             }
           } catch(err){ console.log(JSON.stringify({ evt:"PINNED_WINDOW_ERR", err: String(err) })); }
+        }
+
+        // Booking success/fail guard → prevent false “booked” claims
+        if (name === "book_appointment") {
+          if (result?.ok) {
+            messages.push({
+              role:"system",
+              content:"Booking succeeded. Confirm weekday, full date, time, meeting type, and location. Then ask if anything else."
+            });
+          } else {
+            messages.push({
+              role:"system",
+              content:"Booking failed. Do NOT say it was booked. Say a short outcome using the error text if helpful, then offer 2–3 nearby in-hours options and ask one question."
+            });
+          }
+        }
+
+        // end_call guard to stop further speech
+        if (name === "end_call" && result?.ok) {
+          ws.__ended = true;
         }
       }
 
@@ -709,7 +714,6 @@ wss.on("connection", (ws) => {
   ws.__queued = null;
   ws.__bookKeys = new Map();
   ws.__summarized = false;
-  ws.__ending = false;
   ws.__ended = false;
 
   console.log(JSON.stringify({ evt:"WS_CONN" }));
@@ -756,7 +760,6 @@ wss.on("connection", (ws) => {
 
       // Start Deepgram once
       const dgSock = newDeepgram(async (text) => {
-        if (ws.__ending || ws.__ended) return;
         const base = [
           ...systemMessages(ws.__tenantPrompt),
           ...ws.__mem.slice(-12),
@@ -769,13 +772,11 @@ wss.on("connection", (ws) => {
         }
       });
       dg = dgSock;
-      dg.__ws_ref = ws;
 
       return;
     }
 
     if (msg.event === "media") {
-      if (ws.__ending || ws.__ended) return;
       const ulaw = Buffer.from(msg.media?.payload || "", "base64");
       pendingULaw.push(ulaw);
       if (pendingULaw.length >= BATCH) flushULaw();
