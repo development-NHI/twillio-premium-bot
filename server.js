@@ -172,16 +172,21 @@ function newDeepgram(onFinal) {
     headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // Deepgram expects "Token"
     perMessageDeflate: false
   });
+  dg.on("open", ()=> console.log(JSON.stringify({ evt:"DG_OPEN" })));
+  dg.on("close", (c,r)=> console.log(JSON.stringify({ evt:"DG_CLOSE", code:c, reason:r?.toString?.() })));
+  dg.on("error", (e)=> console.warn(JSON.stringify({ evt:"DG_ERROR", message:e.message })));
   dg.on("message", (data)=>{
     try{
       const ev = JSON.parse(data.toString());
       const alt = ev.channel?.alternatives?.[0];
       const text = (alt?.transcript || "").trim();
       if (!text) return;
+      console.log(JSON.stringify({ evt:"DG_TRANSCRIPT", is_final: !!(ev.is_final||ev.speech_final), text_preview: text.slice(0,80) }));
       if (ev.is_final || ev.speech_final) onFinal?.(text);
-    }catch{}
+    }catch(err){
+      console.warn(JSON.stringify({ evt:"DG_PARSE_ERR", err: String(err) }));
+    }
   });
-  dg.on("error", (e)=> console.warn("[Deepgram error]", e.message));
   return dg;
 }
 
@@ -195,17 +200,24 @@ function cleanTTS(s=""){
     .trim();
 }
 async function speakULaw(ws, text){
-  if (!text || !ws.__streamSid) return;
+  if (!text || !ws.__streamSid) {
+    console.log(JSON.stringify({ evt:"TTS_SKIP", reason: !text ? "empty" : "no streamSid" }));
+    return;
+  }
   const clean = cleanTTS(text);
   try{
+    console.log(JSON.stringify({ evt:"TTS_START", chars: clean.length, preview: clean.slice(0,80) }));
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: clean }, { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true }, timeout:20000, tag:"TTS_STREAM" });
+    let bytes = 0;
     resp.data.on("data", chunk => {
       if (ws.readyState !== WebSocket.OPEN) return;
+      bytes += chunk.length;
       const b64 = Buffer.from(chunk).toString("base64");
       ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload:b64 } }));
     });
-  } catch(e){ console.error("[TTS ERROR]", e.message); }
+    resp.data.on("end", ()=> console.log(JSON.stringify({ evt:"TTS_END", bytes })));
+  } catch(e){ console.error(JSON.stringify({ evt:"TTS_ERROR", message:e.message })); }
 }
 
 /* ===== LLM ===== */
@@ -268,8 +280,19 @@ const toolSchema = [
 async function openaiChat(messages, options={}){
   const headers = { Authorization:`Bearer ${OPENAI_API_KEY}` };
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", response_format:{ type:"text" }, ...options };
+  const id = rid(); const t = Date.now();
+  console.log(JSON.stringify({ evt:"LLM_REQ", id, msg_count: messages.length }));
   const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, { headers, timeout:30000, tag:"OPENAI_CHAT" });
-  return data.choices?.[0];
+  const choice = data.choices?.[0];
+  const msg = choice?.message || {};
+  console.log(JSON.stringify({
+    evt:"LLM_RES",
+    id,
+    ms: Date.now()-t,
+    has_content: !!(msg.content && msg.content.trim()),
+    tool_calls: (msg.tool_calls||[]).map(tc => tc.function?.name)
+  }));
+  return choice;
 }
 
 /* ===== ISO timezone validation helper ===== */
@@ -289,9 +312,14 @@ const Tools = {
 
     const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window:windowObj, contact_name:name, contact_phone:phone };
     try {
+      const t0 = Date.now();
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ" });
+      console.log(JSON.stringify({ evt:"CAL_READ_OK", ms: Date.now()-t0, window: windowObj, count: data?.count, events_len: data?.events?.length }));
       return { ok:true, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body: e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"CAL_READ_FAIL" }));
+      return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body: e.response?.data };
+    }
   },
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
@@ -316,20 +344,30 @@ const Tools = {
       Notes: notes||service||""
     };
     try {
+      const t0 = Date.now();
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000, tag:"CAL_CREATE" });
+      console.log(JSON.stringify({ evt:"CAL_CREATE_OK", ms: Date.now()-t0, startISO, endISO }));
       return { ok:true, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"CAL_CREATE_FAIL" }));
+      return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data };
+    }
   },
 
   async cancel_appointment({ event_id, name, phone, dateISO }) {
     if (!URLS.CAL_DELETE) return { ok:false, error:"CAL_DELETE_URL_MISSING" };
     try {
+      const t0 = Date.now();
       const { data, status } = await httpPost(URLS.CAL_DELETE, {
         intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone, dateISO
       }, { timeout:12000, tag:"CAL_DELETE" });
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
+      console.log(JSON.stringify({ evt:"CAL_DELETE_DONE", ms: Date.now()-t0, ok }));
       return { ok, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"CAL_DELETE_FAIL" }));
+      return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
+    }
   },
 
   async find_customer_events({ name, phone, days=30 }) {
@@ -338,23 +376,39 @@ const Tools = {
     const w = dayWindowLocal(base, BIZ_TZ);
     const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window:w, contact_name:name, contact_phone:phone, days };
     try {
+      const t0 = Date.now();
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ_FIND" });
+      console.log(JSON.stringify({ evt:"CAL_FIND_OK", ms: Date.now()-t0, events: data?.events?.length }));
       return { ok:true, events: data?.events || [], data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"CAL_FIND_FAIL" }));
+      return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
+    }
   },
 
   async lead_upsert({ name, phone, intent, notes }) {
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
     try {
+      const t0 = Date.now();
       const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SOURCE, name, phone, intent, notes }, { timeout:8000, tag:"LEAD_UPSERT" });
+      console.log(JSON.stringify({ evt:"LEAD_OK", ms: Date.now()-t0 }));
       return { ok:true, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"LEAD_FAIL" }));
+      return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data };
+    }
   },
 
   async faq({ topic, service }) {
     try {
-      if (URLS.FAQ_LOG) await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SOURCE, topic, service }, { timeout:8000, tag:"FAQ_LOG" });
-    } catch {}
+      if (URLS.FAQ_LOG) {
+        const t0 = Date.now();
+        await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SOURCE, topic, service }, { timeout:8000, tag:"FAQ_LOG" });
+        console.log(JSON.stringify({ evt:"FAQ_LOG_OK", ms: Date.now()-t0 }));
+      }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"FAQ_LOG_FAIL", message: e.message }));
+    }
     return { ok:true };
   },
 
@@ -365,9 +419,14 @@ const Tools = {
       const handoffUrl = `https://${host}/handoff`;
       const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
+      const t0 = Date.now();
       await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, timeout:10000, tag:"TWILIO_REDIRECT", headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
+      console.log(JSON.stringify({ evt:"TRANSFER_OK", ms: Date.now()-t0 }));
       return { ok:true };
-    } catch(e){ return { ok:false, error:"TRANSFER_FAILED", status:e.response?.status||0, body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"TRANSFER_FAIL", message:e.message }));
+      return { ok:false, error:"TRANSFER_FAILED", status:e.response?.status||0, body:e.response?.data };
+    }
   },
 
   async end_call({ callSid, reason }) {
@@ -375,9 +434,14 @@ const Tools = {
     try {
       const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Status:"completed" });
+      const t0 = Date.now();
       await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, timeout:8000, tag:"TWILIO_HANGUP", headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
+      console.log(JSON.stringify({ evt:"HANGUP_OK", ms: Date.now()-t0, reason: reason||"" }));
       return { ok:true };
-    } catch(e){ return { ok:false, error:"HANGUP_FAILED", status:e.response?.status||0, body:e.response?.data }; }
+    } catch(e){
+      console.log(JSON.stringify({ evt:"HANGUP_FAIL", message:e.message }));
+      return { ok:false, error:"HANGUP_FAILED", status:e.response?.status||0, body:e.response?.data };
+    }
   }
 };
 
@@ -404,7 +468,9 @@ async function fetchTenantPrompt() {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
       if (data?.prompt) return data.prompt;
-    } catch {}
+    } catch(e){
+      console.log(JSON.stringify({ evt:"PROMPT_FETCH_FAIL", message: e.message }));
+    }
   }
   return FALLBACK_PROMPT;
 }
@@ -439,11 +505,12 @@ async function speakStatus(ws, messages, hint) {
 
 /* ===== Generic tool runner with mutex and pinned-window echo ===== */
 async function runTools(ws, baseMessages) {
-  if (ws.__llmBusy) { ws.__queued = baseMessages; return ""; }
+  if (ws.__llmBusy) { ws.__queued = baseMessages; console.log(JSON.stringify({ evt:"RUNTOOLS_QUEUE" })); return ""; }
   ws.__llmBusy = true;
 
   try {
     let messages = baseMessages.slice();
+    console.log(JSON.stringify({ evt:"RUNTOOLS_BEGIN", hops:0, mem_len: ws.__mem?.length||0 }));
 
     for (let hops=0; hops<8; hops++){
       const choice = await openaiChat(messages);
@@ -452,9 +519,11 @@ async function runTools(ws, baseMessages) {
 
       if (!calls.length) {
         const out = msg.content?.trim() || "";
+        console.log(JSON.stringify({ evt:"RUNTOOLS_NO_TOOLS", has_text: !!out, text_preview: out.slice(0,80) }));
         if (out) return out;
 
         const forced = await forceNaturalReply(messages);
+        console.log(JSON.stringify({ evt:"RUNTOOLS_FORCED_REPLY", has_text: !!forced, text_preview: (forced||"").slice(0,80) }));
         if (forced) return forced;
         return "";
       }
@@ -484,7 +553,7 @@ async function runTools(ws, baseMessages) {
       for (const tc of calls) {
         const name = tc.function.name;
         let args = {};
-        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch { console.log(JSON.stringify({ evt:"TOOL_ARGS_PARSE_FAIL", name })); }
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
@@ -502,11 +571,11 @@ async function runTools(ws, baseMessages) {
         }
 
         const impl = Tools[name];
-        console.log(JSON.stringify({ evt:"TOOL_START", name, argsPreview: Object.keys(args) }));
+        console.log(JSON.stringify({ evt:"TOOL_START", name, args_keys: Object.keys(args) }));
         let result = {};
         try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
         catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
-        console.log(JSON.stringify({ evt:"TOOL_DONE", name, ok: result?.ok !== false }));
+        console.log(JSON.stringify({ evt:"TOOL_DONE", name, ok: result?.ok !== false, err: result?.error || null }));
 
         // Attach tool result
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
@@ -522,21 +591,24 @@ async function runTools(ws, baseMessages) {
                 role:"system",
                 content:`You just verified availability for start=${pinStart} end=${pinEnd}. If you intend to book, call book_appointment using the same startISO and endISO exactly.`
               });
+              console.log(JSON.stringify({ evt:"PINNED_WINDOW", start: pinStart, end: pinEnd }));
             }
-          } catch {}
+          } catch(err){ console.log(JSON.stringify({ evt:"PINNED_WINDOW_ERR", err: String(err) })); }
         }
       }
 
-      console.log(JSON.stringify({ evt:"NEXT_HOP" }));
+      console.log(JSON.stringify({ evt:"NEXT_HOP", hop: hops+1 }));
       // Next hop lets the model confirm or issue the next tool call
     }
 
     const guidance = { role:"system", content: "You seem stuck. Ask one concise clarifying question to move forward." };
+    console.log(JSON.stringify({ evt:"HOP_LIMIT_GUIDANCE" }));
     return await forceNaturalReply([...baseMessages, guidance]);
   } finally {
     ws.__llmBusy = false;
     if (ws.__queued) {
       const q = ws.__queued; ws.__queued = null;
+      console.log(JSON.stringify({ evt:"RUNTOOLS_DEQUEUE" }));
       runTools(ws, q).then(async (reply) => { if (reply) await speakULaw(ws, reply); });
     }
   }
@@ -571,8 +643,8 @@ async function postSummary(ws, reason = "normal") {
     ended_reason: reason || ""
   };
 
-  try { if (URLS.CALL_LOG)     await httpPost(URLS.CALL_LOG,     payload, { timeout:10000, tag:"CALL_LOG" }); } catch {}
-  try { if (URLS.CALL_SUMMARY) await httpPost(URLS.CALL_SUMMARY, payload, { timeout: 8000, tag:"CALL_SUMMARY" }); } catch {}
+  try { if (URLS.CALL_LOG)     await httpPost(URLS.CALL_LOG,     payload, { timeout:10000, tag:"CALL_LOG" }); } catch(e){ console.log(JSON.stringify({ evt:"CALL_LOG_FAIL", message:e.message })); }
+  try { if (URLS.CALL_SUMMARY) await httpPost(URLS.CALL_SUMMARY, payload, { timeout: 8000, tag:"CALL_SUMMARY" }); } catch(e){ console.log(JSON.stringify({ evt:"CALL_SUMMARY_FAIL", message:e.message })); }
 }
 
 /* ===== Call loop ===== */
@@ -593,15 +665,17 @@ wss.on("connection", (ws) => {
   ws.__bookKeys = new Map();
   ws.__summarized = false;
 
+  console.log(JSON.stringify({ evt:"WS_CONN" }));
+
   const flushULaw = () => {
     if (!pendingULaw.length || !dg || dg.readyState !== WebSocket.OPEN) return;
     const chunk = Buffer.concat(pendingULaw);
     pendingULaw = [];
-    try { dg.send(chunk); } catch {}
+    try { dg.send(chunk); console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH", bytes: chunk.length })); } catch(err){ console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH_ERR", message: String(err) })); }
   };
 
   ws.on("message", async raw => {
-    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { console.log(JSON.stringify({ evt:"WS_PARSE_ERR" })); return; }
 
     if (msg.event === "start") {
       ws.__streamSid = msg.start.streamSid;
@@ -610,6 +684,7 @@ wss.on("connection", (ws) => {
       ws.__callSid = cp.CallSid || cp.callSid || "";
       ws.__convoId = rid();
       CALLS.set(ws.__callSid, ws);
+      console.log(JSON.stringify({ evt:"CALL_START", streamSid: ws.__streamSid, callSid: ws.__callSid, from: ws.__from }));
 
       ws.__tenantPrompt = await fetchTenantPrompt();
 
@@ -653,6 +728,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.event === "stop") {
+      console.log(JSON.stringify({ evt:"CALL_STOP" }));
       try { flushULaw(); } catch {}
       try { dg?.close(); } catch {}
       await postSummary(ws, "twilio_stop");
@@ -663,12 +739,14 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", async ()=> {
+    console.log(JSON.stringify({ evt:"WS_CLOSE" }));
     try { dg?.close(); } catch {}
     await postSummary(ws, "ws_close");
     CALLS.delete(ws.__callSid);
   });
 
-  ws.on("error", async ()=> {
+  ws.on("error", async (err)=> {
+    console.log(JSON.stringify({ evt:"WS_ERROR", message: err?.message || String(err) }));
     await postSummary(ws, "ws_error");
   });
 });
