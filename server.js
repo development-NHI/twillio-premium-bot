@@ -170,9 +170,6 @@ Availability interpretation:
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
-Call start:
-- On \`<CALL_START>\`, greet briefly with the business name and ask how you can help.
-
 Ending calls (very important):
 - If the caller clearly signals wrap-up (e.g., “that’s it,” “that’ll be all,” “we’re good,” “no thanks,” “I’m all set,” “bye”),
   reply with one short goodbye (e.g., “Thanks for calling—have a great day!”) and then call \`end_call\`.
@@ -539,14 +536,14 @@ function normalizeNumbersForSpeech(text="") {
 // Remove stage directions & keep speech natural
 function cleanTTS(s=""){
   let base = String(s)
-    .replace(/\*\*(.*?)\*\*/g, "$1")       // bold
-    .replace(/\*(.*?)\*/g, "$1")           // italics / stage directions
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
     .replace(/`{1,3}[^`]*`{1,3}/g, "")
     .replace(/^-+\s*/gm, "")
     .replace(/^\d+\.\s*/gm, "")
     .replace(/\[(.*?)\]\((.*?)\)/g, "$1")
     .replace(/^#{1,6}\s*/gm, "")
-    .replace(/\b(?:ending the call now|hanging up( the call)?|i(?:'|’)m ending the call)\b\.?/gi, "") // no meta signoffs
+    .replace(/\b(?:ending the call now|hanging up( the call)?|i(?:'|’)m ending the call)\b\.?/gi, "")
     .replace(/\s{2,}/g, " ")
     .replace(/\n{2,}/g, ". ")
     .replace(/\n/g, ", ")
@@ -1115,7 +1112,7 @@ async function verifyHourAvailability({ text, replyText }) {
   if (!busy) {
     const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
     const hh12 = ((h + 11) % 12) + 1;
-    const mm = m ? `:${String(m).padStart(2,'0')}` : ""; // fixed typo
+    const mm = m ? `:${String(m).padStart(2,'0')}` : "";
     const ampm = h >= 12 ? "PM" : "AM";
     const dayWord = /\btomorrow\b/i.test(text) ? "tomorrow" : "that time";
     return `Good news—${dayWord} at ${hh12}${mm} ${ampm} is open. Want me to lock it in?`;
@@ -1406,10 +1403,8 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // Re-enabled: AI greeting on connect (driven by prompt; not hardcoded in code).
-        ws.__handling = true;
-        await handleTurn(ws, "<CALL_START>");
-        ws.__handling = false;
+        // ==== IMPORTANT CHANGE: No AI greeting on connect. Wait for caller speech.
+        ws.__awaitingReply = false;
 
         return;
       }
@@ -1458,5 +1453,5 @@ if (!wss.__victory_handler_attached) {
 - Single Deepgram socket per call with 1.5s backoff; flush audio only after OPEN -> no WS storm.
 - Blocks premature hangups if the last bot message was a question.
 - Strips any “Ending the call now” stage direction before TTS.
-- AI greeting is back on connect, using your prompt (or PRE_CONNECT_GREETING if you set it in TwiML).
+- No AI auto-greeting on call start; bot waits for caller speech (unless PRE_CONNECT_GREETING TwiML is set).
 */
