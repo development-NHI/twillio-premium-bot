@@ -1,7 +1,7 @@
 /* server.js — Prompt-driven voice agent (transport + thin tools only)
    - JS streams audio, calls the model, and executes tool HTTP calls verbatim.
    - No business rules in JS. All policy lives in the prompt/config.
-   - Keeps CAL_* payloads and endpoints unchanged for Replit integration.
+   - Keeps CAL_* payloads and endpoints unchanged for Replit/Render integration.
 */
 
 import express from "express";
@@ -152,7 +152,7 @@ app.post("/twiml", (req,res) => {
         </Stream>
       </Connect>
     </Response>
-  `.trim()));
+  `.trim());
 });
 
 app.post("/handoff", (_req,res) => {
