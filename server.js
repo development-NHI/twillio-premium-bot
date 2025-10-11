@@ -1112,7 +1112,7 @@ async function verifyHourAvailability({ text, replyText }) {
   if (!busy) {
     const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
     const hh12 = ((h + 11) % 12) + 1;
-    aconst mm = m ? `:${String(m).padStart(2,'0')}` : "";
+    const mm = m ? `:${String(m).padStart(2,'0')}` : ""; // <-- fixed typo here
     const ampm = h >= 12 ? "PM" : "AM";
     const dayWord = /\btomorrow\b/i.test(text) ? "tomorrow" : "that time";
     return `Good news—${dayWord} at ${hh12}${mm} ${ampm} is open. Want me to lock it in?`;
