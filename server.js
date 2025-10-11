@@ -1,7 +1,7 @@
 /* server.js — Prompt-driven voice agent (transport + thin tools only)
-   - JS streams audio, calls the model, and executes tool HTTP calls verbatim.
+   - Streams audio, calls the model, and executes tool HTTP calls verbatim.
    - No business rules in JS. All policy lives in the prompt/config.
-   - Keeps CAL_* payloads and endpoints unchanged for Replit/Render integration.
+   - CAL_* endpoints kept compatible with Replit/Render integrations.
 */
 
 import express from "express";
@@ -207,14 +207,14 @@ function newDeepgram(onFinal) {
 }
 
 /* ===== ElevenLabs TTS (μ-law passthrough) ===== */
-// hard filter: never speak tools, code, or phone numbers
+// never speak tool names, code, ISO blobs, or full phone numbers
 function sanitizeSpoken(raw=""){
   let s = String(raw);
-  s = s.replace(/`{1,3}[\s\S]*?`{1,3}/g, " ");            // code fences
-  s = s.replace(/\b(read_availability|book_appointment|cancel_appointment|find_customer_events|transfer|end_call)\b[\s\S]*/i, " "); // strip tool mentions onward
-  s = s.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]"); // redact phone-like sequences
-  s = s.replace(/[A-Z]{2,}\d{2,}[-:T.\dZ+]*\)?/g, " ");     // scrub ISO-like blobs
-  s = s.replace(/\[(.*?)\]\((.*?)\)/g,"$1");                // markdown links
+  s = s.replace(/`{1,3}[\s\S]*?`{1,3}/g, " "); // code fences
+  s = s.replace(/\b(read_availability|book_appointment|cancel_appointment|find_customer_events|transfer|end_call)\b[\s\S]*/i, " ");
+  s = s.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]");
+  s = s.replace(/[A-Z]{2,}\d{2,}[-:T.\dZ+]*\)?/g, " ");
+  s = s.replace(/\[(.*?)\]\((.*?)\)/g,"$1");
   s = s.replace(/\s{2,}/g," ").trim();
   if (!s) s = "One moment.";
   return s;
@@ -535,7 +535,7 @@ async function runTools(ws, baseMessages) {
         const out = msg.content?.trim() || "";
         console.log(JSON.stringify({ evt:"RUNTOOLS_NO_TOOLS", has_text: !!out, text_preview: out.slice(0,80) }));
 
-        // status-no-tool guard: enforce same-turn contract
+        // status-no-tool guard: enforce same-turn tool call
         if (out && /\b(checking|booking|cancelling|canceling)\b/i.test(out)) {
           console.log(JSON.stringify({ evt:"STATUS_NO_TOOL_GUARD", preview: out.slice(0,64) }));
           messages = [
@@ -546,6 +546,18 @@ async function runTools(ws, baseMessages) {
           ];
           continue;
         }
+
+        // goodbye-without-tool guard → force end_call in same turn
+        if (out && /\b(bye|goodbye|that('?| )is it|we('re| are) good|that('ll| will) be it|nothing else)\b/i.test(out)) {
+          messages = [
+            ...messages,
+            msg,
+            { role:"system",
+              content:"You just ended the conversation. In THIS SAME TURN, call end_call(callSid) immediately after a brief goodbye." }
+          ];
+          continue;
+        }
+
         if (out) return out;
 
         const forced = await forceNaturalReply(messages);
