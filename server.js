@@ -520,6 +520,20 @@ async function runTools(ws, baseMessages) {
       if (!calls.length) {
         const out = msg.content?.trim() || "";
         console.log(JSON.stringify({ evt:"RUNTOOLS_NO_TOOLS", has_text: !!out, text_preview: out.slice(0,80) }));
+
+        // ===== status-no-tool guard: enforce same-turn contract =====
+        if (out && /\b(checking|booking|cancelling|canceling)\b/i.test(out)) {
+          console.log(JSON.stringify({ evt:"STATUS_NO_TOOL_GUARD", preview: out.slice(0,64) }));
+          messages = [
+            ...messages,
+            msg,
+            { role: "system",
+              content: "You just said a status line. Now, in THIS SAME TURN, call the appropriate tool using the exact intended ISO window. Do NOT reply with text only." }
+          ];
+          continue; // re-ask model this hop; expect a tool_call
+        }
+        // ===== end guard =====
+
         if (out) return out;
 
         const forced = await forceNaturalReply(messages);
