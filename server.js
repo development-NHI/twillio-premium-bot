@@ -94,7 +94,6 @@ function todayISOInTZ(tz){
   return `${p.year}-${p.month}-${p.day}`;
 }
 function localEndOffsetISO(dateISO, h, m, tz) {
-  // Build a local wall time then attach the correct offset for TZ
   const d = new Date(`${dateISO}T00:00:00Z`);
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, hour12:false, year:"numeric", month:"2-digit", day:"2-digit",
@@ -153,7 +152,7 @@ app.post("/twiml", (req,res) => {
         </Stream>
       </Connect>
     </Response>
-  `.trim());
+  `.trim()));
 });
 
 app.post("/handoff", (_req,res) => {
@@ -187,7 +186,7 @@ const CALLS = new Map();
 function newDeepgram(onFinal) {
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=900";
   const dg = new WebSocket(url, {
-    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // Deepgram expects "Token"
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` },
     perMessageDeflate: false
   });
   dg.on("open", ()=> console.log(JSON.stringify({ evt:"DG_OPEN" })));
@@ -208,22 +207,21 @@ function newDeepgram(onFinal) {
 }
 
 /* ===== ElevenLabs TTS (μ-law passthrough) ===== */
-function cleanTTS(s=""){
-  const txt = String(s)
-    .replace(/\*\*(.*?)\*\*/g,"$1")
-    .replace(/`{1,3}[^`]*`{1,3}/g,"")
-    .replace(/\[(.*?)\]\((.*?)\)/g,"$1")
-    .replace(/\s{2,}/g," ")
-    .trim();
-  // redact phone-like sequences so TTS won't read numbers aloud
-  return txt.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]");
+// hard filter: never speak tools, code, or phone numbers
+function sanitizeSpoken(raw=""){
+  let s = String(raw);
+  s = s.replace(/`{1,3}[\s\S]*?`{1,3}/g, " ");            // code fences
+  s = s.replace(/\b(read_availability|book_appointment|cancel_appointment|find_customer_events|transfer|end_call)\b[\s\S]*/i, " "); // strip tool mentions onward
+  s = s.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]"); // redact phone-like sequences
+  s = s.replace(/[A-Z]{2,}\d{2,}[-:T.\dZ+]*\)?/g, " ");     // scrub ISO-like blobs
+  s = s.replace(/\[(.*?)\]\((.*?)\)/g,"$1");                // markdown links
+  s = s.replace(/\s{2,}/g," ").trim();
+  if (!s) s = "One moment.";
+  return s;
 }
 async function speakULaw(ws, text){
-  if (!text || !ws.__streamSid) {
-    console.log(JSON.stringify({ evt:"TTS_SKIP", reason: !text ? "empty" : "no streamSid" }));
-    return;
-  }
-  const clean = cleanTTS(text);
+  if (!text || !ws.__streamSid) return;
+  const clean = sanitizeSpoken(text);
   try{
     console.log(JSON.stringify({ evt:"TTS_START", chars: clean.length, preview: clean.slice(0,80) }));
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
@@ -255,7 +253,8 @@ const toolSchema = [
     description:"Create a calendar event. The model must pass the exact startISO/endISO it wants.",
     parameters:{ type:"object", properties:{
       name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
-      startISO:{type:"string"}, endISO:{type:"string"}, notes:{type:"string"}
+      startISO:{type:"string"}, endISO:{type:"string"}, notes:{type:"string"},
+      meeting_type:{type:"string"}, location:{type:"string"}
     }, required:["service","startISO","endISO"] }
   }},
   { type:"function", function:{
@@ -341,7 +340,7 @@ const Tools = {
     }
   },
 
-  async book_appointment({ name, phone, service, startISO, endISO, notes }) {
+  async book_appointment({ name, phone, service, startISO, endISO, notes, meeting_type, location }) {
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     if (!hasTZ(startISO)) return { ok:false, error:"ISO_MISSING_TZ_START" };
     if (!hasTZ(endISO))   return { ok:false, error:"ISO_MISSING_TZ_END"   };
@@ -359,7 +358,9 @@ const Tools = {
       Customer_Name: name||"",
       Customer_Phone: phone||"",
       Customer_Email: "",
-      Notes: notes||service||""
+      Notes: notes||service||"",
+      Meeting_Type: meeting_type||"",
+      Location: location||""
     };
     try {
       const t0 = Date.now();
@@ -481,7 +482,7 @@ Rules:
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
 
 async function fetchTenantPrompt() {
-  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
+  if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH" });
@@ -501,24 +502,19 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
+/* ===== Deterministic status lines (no model) ===== */
+function statusLineForTool(name){
+  if (name === "read_availability") return "One sec, checking that time.";
+  if (name === "book_appointment")  return "Got it, booking now.";
+  if (name === "cancel_appointment")return "Cancelling now.";
+  return "One moment.";
+}
+
 /* ===== Force a spoken reply when tools are disabled ===== */
 async function forceNaturalReply(messages) {
   const choice = await openaiChat(messages, { tool_choice:"none" });
   const msg = choice?.message || {};
   return (msg.content || "").trim();
-}
-
-/* ===== Prompt-driven status speech when model returns only tools ===== */
-async function speakStatus(ws, messages, hint) {
-  const guidance = {
-    role: "system",
-    content: `Say one short status line about "${hint}". Keep it under 8 words.`
-  };
-  const line = await forceNaturalReply([...messages, guidance]);
-  if (line) {
-    console.log(JSON.stringify({ evt:"STATUS_SAY", line }));
-    await speakULaw(ws, line);
-  }
 }
 
 /* ===== Generic tool runner with mutex and pinned-window echo ===== */
@@ -558,20 +554,9 @@ async function runTools(ws, baseMessages) {
         return "";
       }
 
-      // Speak a status line once per hop before executing tools
-      const said = (msg.content || "").trim();
-      if (said) {
-        console.log(JSON.stringify({ evt:"STATUS_MODEL_TEXT", said }));
-        await speakULaw(ws, said);
-      } else {
-        const first = calls[0]?.function?.name || "";
-        const hint =
-          first === "read_availability" ? "checking that time" :
-          first === "book_appointment"  ? "booking now" :
-          first === "cancel_appointment"? "cancelling now" :
-          "one moment";
-        await speakStatus(ws, messages, hint);
-      }
+      // Speak deterministic status line per first tool, never tool text
+      const first = calls[0]?.function?.name || "";
+      await speakULaw(ws, statusLineForTool(first));
 
       console.log(JSON.stringify({
         evt:"LLM_TOOL_CALLS",
@@ -628,7 +613,6 @@ async function runTools(ws, baseMessages) {
       }
 
       console.log(JSON.stringify({ evt:"NEXT_HOP", hop: hops+1 }));
-      // Next hop lets the model confirm or issue the next tool call
     }
 
     const guidance = { role:"system", content: "You seem stuck. Ask one concise clarifying question to move forward." };
@@ -653,7 +637,6 @@ function transcriptFromMem(mem){
   }).filter(Boolean).join("\n");
 }
 
-// Schema-compatible postSummary
 async function postSummary(ws, reason = "normal") {
   if (ws.__summarized) return;
   ws.__summarized = true;
