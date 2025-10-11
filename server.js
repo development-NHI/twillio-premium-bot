@@ -169,7 +169,7 @@ const CALLS = new Map();
 function newDeepgram(onFinal) {
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=900";
   const dg = new WebSocket(url, {
-    headers: { Authorization: `token ${DEEPGRAM_API_KEY}` },
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // "Token" is expected by Deepgram
     perMessageDeflate: false
   });
   dg.on("message", (data)=>{
@@ -415,6 +415,19 @@ async function forceNaturalReply(messages) {
   return (msg.content || "").trim();
 }
 
+/* ===== Prompt-driven status speech when model returns only tools ===== */
+async function speakStatus(ws, messages, hint) {
+  const guidance = {
+    role: "system",
+    content: `Say one short status line about "${hint}". Keep it under 8 words.`
+  };
+  const line = await forceNaturalReply([...messages, guidance]);
+  if (line) {
+    console.log(JSON.stringify({ evt:"STATUS_SAY", line }));
+    await speakULaw(ws, line);
+  }
+}
+
 /* ===== Generic tool runner with mutex and no premature return ===== */
 async function runTools(ws, baseMessages) {
   if (ws.__llmBusy) { ws.__queued = baseMessages; return ""; }
@@ -432,26 +445,47 @@ async function runTools(ws, baseMessages) {
         const out = msg.content?.trim() || "";
         if (out) return out;
 
-        // Last resort only when model gave no tools and no content
         const forced = await forceNaturalReply(messages);
         if (forced) return forced;
         return "";
       }
 
-      // Execute announced tool calls and continue loop so model can follow up
+      // Speak a status line once per hop before executing tools
+      const said = (msg.content || "").trim();
+      if (said) {
+        console.log(JSON.stringify({ evt:"STATUS_MODEL_TEXT", said }));
+        await speakULaw(ws, said);
+      } else {
+        const first = calls[0]?.function?.name || "";
+        const hint =
+          first === "read_availability" ? "checking that time" :
+          first === "book_appointment"  ? "booking now" :
+          first === "cancel_appointment"? "cancelling now" :
+          "one moment";
+        await speakStatus(ws, messages, hint);
+      }
+
+      console.log(JSON.stringify({
+        evt:"LLM_TOOL_CALLS",
+        count: calls.length,
+        names: calls.map(c => c.function?.name)
+      }));
+
+      // Execute tools
       for (const tc of calls) {
         const name = tc.function.name;
         let args = {};
         try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-        // Deduplicate same booking window within 60s
         if (name === "book_appointment") {
           const k = `${args.startISO||""}|${args.endISO||""}`;
           const now = Date.now();
           ws.__bookKeys = ws.__bookKeys || new Map();
           const last = ws.__bookKeys.get(k) || 0;
           if (now - last < 60000) {
+            console.log(JSON.stringify({ evt:"BOOK_DEDUP_SUPPRESS", key:k }));
             messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:false, error:"DUPLICATE_BOOKING_SUPPRESSED" }) }];
             continue;
           }
@@ -459,17 +493,19 @@ async function runTools(ws, baseMessages) {
         }
 
         const impl = Tools[name];
+        console.log(JSON.stringify({ evt:"TOOL_START", name, argsPreview: Object.keys(args) }));
         let result = {};
         try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
         catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
+        console.log(JSON.stringify({ evt:"TOOL_DONE", name, ok: result?.ok !== false }));
 
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
       }
 
-      // Loop continues; the next hop lets the model say “Booked” or issue another tool call
+      console.log(JSON.stringify({ evt:"NEXT_HOP" }));
+      // Next hop lets the model confirm or issue the next tool call
     }
 
-    // Hop limit reached. Ask the model to clarify next step.
     const guidance = { role:"system", content: "You seem stuck. Ask one concise clarifying question to move forward." };
     return await forceNaturalReply([...baseMessages, guidance]);
   } finally {
@@ -552,7 +588,7 @@ wss.on("connection", (ws) => {
 
       ws.__tenantPrompt = await fetchTenantPrompt();
 
-      // Proactive AI greeting
+      // Proactive AI greeting (prompt-driven)
       const boot = [
         ...systemMessages(ws.__tenantPrompt),
         ...ws.__mem.slice(-12),
