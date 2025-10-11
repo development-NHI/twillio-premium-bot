@@ -25,7 +25,6 @@ const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
 const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID || "";
 const OWNER_PHONE        = process.env.OWNER_PHONE || "";
 
-const DASH_BIZ    = process.env.DASH_BIZ || "The Victory Team";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
 const BIZ_TZ      = process.env.BIZ_TZ || "America/New_York";
 
@@ -106,15 +105,6 @@ function isoToLocalYYYYMMDDHHmm(iso, tz) {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
-/* ===== Phone normalizer ===== */
-function normPhone(s=""){
-  const d = (String(s).match(/\d/g) || []).join("");
-  if (!d) return "";
-  if (d.length === 11 && d.startsWith("1")) return `+${d}`;
-  if (d.length === 10) return `+1${d}`;
-  return `+${d}`;
-}
-
 /* ===== App / TwiML ===== */
 const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
@@ -161,7 +151,7 @@ app.post("/handoff", (_req,res) => {
 const server = app.listen(PORT, () => {
   console.log(`[INIT] listening on ${PORT}`);
   console.log("[INIT] URLS", URLS);
-  console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
+  console.log("[INIT] TENANT", { DASH_SOURCE, BIZ_TZ });
 });
 
 /* ===== WS server (singleton) ===== */
@@ -319,7 +309,7 @@ const Tools = {
     else if (dateISO) windowObj = dayWindowLocal(dateISO, BIZ_TZ);
     else windowObj = dayWindowLocal(todayISOInTZ(BIZ_TZ), BIZ_TZ);
 
-    const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window:windowObj, contact_name:name, contact_phone:normPhone(phone||"") };
+    const payload = { intent:"READ", source:DASH_SOURCE, timezone:BIZ_TZ, window:windowObj, contact_name:name, contact_phone:phone };
     try {
       const t0 = Date.now();
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ" });
@@ -339,7 +329,6 @@ const Tools = {
     const startLocal = isoToLocalYYYYMMDDHHmm(startISO, BIZ_TZ);
     const endLocal   = isoToLocalYYYYMMDDHHmm(endISO,   BIZ_TZ);
     const payload = {
-      biz: DASH_BIZ,
       source: DASH_SOURCE,
       Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
       Timezone: BIZ_TZ,
@@ -348,7 +337,7 @@ const Tools = {
       Start_Time_UTC:   startISO,
       End_Time_UTC:     endISO,
       Customer_Name: name||"",
-      Customer_Phone: normPhone(phone||""),
+      Customer_Phone: phone||"",
       Customer_Email: "",
       Notes: notes||service||""
     };
@@ -368,7 +357,7 @@ const Tools = {
     try {
       const t0 = Date.now();
       const { data, status } = await httpPost(URLS.CAL_DELETE, {
-        intent:"DELETE", biz:DASH_BIZ, source:DASH_SOURCE, event_id, name, phone: normPhone(phone||""), dateISO
+        intent:"DELETE", source:DASH_SOURCE, event_id, name, phone, dateISO
       }, { timeout:12000, tag:"CAL_DELETE" });
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
       console.log(JSON.stringify({ evt:"CAL_DELETE_DONE", ms: Date.now()-t0, ok }));
@@ -383,7 +372,7 @@ const Tools = {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
     const base = todayISOInTZ(BIZ_TZ);
     const w = dayWindowLocal(base, BIZ_TZ);
-    const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window:w, contact_name:name, contact_phone:normPhone(phone||""), days };
+    const payload = { intent:"READ", source:DASH_SOURCE, timezone:BIZ_TZ, window:w, contact_name:name, contact_phone:phone, days };
     try {
       const t0 = Date.now();
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ_FIND" });
@@ -399,7 +388,7 @@ const Tools = {
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
     try {
       const t0 = Date.now();
-      const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SOURCE, name, phone: normPhone(phone||""), intent, notes }, { timeout:8000, tag:"LEAD_UPSERT" });
+      const { data } = await httpPost(URLS.LEAD_UPSERT, { source:DASH_SOURCE, name, phone, intent, notes }, { timeout:8000, tag:"LEAD_UPSERT" });
       console.log(JSON.stringify({ evt:"LEAD_OK", ms: Date.now()-t0 }));
       return { ok:true, data };
     } catch(e){
@@ -412,7 +401,7 @@ const Tools = {
     try {
       if (URLS.FAQ_LOG) {
         const t0 = Date.now();
-        await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SOURCE, topic, service }, { timeout:8000, tag:"FAQ_LOG" });
+        await httpPost(URLS.FAQ_LOG, { source:DASH_SOURCE, topic, service }, { timeout:8000, tag:"FAQ_LOG" });
         console.log(JSON.stringify({ evt:"FAQ_LOG_OK", ms: Date.now()-t0 }));
       }
     } catch(e){
@@ -456,92 +445,17 @@ const Tools = {
 
 /* ===== Prompt sourcing (RENDER_PROMPT preferred) ===== */
 const FALLBACK_PROMPT = `
-[Prompt-Version: 2025-10-11T23:40Z • single-ID • same-turn-contract • pin-window • no-silence • iso-tz • confirm-outcome]
+[Prompt-Version: 2025-10-11 baseline, no-biz-var]
 
-You are an AI phone receptionist for The Victory Team (VictoryTeamSells.com) — Maryland real estate.
-Timezone: America/New_York. Hours: Mon–Fri 9–5.
+You are the AI phone receptionist.
+Timezone: ${BIZ_TZ}. Be concise and human-like. Ask one question at a time.
 
-Brand/Tone
-- Friendly, natural, concise, confident, local.
-- Office: 1316 E Churchville Rd, Bel Air MD 21014. Main: 833-888-1754.
-- Services: buyer consults & tours, seller/listing consults (mention 1.75% model if asked), investors, general Q&A.
-- Positioning (only if relevant): 600+ homes sold; $220M+ closed; Top 1%; 5★ reviews.
-
-Opening
-- Say immediately: “Thanks for calling The Victory Team. How can I help today?”
-
-Conversation Rules
-- Ask one question at a time. Replies under 15 words unless reading back.
-- Keep a scratchpad: Name, Phone, Role, Service, Property/MLS, Date, Time, Meeting Type, Location, Notes.
-- Before asking, check your scratchpad. If you have it, don’t ask again.
-- Accept barge-in. If the caller answers, stop and continue from that answer.
-- Do not repeat a question they just answered.
-
-Identity Capture
-- Use caller ID if they say “this number.” Ask for a different number only if they specify one.
-- Collect name and phone once. Ask right before booking or during cancel/rescheduling.
-
-Data to collect before booking
-- Name, phone, service type, property/MLS (if showing), preferred date and time, meeting type (in-person vs virtual; location if in-person), notes.
-
-Scheduling Policy (model-driven, tool-verified)
-1) Resolve relative dates in America/New_York for “today/tomorrow/next <weekday>.”
-2) Same-turn contract:
-   - If you say a status line (“One sec—checking that time.” / “Still checking…” / “Got it—booking now.” / “Cancelling now.”), you MUST include the matching tool_call in the SAME turn. Never send a text-only turn after a status line.
-3) When the caller proposes a specific hour (e.g., “next Monday at 2 PM”):
-   - Build that exact 60-minute window in America/New_York.
-   - Say the status line and CALL read_availability for that exact hour only.
-   - Consider the slot free ONLY if the read succeeded AND no overlapping events exist in the returned window.
-   - If free → say “That hour is open.” THEN CALL book_appointment using the EXACT same startISO/endISO you just checked. Do not recompute dates.
-   - If busy → say “That hour is taken.” Offer 2–3 nearby options and wait.
-   - If the slot returns “canceled,” you may offer it.
-4) After ANY tool call, speak one short line summarizing the outcome before asking the next question.
-5) After a successful booking, immediately confirm with weekday + date, time, meeting type, location, and any captured notes. Then ask if they need anything else.
-6) Never stop after read_availability. Either book immediately or offer nearby alternatives.
-
-Slot Pinning
-- Book with the identical startISO/endISO you verified. Never reinterpret “next Monday.”
-- Do not re-book the same pinned ISO within the conversation unless the first booking failed or was canceled.
-
-Ambiguous Times
-- If the caller says “1:00” without AM/PM and you are moving a same-day morning slot, assume 1 PM once and confirm. Otherwise ask: “Do you mean 1 AM or 1 PM?”
-
-Correction / Reschedule in Same Call
-- If the wrong day/time is noticed after booking:
-  - Call cancel_appointment with the created event_id.
-  - Restate the intended time (weekday + date).
-  - Verify that hour with read_availability, then call book_appointment with those verified ISOs.
-
-Cancel / Reschedule Identity (name + phone only)
-1) Use caller ID if they say “this number.”
-2) Find a single upcoming event using find_customer_events (or read_availability if backend expects it).
-3) If exactly one future match → capture its event_id.
-4) Cancel: cancel_appointment(event_id). Reschedule: verify the new hour → cancel old by event_id → book new with the verified ISOs.
-5) If none or multiple → ask only the missing disambiguator (date/time/location).
-
-Latency / Silence Prevention
-- A status line must be followed immediately by a tool_call in the same turn, or by a spoken result from the tool. Never end a turn with a status-only message.
-- Keep status lines short: “One sec—checking that time.”, “Still checking…”, “Got it—booking now.”
-
-Tool Usage
-- Use tools for reading, booking, canceling, rescheduling, transfer, FAQ logging, and lead capture.
-- Always resolve times in America/New_York.
-- Always send ISO-8601 with timezone (Z or ±HH:MM) in startISO/endISO.
-- If a tool response indicates ISO_MISSING_TZ_START or ISO_MISSING_TZ_END, regenerate the same window with timezone and retry once.
-- Include name, phone, service, property/MLS, meeting type, location, and useful notes in Notes.
-- Do not invent tool outcomes. If a tool fails, state it concisely and offer next steps.
-
-Outside Hours
-- Capture name, number, service, best callback time. Promise a callback during business hours.
-
-Ending Calls
-- If the caller says “that’s it,” “we’re good,” or “bye,” give a short goodbye and call end_call.
-- After you ask a question, wait for their answer. Once they decline more help, end_call.
-
-Output
-- Short, natural sentences. No bullet lists in speech.
-- Confirmations must include weekday + date to avoid off-by-day errors.
-- Example: “You’re all set for Monday, October 13th at 2 PM.”
+Rules:
+- Scheduling logic is yours. Use tools exactly as needed.
+- When you check a time, pin that exact start/end in your booking call.
+- Don’t hang up unless caller ends or you choose to end; then call end_call.
+- Include name, phone, service, and notes when booking if available.
+- Keep confirmations short and natural.
 `;
 
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
@@ -550,7 +464,7 @@ async function fetchTenantPrompt() {
   if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
   if (URLS.PROMPT_FETCH) {
     try {
-      const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
+      const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH" });
       if (data?.prompt) return data.prompt;
     } catch(e){
       console.log(JSON.stringify({ evt:"PROMPT_FETCH_FAIL", message: e.message }));
@@ -733,7 +647,6 @@ async function postSummary(ws, reason = "normal") {
   };
 
   const payload = {
-    biz: DASH_BIZ,
     source: DASH_SOURCE,
     ...trace,
     summary: ws.__summary || "",
