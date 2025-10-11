@@ -1,7 +1,7 @@
 /* server.js — Prompt-driven voice agent (transport + thin tools only)
-   - JS only streams audio, calls the model, and executes tool HTTP calls verbatim.
+   - JS streams audio, calls the model, and executes tool HTTP calls verbatim.
    - No business rules in JS. All policy lives in the prompt/config.
-   - Keeps your CAL_* payloads and endpoints unchanged for Replit integration.
+   - Keeps CAL_* payloads and endpoints unchanged for Replit integration.
 */
 
 import express from "express";
@@ -49,6 +49,7 @@ requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
+// Calendar URLs optional. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
@@ -113,7 +114,7 @@ app.use(bodyParser.json());
 app.get("/", (_req,res) => res.status(200).send("OK: Prompt-driven Voice Agent"));
 app.get("/healthz", (_req,res) => res.status(200).send("ok"));
 
-function escapeXml(s=""){ return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c])); }
+function escapeXml(s=""){ return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;"}[c])); }
 
 app.post("/twiml", (req,res) => {
   const from = req.body?.From || "";
@@ -270,7 +271,7 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
-/* ===== Tools (thin wrappers) ===== */
+/* ===== Tool implementations (thin wrappers, no logic) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
@@ -372,22 +373,23 @@ const Tools = {
 
 /* ===== Prompt sourcing (RENDER_PROMPT preferred) ===== */
 const FALLBACK_PROMPT = `
-[Prompt-Version: 2025-10-10]
+[Prompt-Version: 2025-10-11 baseline]
 
-You are the AI phone receptionist for **${DASH_BIZ}**.
+You are the AI phone receptionist for ${DASH_BIZ}.
 Timezone: ${BIZ_TZ}. Be concise and human-like. Ask one question at a time.
 
 Rules:
-- All scheduling logic is yours. Use tools exactly as needed.
+- Scheduling logic is yours. Use tools exactly as needed.
 - When you check a time, pin that exact start/end in your booking call.
-- Don’t hang up unless you choose to end or caller ends; then call end_call.
+- Don’t hang up unless caller ends or you choose to end; then call end_call.
 - Include name, phone, service, and notes when booking if available.
 - Keep confirmations short and natural.
 `;
+
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
 
 async function fetchTenantPrompt() {
-  if (RENDER_PROMPT) return RENDER_PROMPT;
+  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
   if (URLS.PROMPT_FETCH) {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
@@ -405,61 +407,61 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
-/* ===== Generic tool runner ===== */
+/* ===== Generic tool runner with simple mutex and booking dedupe ===== */
 async function runTools(ws, baseMessages) {
-  let messages = baseMessages.slice();
-  for (let hops=0; hops<8; hops++){
-    const choice = await openaiChat(messages);
-    const msg = choice?.message || {};
-    if (!msg.tool_calls?.length) return msg.content?.trim() || "";
-
-    for (const tc of msg.tool_calls) {
-      const name = tc.function.name;
-      let args = {};
-      try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
-      if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
-      const impl = Tools[name];
-      let result = {};
-      try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
-      catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
-      messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
-    }
+  // Prevent overlapping LLM/tool runs from rapid ASR finals.
+  if (ws.__llmBusy) {
+    ws.__queued = baseMessages; // keep latest
+    return "";
   }
-  return "";
-}
+  ws.__llmBusy = true;
 
-/* ===== Action nudge + watchdog ===== */
-const FOLLOWUP_PAT = /(checking that time|booking now)/i;
-function buildNudge(hint){
-  return [
-    { role:"system", content: "You just said a status line. Now immediately invoke the required tool." },
-    hint ? { role:"system", content: hint } : null
-  ].filter(Boolean);
-}
+  try {
+    let messages = baseMessages.slice();
+    for (let hops=0; hops<8; hops++){
+      const choice = await openaiChat(messages);
+      const msg = choice?.message || {};
+      const calls = msg.tool_calls || [];
 
-async function llmTurn(ws, userOrSyntheticText, { nudgeHint } = {}) {
-  const base = [
-    ...systemMessages(ws.__tenantPrompt),
-    ...ws.__mem.slice(-12),
-    { role:"user", content: userOrSyntheticText }
-  ];
-  let reply = await runTools(ws, base);
-
-  if (reply) {
-    await speakULaw(ws, reply);
-    ws.__mem.push({ role:"user", content:userOrSyntheticText }, { role:"assistant", content:reply });
-
-    // If model said “checking…” or “booking now” without tool calls, nudge it.
-    if (FOLLOWUP_PAT.test(reply)) {
-      const nudged = await runTools(ws, [
-        ...systemMessages(ws.__tenantPrompt),
-        ...ws.__mem.slice(-12),
-        ...buildNudge(nudgeHint || "Proceed using pinned startISO/endISO from the last availability check.")
-      ]);
-      if (nudged) {
-        await speakULaw(ws, nudged);
-        ws.__mem.push({ role:"assistant", content:nudged });
+      if (!calls.length) {
+        return msg.content?.trim() || "";
       }
+
+      for (const tc of calls) {
+        const name = tc.function.name;
+        let args = {};
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+
+        // Deduplicate same booking window within 60s
+        if (name === "book_appointment") {
+          const k = `${args.startISO||""}|${args.endISO||""}`;
+          const now = Date.now();
+          ws.__bookKeys = ws.__bookKeys || new Map();
+          const last = ws.__bookKeys.get(k) || 0;
+          if (now - last < 60000) {
+            // Skip duplicate booking attempt
+            messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:false, error:"DUPLICATE_BOOKING_SUPPRESSED" }) }];
+            continue;
+          }
+          ws.__bookKeys.set(k, now);
+        }
+
+        const impl = Tools[name];
+        let result = {};
+        try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
+        catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
+        messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
+      }
+    }
+    return "";
+  } finally {
+    ws.__llmBusy = false;
+    // If a latest message was queued while busy, process it once.
+    if (ws.__queued) {
+      const q = ws.__queued; ws.__queued = null;
+      // fire and forget; do not block current turn
+      runTools(ws, q).then(async (reply) => { if (reply) await speakULaw(ws, reply); });
     }
   }
 }
@@ -476,6 +478,9 @@ wss.on("connection", (ws) => {
   ws.__streamSid = "";
   ws.__callSid = "";
   ws.__from = "";
+  ws.__llmBusy = false;
+  ws.__queued = null;
+  ws.__bookKeys = new Map();
 
   const flushULaw = () => {
     if (!pendingULaw.length || !dg || dg.readyState !== WebSocket.OPEN) return;
@@ -494,14 +499,33 @@ wss.on("connection", (ws) => {
       ws.__callSid = cp.CallSid || cp.callSid || "";
       CALLS.set(ws.__callSid, ws);
 
+      // Fetch prompt once
       ws.__tenantPrompt = await fetchTenantPrompt();
 
-      // Proactive greeting
-      await llmTurn(ws, "<CALL_START>");
+      // Proactive AI greeting
+      const boot = [
+        ...systemMessages(ws.__tenantPrompt),
+        ...ws.__mem.slice(-12),
+        { role:"user", content:"<CALL_START>" }
+      ];
+      const hello = await runTools(ws, boot);
+      if (hello) {
+        await speakULaw(ws, hello);
+        ws.__mem.push({ role:"user", content:"<CALL_START>" }, { role:"assistant", content:hello });
+      }
 
-      // Start Deepgram
+      // Start Deepgram once
       dg = newDeepgram(async (text) => {
-        await llmTurn(ws, text);
+        const base = [
+          ...systemMessages(ws.__tenantPrompt),
+          ...ws.__mem.slice(-12),
+          { role:"user", content: text }
+        ];
+        const reply = await runTools(ws, base);
+        if (reply) {
+          await speakULaw(ws, reply);
+          ws.__mem.push({ role:"user", content:text }, { role:"assistant", content:reply });
+        }
       });
 
       return;
