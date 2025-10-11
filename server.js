@@ -50,7 +50,7 @@ requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
-// Calendar URLs can be optional per deployment, but warn:
+// Calendar URLs optional per deployment. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
@@ -159,7 +159,7 @@ if (!wss) {
 const CALLS = new Map();
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-/* ===== Deepgram (single connection, no “smart” reconnect) ===== */
+/* ===== Deepgram (single connection) ===== */
 function newDeepgram(onFinal) {
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=900";
   const dg = new WebSocket(url, {
@@ -288,7 +288,7 @@ const Tools = {
       source: DASH_SOURCE,
       Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
       Timezone: BIZ_TZ,
-      Start_Time_Local: "", // model owns messaging; backend can derive if needed
+      Start_Time_Local: "",
       End_Time_Local:   "",
       Start_Time_UTC:   startISO,
       End_Time_UTC:     endISO,
@@ -311,14 +311,13 @@ const Tools = {
       }, { timeout:12000, tag:"CAL_DELETE" });
       const ok = (status>=200&&status<300) || data?.ok === true || data?.deleted === true || data?.cancelled === true;
       return { ok, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body: e.response?.data }; }
+    } catch(e){ return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data }; }
   },
 
   async find_customer_events({ name, phone, days=30 }) {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
     const base = todayISOInTZ(BIZ_TZ);
     const w = dayWindowLocal(base, BIZ_TZ);
-    // Let backend interpret days if it supports it; otherwise model can iterate.
     const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ, window:w, contact_name:name, contact_phone:phone, days };
     try {
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000, tag:"CAL_READ_FIND" });
@@ -364,7 +363,7 @@ const Tools = {
   }
 };
 
-/* ===== System prompt builder (all policy lives here) ===== */
+/* ===== Prompt sourcing (RENDER_PROMPT preferred) ===== */
 const FALLBACK_PROMPT = `
 [Prompt-Version: 2025-10-10]
 
@@ -373,19 +372,23 @@ Timezone: ${BIZ_TZ}. Be concise and human-like. Ask one question at a time.
 
 Rules:
 - All scheduling logic is yours. Use tools exactly as needed.
-- When you check a time, you must pin that exact start/end in your next booking call.
-- Do not assume hours yourself; if needed, ask or call tools to check availability.
-- Don’t hang up unless the caller clearly ends or you choose to end; then call end_call.
-- Always include name, phone, service, and notes when booking if available.
+- When you check a time, pin that exact start/end in your booking call.
+- Don’t hang up unless you choose to end or caller ends; then call end_call.
+- Include name, phone, service, and notes when booking if available.
 - Keep confirmations short and natural.
 `;
 
+const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
+
 async function fetchTenantPrompt() {
-  if (!URLS.PROMPT_FETCH) return FALLBACK_PROMPT;
-  try {
-    const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
-    return data?.prompt || FALLBACK_PROMPT;
-  } catch { return FALLBACK_PROMPT; }
+  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
+  if (URLS.PROMPT_FETCH) {
+    try {
+      const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
+      if (data?.prompt) return data.prompt;
+    } catch {}
+  }
+  return FALLBACK_PROMPT;
 }
 
 function systemMessages(tenantPrompt) {
@@ -451,6 +454,18 @@ wss.on("connection", (ws) => {
 
       // Fetch prompt once
       ws.__tenantPrompt = await fetchTenantPrompt();
+
+      // Proactive AI greeting before the caller speaks
+      const boot = [
+        ...systemMessages(ws.__tenantPrompt),
+        ...ws.__mem.slice(-12),
+        { role:"user", content:"<CALL_START>" }
+      ];
+      const hello = await runTools(ws, boot);
+      if (hello) {
+        await speakULaw(ws, hello);
+        ws.__mem.push({ role:"user", content:"<CALL_START>" }, { role:"assistant", content:hello });
+      }
 
       // Start Deepgram once
       dg = newDeepgram(async (text) => {
