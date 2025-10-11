@@ -7,6 +7,7 @@
    - Single-booking guarantee + exact-hour verification
    - Extra: robust timezone handling (DST-safe), weekday resolution in TZ, defensive logging
    - NEW: ZIP/address readback cleanup (no stray commas); strip “Ending the call now.”
+   - NEW: Atomic reschedule tool; tool loop guard; status talkback during multi-hop tool chains
 */
 
 import express from "express";
@@ -119,7 +120,7 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag, trac
 
 /* ===== Brain prompt (single source of truth) ===== */
 const RENDER_PROMPT = process.env.RENDER_PROMPT || `
-[Prompt-Version: 2025-10-10T22:05Z]
+[Prompt-Version: 2025-10-10T22:05Z + reschedule-fix]
 
 You are an AI phone receptionist for **The Victory Team (VictoryTeamSells.com)** — Maryland real estate.
 
@@ -141,14 +142,13 @@ Data to collect before booking:
 Scheduling policy:
 - Always use tools to read availability and book/cancel/reschedule.
 - Resolve relative dates in America/New_York (today/tomorrow/next Mon etc.).
-- When checking a specific time, do a targeted read for that exact hour.
+- When checking a specific time, do a targeted read for that exact hour only.
 - If the slot is open, confirm once, then book. If taken, offer 2–3 nearby options.
 - If a slot shows “canceled,” you may offer it.
 
-**Slot pinning (important to avoid off-by-day errors):**
+Slot pinning (avoid off-by-day):
 - After you confirm a slot is open using \`read_availability\` for an exact window,
-  **book using the exact \`start_utc\`/\`end_utc\` of that same window.**
-- Do not recompute “next Monday” again during booking; reuse the verified window.
+  **book using the exact \`start_utc\`/\`end_utc\` of that same window** (don’t recompute “next Monday”).
 
 Cancel/Reschedule identity (name + phone only):
 - Use caller ID if they say “this number”.
@@ -156,13 +156,25 @@ Cancel/Reschedule identity (name + phone only):
   1) READ with contact_phone (and time if provided).
   2) If exactly one future match, capture its event_id.
   3) Cancel: cancel by event_id.
-  4) Reschedule: cancel by event_id, then propose 2–3 nearby times and book chosen one.
+  4) **Reschedule (atomic):** when the caller gives a new time, call **\`reschedule_appointment\`** with the identified event_id and the new exact \`startISO\`/\`endISO\`. Do **not** loop multiple reads first.
   5) If none or multiple: ask only the missing disambiguator.
 
 Reschedule integrity:
 - Preserve service, meeting type, location, property/MLS, and notes unless changed by caller.
 - When booking, include: service, notes (meeting type, location, property/MLS, special requests),
   name, phone, and the confirmed start/end times.
+
+Ambiguous times:
+- If the caller says “1:00” with no AM/PM **and** you’re moving a same-day morning slot, assume **1 PM** once and confirm.
+- Otherwise ask a single clarifier: “Do you mean 1 AM or 1 PM?”
+
+Loop guard:
+- If you’ve called \`read_availability\` twice in a row for the same hour, stop and either:
+  - Ask the one-shot clarifier above, or
+  - If you already know the intent, proceed with \`reschedule_appointment\`.
+
+Never go silent:
+- If tools take several steps, say a quick status line like “One sec—checking that time.”
 
 Availability interpretation:
 - \`{events:[]}\` or \`{summary:{free:true}}\` ⇒ available. Otherwise unavailable.
@@ -976,6 +988,69 @@ const Tools = {
       console.warn("[end_call] hangup error", e.message);
     }
     return {};
+  },
+
+  /* NEW: Atomic cancel→book in one call */
+  async reschedule_appointment({ event_id, name, phone, newStartISO, newEndISO, notes }) {
+    console.log("[TOOL] reschedule_appointment", { event_id_present: !!event_id, hasName: !!name, hasPhone: !!phone, newStartISO, newEndISO });
+    if (!URLS.CAL_READ || !URLS.CAL_DELETE || !URLS.CAL_CREATE) return { ok:false, error:"missing_endpoints" };
+    const normalizedPhone = toE164US((phone && phone.trim()) || CURRENT_FROM || "");
+    try {
+      // 1) Identify the target event if no id
+      let id = event_id, prior = null;
+      if (!id) {
+        const baseDate = todayISOInTZ(BIZ_TZ);
+        const w = rangeWindowLocal(baseDate, 60, BIZ_TZ);
+        const { data } = await httpPost(URLS.CAL_READ, {
+          intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
+          window: { start_local:w.start_local, end_local:w.end_local, start_utc:w.start_utc, end_utc:w.end_utc },
+          contact_phone: normalizedPhone || undefined
+        }, { timeout:12000, tag:"CAL_READ_FIND", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+        const live = (data?.events||[]).filter(e => e.status !== "canceled");
+        const target10 = last10(normalizedPhone);
+        const phoneMatches = target10 ? live.filter(e => matchesPhoneLast10(e, target10)) : [];
+        const nameMatches  = name ? live.filter(e => softNameMatch(e.customer_name||e.customer||e.event_name||"", name)) : [];
+        const picks = phoneMatches.length ? phoneMatches : (nameMatches.length ? nameMatches : live);
+        if (picks.length !== 1) return { ok:false, error:"ambiguous_or_missing_event", candidates: picks.map(e => ({ event_id:e.event_id, start_local:e.start_local, event_name:e.event_name })) };
+        prior = picks[0]; id = prior.event_id;
+      } else {
+        // best-effort fetch prior for carry-over
+        try {
+          const nowISO = todayISOInTZ(BIZ_TZ);
+          const w = rangeWindowLocal(nowISO, 60, BIZ_TZ);
+          const { data } = await httpPost(URLS.CAL_READ, {
+            intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
+            window: { start_local:w.start_local, end_local:w.end_local, start_utc:w.start_utc, end_utc:w.end_utc }
+          }, { timeout:12000, tag:"CAL_READ_VERIFY", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+          prior = (data?.events||[]).find(e => e.event_id === id) || null;
+        } catch {}
+      }
+
+      // 2) Verify the new hour is free (exact window)
+      const probe = await Tools.read_availability({ startISO: newStartISO, endISO: newEndISO });
+      if (probe?.summary?.busy) return { ok:false, error:"time_unavailable" };
+
+      // 3) Cancel the original
+      const cancelled = await Tools.cancel_appointment({ event_id:id, name, phone });
+      if (!cancelled?.ok) return { ok:false, error:"cancel_failed" };
+
+      // 4) Book the new one, preserving details
+      const carryService = (prior?.event_name || "").split(" (")[0] || "Appointment";
+      const carryNotes = notes || prior?.notes || prior?.Notes || "";
+      const n = await Tools.book_appointment({
+        name: name || prior?.customer_name || "",
+        phone: normalizedPhone,
+        service: carryService,
+        startISO: newStartISO,
+        endISO: newEndISO,
+        notes: carryNotes
+      });
+      if (!n?.ok) return { ok:false, error:"rebook_failed" };
+      return { ok:true, data:{ from_event_id:id, to:n.data } };
+    } catch (e) {
+      console.warn("[RESCHEDULE] error", e.message);
+      return { ok:false, error:"reschedule_failed" };
+    }
   }
 };
 
@@ -1040,6 +1115,18 @@ const toolSchema = [
       name:"end_call",
       description:"Politely end the call after your goodbye",
       parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] }
+  }},
+  { type:"function", function:{
+      name:"reschedule_appointment",
+      description:"Atomically reschedule an existing appointment by canceling it and booking a new exact-hour slot.",
+      parameters:{ type:"object", properties:{
+        event_id:{type:"string"},
+        name:{type:"string"},
+        phone:{type:"string"},
+        newStartISO:{type:"string"},
+        newEndISO:{type:"string"},
+        notes:{type:"string"}
+      }, required:["newStartISO","newEndISO"] }
   }}
 ];
 
@@ -1287,6 +1374,7 @@ if (!wss.__victory_handler_attached) {
 
     async function resolveToolChain(baseMessages) {
       let messages = baseMessages.slice();
+      let sameToolCount = 0, lastToolName = "";
       for (let hops = 0; hops < 8; hops++) {
         const choice = await openaiChat(messages);
         const msg = choice?.message || {};
@@ -1311,6 +1399,19 @@ if (!wss.__victory_handler_attached) {
           catch(e){ console.error("[TOOL] error", name, e.message); toolResult = {}; }
 
           messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
+
+          // Loop guard: if we keep hitting the same tool (e.g., read_availability), break and clarify
+          if (name === lastToolName) sameToolCount++; else sameToolCount = 1;
+          lastToolName = name;
+          if (sameToolCount >= 2 && name === "read_availability") {
+            const shortQ = "Do you mean 1 PM for that day, or a different time?";
+            await say(ws, shortQ);
+            remember(ws.__mem, "bot", shortQ);
+            return ""; // stop tool loop; wait for caller
+          }
+
+          // Guaranteed talkback: after 3 tool hops, give a quick status so we never go silent
+          if (hops === 2) { try { await say(ws, "One sec—checking that time for you."); remember(ws.__mem, "bot", "One sec—checking that time for you."); } catch {} }
 
           if (name === "end_call") {
             ws.__saidFarewell = true;
@@ -1456,4 +1557,5 @@ if (!wss.__victory_handler_attached) {
 - Blocks premature hangups if the last bot message was a question.
 - Strips any “Ending the call now” stage direction before TTS.
 - Greets on WS “start” (AI-driven, not hardcoded dialogs).
+- Atomic reschedule tool prevents cancel-without-rebook; loop guard + status talkback avoid silent tool loops.
 */
