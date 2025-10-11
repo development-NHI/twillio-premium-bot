@@ -50,6 +50,7 @@ requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
+// Calendar URLs optional per deployment. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
@@ -390,7 +391,7 @@ Rules:
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
 
 async function fetchTenantPrompt() {
-  if (RENDER_PROMPT) return RENDER_PROMPT;
+  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
   if (URLS.PROMPT_FETCH) {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
@@ -408,7 +409,14 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
-/* ===== Generic tool runner ===== */
+/* ===== Generic tool runner (with status lines + watchdog) ===== */
+const STATUS_LINES = {
+  read_availability: "One sec—checking that time.",
+  book_appointment:  "Got it—booking now.",
+  cancel_appointment:"One moment—canceling that.",
+  find_customer_events:"One sec—looking that up."
+};
+
 async function runTools(ws, baseMessages) {
   let messages = baseMessages.slice();
   for (let hops=0; hops<8; hops++){
@@ -420,11 +428,28 @@ async function runTools(ws, baseMessages) {
       const name = tc.function.name;
       let args = {};
       try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+
+      // Immediate UX status line (no business logic)
+      if (STATUS_LINES[name]) {
+        try { await speakULaw(ws, STATUS_LINES[name]); } catch {}
+      }
+
+      // 3s watchdog to avoid silence on slow HTTP
+      let saidStillChecking = false;
+      const watchdog = setTimeout(async () => {
+        if (!saidStillChecking) {
+          saidStillChecking = true;
+          try { await speakULaw(ws, "Still checking."); } catch {}
+        }
+      }, 3000);
+
       if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
       const impl = Tools[name];
       let result = {};
       try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
       catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
+      clearTimeout(watchdog);
+
       messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
     }
   }
