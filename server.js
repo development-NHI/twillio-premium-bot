@@ -408,21 +408,20 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
-/* ===== Force a spoken reply after tools ===== */
+/* ===== Force a spoken reply after tools (only when no tools are used) ===== */
 async function forceNaturalReply(messages) {
   const choice = await openaiChat(messages, { tool_choice:"none" });
   const msg = choice?.message || {};
   return (msg.content || "").trim();
 }
 
-/* ===== Generic tool runner with mutex, dedupe, and reply guarantee ===== */
+/* ===== Generic tool runner with mutex and no premature return ===== */
 async function runTools(ws, baseMessages) {
   if (ws.__llmBusy) { ws.__queued = baseMessages; return ""; }
   ws.__llmBusy = true;
 
   try {
     let messages = baseMessages.slice();
-    let lastToolError = null;
 
     for (let hops=0; hops<8; hops++){
       const choice = await openaiChat(messages);
@@ -433,11 +432,13 @@ async function runTools(ws, baseMessages) {
         const out = msg.content?.trim() || "";
         if (out) return out;
 
+        // Last resort only when model gave no tools and no content
         const forced = await forceNaturalReply(messages);
         if (forced) return forced;
         return "";
       }
 
+      // Execute announced tool calls and continue loop so model can follow up
       for (const tc of calls) {
         const name = tc.function.name;
         let args = {};
@@ -462,23 +463,13 @@ async function runTools(ws, baseMessages) {
         try { result = await (impl ? impl(args) : { ok:false, error:"TOOL_NOT_FOUND" }); }
         catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
 
-        if (result?.ok === false) lastToolError = result?.error || "TOOL_ERR";
-
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
       }
 
-      // After executing tool calls in this hop, force a prompt-driven natural reply.
-      if (lastToolError) {
-        const guidance = { role:"system", content: "Your last tool call failed. Briefly tell the caller the calendar didn’t respond and ask if they want you to retry or take a message. Keep it natural, one sentence." };
-        const forcedErr = await forceNaturalReply([...messages, guidance]);
-        if (forcedErr) return forcedErr;
-      } else {
-        const forced = await forceNaturalReply(messages);
-        if (forced) return forced;
-      }
+      // Loop continues; the next hop lets the model say “Booked” or issue another tool call
     }
 
-    // If model loops, ask it—prompt-driven—to clarify next step.
+    // Hop limit reached. Ask the model to clarify next step.
     const guidance = { role:"system", content: "You seem stuck. Ask one concise clarifying question to move forward." };
     return await forceNaturalReply([...baseMessages, guidance]);
   } finally {
@@ -514,7 +505,7 @@ async function postSummary(ws, reason = "normal") {
     biz: DASH_BIZ,
     source: DASH_SOURCE,
     ...trace,
-    summary: ws.__summary || "",        // optional rolling summary if you add one later
+    summary: ws.__summary || "",
     transcript: transcriptFromMem(ws.__mem || []),
     ended_reason: reason || ""
   };
@@ -535,7 +526,7 @@ wss.on("connection", (ws) => {
   ws.__streamSid = "";
   ws.__callSid = "";
   ws.__from = "";
-  ws.__convoId = "";         // added for summary schema
+  ws.__convoId = "";
   ws.__llmBusy = false;
   ws.__queued = null;
   ws.__bookKeys = new Map();
@@ -574,7 +565,7 @@ wss.on("connection", (ws) => {
       }
 
       // Start Deepgram once
-      dg = newDeepgram(async (text) => {
+      const dgSock = newDeepgram(async (text) => {
         const base = [
           ...systemMessages(ws.__tenantPrompt),
           ...ws.__mem.slice(-12),
@@ -586,6 +577,7 @@ wss.on("connection", (ws) => {
           ws.__mem.push({ role:"user", content:text }, { role:"assistant", content:reply });
         }
       });
+      dg = dgSock;
 
       return;
     }
