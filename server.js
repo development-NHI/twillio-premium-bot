@@ -43,14 +43,14 @@ const URLS = {
 };
 
 function requireEnv(name, val) {
-  if (!val) { console.error([ENV] Missing ${name}); process.exit(1); }
+  if (!val) { console.error(`[ENV] Missing ${name}`); process.exit(1); }
 }
 requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
 // Calendar URLs optional. Warn if missing:
-["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn([WARN] ${k} not set); });
+["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
 const DEBUG_HTTP = (process.env.DEBUG_HTTP ?? "true") === "true";
@@ -58,7 +58,7 @@ function rid(){ return Math.random().toString(36).slice(2,8); }
 function preview(obj, max=320){ try { const s = typeof obj==="string"?obj:JSON.stringify(obj); return s.length>max? s.slice(0,max)+"…" : s; } catch { return ""; } }
 async function httpPost(url, data, { headers={}, timeout=12000, auth, tag } = {}) {
   const id = rid(), t = Date.now();
-  if (DEBUG_HTTP) console.log(JSON.stringify({ evt:"HTTP_REQ", id, tag, method:"POST", url, timeout, payload_len: Buffer.byteLength(preview(data, 1<<20),"utf8") }));
+  if (DEBUG_HTTP) console.log(JSON.stringify({ evt:"HTTP_REQ", id, tag, method:"POST", url, timeout, payload_len: Buffer.byteLength(typeof data==="string"?data:JSON.stringify(data||{}),"utf8") }));
   try {
     const resp = await axios.post(url, data, { headers, timeout, auth, responseType: headers.acceptStream ? "stream" : undefined });
     if (DEBUG_HTTP) console.log(JSON.stringify({ evt:"HTTP_RES", id, tag, method:"POST", url, status:resp.status, ms:Date.now()-t, resp_preview: headers.acceptStream ? "[stream]" : preview(resp.data) }));
@@ -89,12 +89,12 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag } = {
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value,a),{});
-  return ${p.year}-${p.month}-${p.day};
+  return `${p.year}-${p.month}-${p.day}`;
 }
 function dayWindowLocal(dateISO, tz) {
-  const start_utc = new Date(${dateISO}T00:00:00).toISOString();
-  const end_utc   = new Date(${dateISO}T23:59:00).toISOString();
-  return { start_local: ${dateISO} 00:00, end_local: ${dateISO} 23:59, start_utc, end_utc, timezone: tz };
+  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
+  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
+  return { start_local: `${dateISO} 00:00`, end_local: `${dateISO} 23:59`, start_utc, end_utc, timezone: tz };
 }
 function isoToLocalYYYYMMDDHHmm(iso, tz) {
   const d = new Date(iso);
@@ -103,7 +103,7 @@ function isoToLocalYYYYMMDDHHmm(iso, tz) {
     hour:"2-digit", minute:"2-digit", hour12:false
   });
   const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
-  return ${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute};
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 /* ===== App / TwiML ===== */
@@ -120,9 +120,9 @@ app.post("/twiml", (req,res) => {
   const from = req.body?.From || "";
   const callSid = req.body?.CallSid || "";
   res.set("Content-Type","text/xml");
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
-  const optSay = PRE_CONNECT_GREETING ? <Say>${escapeXml(PRE_CONNECT_GREETING)}</Say> : "";
-  const statusCb = process.env.STATUS_CALLBACK_URL ? <StatusCallback url="${process.env.STATUS_CALLBACK_URL}" /> : "";
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+  const optSay = PRE_CONNECT_GREETING ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>` : "";
+  const statusCb = process.env.STATUS_CALLBACK_URL ? `<StatusCallback url="${process.env.STATUS_CALLBACK_URL}" />` : "";
   res.send(`
     <Response>
       ${optSay}
@@ -150,7 +150,7 @@ app.post("/handoff", (_req,res) => {
 });
 
 const server = app.listen(PORT, () => {
-  console.log([INIT] listening on ${PORT});
+  console.log(`[INIT] listening on ${PORT}`);
   console.log("[INIT] URLS", URLS);
   console.log("[INIT] TENANT", { DASH_BIZ, DASH_SOURCE, BIZ_TZ });
 });
@@ -169,7 +169,7 @@ const CALLS = new Map();
 function newDeepgram(onFinal) {
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=900";
   const dg = new WebSocket(url, {
-    headers: { Authorization: Token ${DEEPGRAM_API_KEY} }, // Deepgram expects "Token"
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // Deepgram expects "Token"
     perMessageDeflate: false
   });
   dg.on("open", ()=> console.log(JSON.stringify({ evt:"DG_OPEN" })));
@@ -193,9 +193,8 @@ function newDeepgram(onFinal) {
 /* ===== ElevenLabs TTS (μ-law passthrough) ===== */
 function cleanTTS(s=""){
   return String(s)
-    .replace(/\\(.?)\\*/g,"$1")
-    .replace(/{1,3}[^]*`{1,3}/g,"")
-    .replace(/\[(.?)\]\((.?)\)/g,"$1")
+    .replace(/\\`(.|\\n)*?\\`/g,"")          // strip code fences
+    .replace(/\[(.*?)\]\((.*?)\)/g,"$1")     // strip markdown links
     .replace(/\s{2,}/g," ")
     .trim();
 }
@@ -207,7 +206,7 @@ async function speakULaw(ws, text){
   const clean = cleanTTS(text);
   try{
     console.log(JSON.stringify({ evt:"TTS_START", chars: clean.length, preview: clean.slice(0,80) }));
-    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: clean }, { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true }, timeout:20000, tag:"TTS_STREAM" });
     let bytes = 0;
     resp.data.on("data", chunk => {
@@ -278,7 +277,7 @@ const toolSchema = [
 ];
 
 async function openaiChat(messages, options={}){
-  const headers = { Authorization:Bearer ${OPENAI_API_KEY} };
+  const headers = { Authorization: `Bearer ${OPENAI_API_KEY}` };
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", response_format:{ type:"text" }, ...options };
   const id = rid(); const t = Date.now();
   console.log(JSON.stringify({ evt:"LLM_REQ", id, msg_count: messages.length }));
@@ -332,7 +331,7 @@ const Tools = {
     const payload = {
       biz: DASH_BIZ,
       source: DASH_SOURCE,
-      Event_Name: ${service||"Appointment"} (${name||"Guest"}),
+      Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
       Timezone: BIZ_TZ,
       Start_Time_Local: startLocal,
       End_Time_Local:   endLocal,
@@ -415,13 +414,13 @@ const Tools = {
   async transfer({ reason, callSid }) {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) return { ok:false, error:"TRANSFER_CONFIG_MISSING" };
     try {
-      const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
-      const handoffUrl = https://${host}/handoff;
-      const url = https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json;
+      const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+      const handoffUrl = `https://${host}/handoff`;
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
       const t0 = Date.now();
       await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, timeout:10000, tag:"TWILIO_REDIRECT", headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
-      console.log(JSON.stringify({ evt:"TRANSFER_OK", ms: Date.now()-t0 }));
+      console.log(JSON.stringify({ evt:"TRANSFER_OK", ms: Date.now()-t0, reason: reason||"" }));
       return { ok:true };
     } catch(e){
       console.log(JSON.stringify({ evt:"TRANSFER_FAIL", message:e.message }));
@@ -432,7 +431,7 @@ const Tools = {
   async end_call({ callSid, reason }) {
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { ok:false, error:"HANGUP_CONFIG_MISSING" };
     try {
-      const url = https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json;
+      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
       const params = new URLSearchParams({ Status:"completed" });
       const t0 = Date.now();
       await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, timeout:8000, tag:"TWILIO_HANGUP", headers:{ "Content-Type":"application/x-www-form-urlencoded" } });
@@ -478,7 +477,7 @@ async function fetchTenantPrompt() {
 function systemMessages(tenantPrompt) {
   const today = todayISOInTZ(BIZ_TZ);
   return [
-    { role:"system", content: Today is ${today}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone. },
+    { role:"system", content: `Today is ${today}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
     { role:"system", content: tenantPrompt || FALLBACK_PROMPT }
   ];
 }
@@ -494,7 +493,7 @@ async function forceNaturalReply(messages) {
 async function speakStatus(ws, messages, hint) {
   const guidance = {
     role: "system",
-    content: Say one short status line about "${hint}". Keep it under 8 words.
+    content: `Say one short status line about "${hint}". Keep it under 8 words.`
   };
   const line = await forceNaturalReply([...messages, guidance]);
   if (line) {
@@ -505,7 +504,7 @@ async function speakStatus(ws, messages, hint) {
 
 /* ===== Generic tool runner with mutex and pinned-window echo ===== */
 async function runTools(ws, baseMessages) {
-  if (ws._llmBusy) { ws._queued = baseMessages; console.log(JSON.stringify({ evt:"RUNTOOLS_QUEUE" })); return ""; }
+  if (ws.__llmBusy) { ws.__queued = baseMessages; console.log(JSON.stringify({ evt:"RUNTOOLS_QUEUE" })); return ""; }
   ws.__llmBusy = true;
 
   try {
@@ -572,9 +571,9 @@ async function runTools(ws, baseMessages) {
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
         if (name === "book_appointment") {
-          const k = ${args.startISO||""}|${args.endISO||""};
+          const k = `${args.startISO||""}|${args.endISO||""}`;
           const now = Date.now();
-          ws._bookKeys = ws._bookKeys || new Map();
+          ws.__bookKeys = ws.__bookKeys || new Map();
           const last = ws.__bookKeys.get(k) || 0;
           if (now - last < 60000) {
             console.log(JSON.stringify({ evt:"BOOK_DEDUP_SUPPRESS", key:k }));
@@ -603,7 +602,7 @@ async function runTools(ws, baseMessages) {
             if (r?.ok === true && pinStart && pinEnd) {
               messages.push({
                 role:"system",
-                content:You just verified availability for start=${pinStart} end=${pinEnd}. If you intend to book, call book_appointment using the same startISO and endISO exactly.
+                content:`You just verified availability for start=${pinStart} end=${pinEnd}. If you intend to book, call book_appointment using the same startISO and endISO exactly.`
               });
               console.log(JSON.stringify({ evt:"PINNED_WINDOW", start: pinStart, end: pinEnd }));
             }
@@ -621,7 +620,7 @@ async function runTools(ws, baseMessages) {
   } finally {
     ws.__llmBusy = false;
     if (ws.__queued) {
-      const q = ws._queued; ws._queued = null;
+      const q = ws.__queued; ws.__queued = null;
       console.log(JSON.stringify({ evt:"RUNTOOLS_DEQUEUE" }));
       runTools(ws, q).then(async (reply) => { if (reply) await speakULaw(ws, reply); });
     }
@@ -631,8 +630,8 @@ async function runTools(ws, baseMessages) {
 /* ===== Call summary ===== */
 function transcriptFromMem(mem){
   return mem.map(m => {
-    if (m.role === "user") return Caller: ${m.content};
-    if (m.role === "assistant") return AI: ${m.content};
+    if (m.role === "user") return `Caller: ${m.content}`;
+    if (m.role === "assistant") return `AI: ${m.content}`;
     return "";
   }).filter(Boolean).join("\n");
 }
@@ -692,13 +691,13 @@ wss.on("connection", (ws) => {
     let msg; try { msg = JSON.parse(raw.toString()); } catch { console.log(JSON.stringify({ evt:"WS_PARSE_ERR" })); return; }
 
     if (msg.event === "start") {
-      ws.__streamSid = msg.start.streamSid;
+      ws.__streamSid = msg.start?.streamSid || "";
       const cp = msg.start?.customParameters || {};
       ws.__from    = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
       ws.__convoId = rid();
       CALLS.set(ws.__callSid, ws);
-      console.log(JSON.stringify({ evt:"CALL_START", streamSid: ws._streamSid, callSid: ws.callSid, from: ws._from }));
+      console.log(JSON.stringify({ evt:"CALL_START", streamSid: ws.__streamSid, callSid: ws.__callSid, from: ws.__from }));
 
       ws.__tenantPrompt = await fetchTenantPrompt();
 
@@ -715,7 +714,7 @@ wss.on("connection", (ws) => {
       }
 
       // Start Deepgram once
-      const dgSock = newDeepgram(async (text) => {
+      dg = newDeepgram(async (text) => {
         const base = [
           ...systemMessages(ws.__tenantPrompt),
           ...ws.__mem.slice(-12),
@@ -727,7 +726,6 @@ wss.on("connection", (ws) => {
           ws.__mem.push({ role:"user", content:text }, { role:"assistant", content:reply });
         }
       });
-      dg = dgSock;
 
       return;
     }
@@ -762,5 +760,5 @@ wss.on("connection", (ws) => {
   ws.on("error", async (err)=> {
     console.log(JSON.stringify({ evt:"WS_ERROR", message: err?.message || String(err) }));
     await postSummary(ws, "ws_error");
-  });
+  });
 });
