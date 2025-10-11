@@ -35,7 +35,7 @@ const URLS = {
   CAL_CREATE:   process.env.REPLIT_CREATE_URL   || process.env.DASH_CAL_CREATE_URL   || "",
   CAL_DELETE:   process.env.REPLIT_DELETE_URL   || process.env.DASH_CAL_CANCEL_URL   || "",
   LEAD_UPSERT:  process.env.REPLIT_LEAD_URL     || process.env.DASH_LEAD_UPSERT_URL  || "",
-  FAQ_LOG:      process.env.REPLIT_FAQ_URL      || process.env.DASH_CALL_LOG_URL     || "",
+  FAQ_LOG:      process.env.REPLIT_FAQ_URL      || process.env.DASH_FAQ_URL          || "",
   CALL_LOG:     process.env.DASH_CALL_LOG_URL   || "",
   CALL_SUMMARY: process.env.DASH_CALL_SUMMARY_URL || "",
   PROMPT_FETCH: process.env.PROMPT_FETCH_URL    || ""
@@ -51,8 +51,11 @@ requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
 // Calendar URLs optional. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
+/* ===== Logging knobs ===== */
+const DEBUG_HTTP  = (process.env.DEBUG_HTTP  ?? "true")  === "true";
+const DEBUG_MEDIA = (process.env.DEBUG_MEDIA ?? "false") === "true";
+
 /* ===== HTTP helpers ===== */
-const DEBUG_HTTP = (process.env.DEBUG_HTTP ?? "true") === "true";
 function rid(){ return Math.random().toString(36).slice(2,8); }
 function preview(obj, max=320){ try { const s = typeof obj==="string"?obj:JSON.stringify(obj); return s.length>max? s.slice(0,max)+"…" : s; } catch { return ""; } }
 async function httpPost(url, data, { headers={}, timeout=12000, auth, tag } = {}) {
@@ -90,10 +93,27 @@ function todayISOInTZ(tz){
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value,a),{});
   return `${p.year}-${p.month}-${p.day}`;
 }
+function localEndOffsetISO(dateISO, h, m, tz) {
+  // Build a local wall time then attach the correct offset for TZ
+  const d = new Date(`${dateISO}T00:00:00Z`);
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, hour12:false, year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", second:"2-digit"
+  });
+  const parts = fmt.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value,a),{});
+  const local = `${parts.year}-${parts.month}-${parts.day}T${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:00`;
+  const tzName = new Date(`${local}`).toLocaleTimeString('en-US',{ timeZone: tz, timeZoneName:'shortOffset' });
+  const off = tzName.match(/[+-]\d{2}:\d{2}/)?.[0] || "Z";
+  return `${local}${off}`;
+}
 function dayWindowLocal(dateISO, tz) {
-  const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
-  const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
-  return { start_local: `${dateISO} 00:00`, end_local: `${dateISO} 23:59`, start_utc, end_utc, timezone: tz };
+  return {
+    start_local: `${dateISO} 00:00`,
+    end_local:   `${dateISO} 23:59`,
+    start_utc:   localEndOffsetISO(dateISO, 0,   0, tz),
+    end_utc:     localEndOffsetISO(dateISO, 23, 59, tz),
+    timezone:    tz
+  };
 }
 function isoToLocalYYYYMMDDHHmm(iso, tz) {
   const d = new Date(iso);
@@ -121,18 +141,17 @@ app.post("/twiml", (req,res) => {
   res.set("Content-Type","text/xml");
   const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
   const optSay = PRE_CONNECT_GREETING ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>` : "";
-  const statusCb = process.env.STATUS_CALLBACK_URL ? `<StatusCallback url="${process.env.STATUS_CALLBACK_URL}" />` : "";
+  const statusCbAttr = process.env.STATUS_CALLBACK_URL ? ` statusCallback="${process.env.STATUS_CALLBACK_URL}"` : "";
   res.send(`
     <Response>
       ${optSay}
       <Connect>
-        <Stream url="wss://${host}" track="inbound_track">
+        <Stream url="wss://${host}" track="inbound_track"${statusCbAttr}>
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
       </Connect>
-      ${statusCb}
     </Response>
   `.trim());
 });
@@ -180,7 +199,6 @@ function newDeepgram(onFinal) {
       const alt = ev.channel?.alternatives?.[0];
       const text = (alt?.transcript || "").trim();
       if (!text) return;
-      console.log(JSON.stringify({ evt:"DG_TRANSCRIPT", is_final: !!(ev.is_final||ev.speech_final), text_preview: text.slice(0,80) }));
       if (ev.is_final || ev.speech_final) onFinal?.(text);
     }catch(err){
       console.warn(JSON.stringify({ evt:"DG_PARSE_ERR", err: String(err) }));
@@ -191,12 +209,14 @@ function newDeepgram(onFinal) {
 
 /* ===== ElevenLabs TTS (μ-law passthrough) ===== */
 function cleanTTS(s=""){
-  return String(s)
+  const txt = String(s)
     .replace(/\*\*(.*?)\*\*/g,"$1")
     .replace(/`{1,3}[^`]*`{1,3}/g,"")
     .replace(/\[(.*?)\]\((.*?)\)/g,"$1")
     .replace(/\s{2,}/g," ")
     .trim();
+  // redact phone-like sequences so TTS won't read numbers aloud
+  return txt.replace(/\+?\d[\d\-\s().]{7,}/g, "[number saved]");
 }
 async function speakULaw(ws, text){
   if (!text || !ws.__streamSid) {
@@ -519,7 +539,7 @@ async function runTools(ws, baseMessages) {
         const out = msg.content?.trim() || "";
         console.log(JSON.stringify({ evt:"RUNTOOLS_NO_TOOLS", has_text: !!out, text_preview: out.slice(0,80) }));
 
-        // ===== status-no-tool guard: enforce same-turn contract =====
+        // status-no-tool guard: enforce same-turn contract
         if (out && /\b(checking|booking|cancelling|canceling)\b/i.test(out)) {
           console.log(JSON.stringify({ evt:"STATUS_NO_TOOL_GUARD", preview: out.slice(0,64) }));
           messages = [
@@ -528,10 +548,8 @@ async function runTools(ws, baseMessages) {
             { role: "system",
               content: "You just said a status line. Now, in THIS SAME TURN, call the appropriate tool using the exact intended ISO window. Do NOT reply with text only." }
           ];
-          continue; // re-ask model this hop; expect a tool_call
+          continue;
         }
-        // ===== end guard =====
-
         if (out) return out;
 
         const forced = await forceNaturalReply(messages);
@@ -664,6 +682,7 @@ wss.on("connection", (ws) => {
   let pendingULaw = [];
   const BATCH = 6;
   let tailTimer = null;
+  let FLUSH_COUNT = 0;
 
   ws.__mem = [];
   ws.__tenantPrompt = "";
@@ -682,7 +701,14 @@ wss.on("connection", (ws) => {
     if (!pendingULaw.length || !dg || dg.readyState !== WebSocket.OPEN) return;
     const chunk = Buffer.concat(pendingULaw);
     pendingULaw = [];
-    try { dg.send(chunk); console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH", bytes: chunk.length })); } catch(err){ console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH_ERR", message: String(err) })); }
+    try {
+      dg.send(chunk);
+      if (DEBUG_MEDIA && (++FLUSH_COUNT % 50 === 0)) {
+        console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH", bytes: chunk.length, n: FLUSH_COUNT }));
+      }
+    } catch(err){
+      console.log(JSON.stringify({ evt:"DG_AUDIO_FLUSH_ERR", message: String(err) }));
+    }
   };
 
   ws.on("message", async raw => {
