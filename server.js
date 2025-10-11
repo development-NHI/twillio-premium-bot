@@ -22,8 +22,8 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID || "";
+const OWNER_PHONE        = process.env.OWNER_PHONE || "";
 
 const DASH_BIZ    = process.env.DASH_BIZ || "The Victory Team";
 const DASH_SOURCE = process.env.DASH_SOURCE || "voice";
@@ -169,7 +169,7 @@ const CALLS = new Map();
 function newDeepgram(onFinal) {
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true&endpointing=900";
   const dg = new WebSocket(url, {
-    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // "Token" is expected by Deepgram
+    headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }, // Deepgram expects "Token"
     perMessageDeflate: false
   });
   dg.on("message", (data)=>{
@@ -272,10 +272,16 @@ async function openaiChat(messages, options={}){
   return data.choices?.[0];
 }
 
+/* ===== ISO timezone validation helper ===== */
+function hasTZ(s){ return typeof s==="string" && (/[Zz]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s)); }
+
 /* ===== Tool implementations (thin wrappers, no logic) ===== */
 const Tools = {
   async read_availability({ dateISO, startISO, endISO, name, phone }) {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
+    if (startISO && !hasTZ(startISO)) return { ok:false, error:"ISO_MISSING_TZ_START" };
+    if (endISO   && !hasTZ(endISO))   return { ok:false, error:"ISO_MISSING_TZ_END"   };
+
     let windowObj;
     if (startISO && endISO) windowObj = { start_utc:startISO, end_utc:endISO };
     else if (dateISO) windowObj = dayWindowLocal(dateISO, BIZ_TZ);
@@ -290,6 +296,9 @@ const Tools = {
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
+    if (!hasTZ(startISO)) return { ok:false, error:"ISO_MISSING_TZ_START" };
+    if (!hasTZ(endISO))   return { ok:false, error:"ISO_MISSING_TZ_END"   };
+
     const startLocal = isoToLocalYYYYMMDDHHmm(startISO, BIZ_TZ);
     const endLocal   = isoToLocalYYYYMMDDHHmm(endISO,   BIZ_TZ);
     const payload = {
@@ -408,7 +417,7 @@ function systemMessages(tenantPrompt) {
   ];
 }
 
-/* ===== Force a spoken reply after tools (only when no tools are used) ===== */
+/* ===== Force a spoken reply when tools are disabled ===== */
 async function forceNaturalReply(messages) {
   const choice = await openaiChat(messages, { tool_choice:"none" });
   const msg = choice?.message || {};
@@ -428,7 +437,7 @@ async function speakStatus(ws, messages, hint) {
   }
 }
 
-/* ===== Generic tool runner with mutex and no premature return ===== */
+/* ===== Generic tool runner with mutex and pinned-window echo ===== */
 async function runTools(ws, baseMessages) {
   if (ws.__llmBusy) { ws.__queued = baseMessages; return ""; }
   ws.__llmBusy = true;
@@ -499,7 +508,23 @@ async function runTools(ws, baseMessages) {
         catch(e){ result = { ok:false, error:e.message||"TOOL_ERR" }; }
         console.log(JSON.stringify({ evt:"TOOL_DONE", name, ok: result?.ok !== false }));
 
+        // Attach tool result
         messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
+
+        // Pinned-window echo after successful availability read
+        if (name === "read_availability") {
+          try {
+            const r = result;
+            const pinStart = r?.data?.window?.start_utc;
+            const pinEnd   = r?.data?.window?.end_utc;
+            if (r?.ok === true && pinStart && pinEnd) {
+              messages.push({
+                role:"system",
+                content:`You just verified availability for start=${pinStart} end=${pinEnd}. If you intend to book, call book_appointment using the same startISO and endISO exactly.`
+              });
+            }
+          } catch {}
+        }
       }
 
       console.log(JSON.stringify({ evt:"NEXT_HOP" }));
@@ -526,7 +551,7 @@ function transcriptFromMem(mem){
   }).filter(Boolean).join("\n");
 }
 
-// === Schema-compatible postSummary (no hardcoded phrasing) ===
+// Schema-compatible postSummary
 async function postSummary(ws, reason = "normal") {
   if (ws.__summarized) return;
   ws.__summarized = true;
