@@ -50,7 +50,6 @@ requireEnv("OPENAI_API_KEY", OPENAI_API_KEY);
 requireEnv("DEEPGRAM_API_KEY", DEEPGRAM_API_KEY);
 requireEnv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY);
 requireEnv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID);
-// Calendar URLs optional per deployment. Warn if missing:
 ["CAL_READ","CAL_CREATE","CAL_DELETE"].forEach(k => { if (!URLS[k]) console.warn(`[WARN] ${k} not set`); });
 
 /* ===== HTTP helpers ===== */
@@ -86,17 +85,25 @@ async function httpGet(url, { headers={}, timeout=12000, params, auth, tag } = {
   }
 }
 
-/* ===== Minimal TZ helpers (no “smart” adjustments) ===== */
+/* ===== Minimal TZ helpers ===== */
 function todayISOInTZ(tz){
   const f = new Intl.DateTimeFormat("en-CA",{ timeZone:tz, year:"numeric", month:"2-digit", day:"2-digit" });
   const p = f.formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value,a),{});
   return `${p.year}-${p.month}-${p.day}`;
 }
 function dayWindowLocal(dateISO, tz) {
-  // Only used if the MODEL passes dateISO instead of explicit ISO window.
   const start_utc = new Date(`${dateISO}T00:00:00`).toISOString();
   const end_utc   = new Date(`${dateISO}T23:59:00`).toISOString();
   return { start_local: `${dateISO} 00:00`, end_local: `${dateISO} 23:59`, start_utc, end_utc, timezone: tz };
+}
+function isoToLocalYYYYMMDDHHmm(iso, tz) {
+  const d = new Date(iso);
+  const f = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", hour12:false
+  });
+  const p = f.formatToParts(d).reduce((a,x)=> (a[x.type]=x.value, a), {});
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
 /* ===== App / TwiML ===== */
@@ -283,13 +290,15 @@ const Tools = {
 
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
+    const startLocal = isoToLocalYYYYMMDDHHmm(startISO, BIZ_TZ);
+    const endLocal   = isoToLocalYYYYMMDDHHmm(endISO,   BIZ_TZ);
     const payload = {
       biz: DASH_BIZ,
       source: DASH_SOURCE,
       Event_Name: `${service||"Appointment"} (${name||"Guest"})`,
       Timezone: BIZ_TZ,
-      Start_Time_Local: "",
-      End_Time_Local:   "",
+      Start_Time_Local: startLocal,
+      End_Time_Local:   endLocal,
       Start_Time_UTC:   startISO,
       End_Time_UTC:     endISO,
       Customer_Name: name||"",
@@ -381,7 +390,7 @@ Rules:
 const RENDER_PROMPT = process.env.RENDER_PROMPT || "";
 
 async function fetchTenantPrompt() {
-  if (RENDER_PROMPT) return RENDER_PROMPT; // prefer env
+  if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
     try {
       const { data } = await httpGet(URLS.PROMPT_FETCH, { timeout:8000, tag:"PROMPT_FETCH", params:{ biz:DASH_BIZ } });
