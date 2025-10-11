@@ -170,6 +170,9 @@ Availability interpretation:
 Outside hours:
 - Capture name, number, service, best time to reach; promise a callback during business hours.
 
+Call start:
+- On \`<CALL_START>\`, greet briefly with the business name and ask how you can help.
+
 Ending calls (very important):
 - If the caller clearly signals wrap-up (e.g., “that’s it,” “that’ll be all,” “we’re good,” “no thanks,” “I’m all set,” “bye”),
   reply with one short goodbye (e.g., “Thanks for calling—have a great day!”) and then call \`end_call\`.
@@ -1112,7 +1115,7 @@ async function verifyHourAvailability({ text, replyText }) {
   if (!busy) {
     const h = LAST_TIME_HINT.hour24, m = LAST_TIME_HINT.min || 0;
     const hh12 = ((h + 11) % 12) + 1;
-    const mm = m ? `:${String(m).padStart(2,'0')}` : ""; // <-- fixed typo here
+    const mm = m ? `:${String(m).padStart(2,'0')}` : ""; // fixed typo
     const ampm = h >= 12 ? "PM" : "AM";
     const dayWord = /\btomorrow\b/i.test(text) ? "tomorrow" : "that time";
     return `Good news—${dayWord} at ${hh12}${mm} ${ampm} is open. Want me to lock it in?`;
@@ -1403,8 +1406,10 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
-        // QUICK UPDATE: removed auto AI greeting on connect.
-        // The assistant will not speak until the caller says something.
+        // Re-enabled: AI greeting on connect (driven by prompt; not hardcoded in code).
+        ws.__handling = true;
+        await handleTurn(ws, "<CALL_START>");
+        ws.__handling = false;
 
         return;
       }
@@ -1453,5 +1458,5 @@ if (!wss.__victory_handler_attached) {
 - Single Deepgram socket per call with 1.5s backoff; flush audio only after OPEN -> no WS storm.
 - Blocks premature hangups if the last bot message was a question.
 - Strips any “Ending the call now” stage direction before TTS.
-- No hardcoded or auto AI greeting on connect (per your request).
+- AI greeting is back on connect, using your prompt (or PRE_CONNECT_GREETING if you set it in TwiML).
 */
