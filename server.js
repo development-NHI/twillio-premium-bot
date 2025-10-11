@@ -424,7 +424,15 @@ if (!wss) {
 
 /* ===== Utilities ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function escapeHtml(s=""){ return s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',''':''&#39;'','"':'&quot;'}[c])); }
+function escapeHtml(s = "") {
+  return s.replace(/[&<>'"]/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    "'": '&#39;',
+    '"': '&quot;'
+  })[c]);
+}
 
 /* ===== Minimal Memory ===== */
 function newMemory() { return { transcript: [], summary: "" }; }
@@ -456,6 +464,7 @@ function newDeepgram(onFinal, wsRef) {
     if (wsRef) {
       wsRef.__dgOpen = true;
       wsRef.__dgState.connecting = false;
+      // Flush any buffered audio now that we're open
       try { wsRef.__flushULaw?.(); } catch {}
     }
   });
@@ -487,8 +496,9 @@ function newDeepgram(onFinal, wsRef) {
     console.log("[Deepgram] closed");
     if (wsRef) {
       wsRef.__dgOpen = false;
-      wsRef.__dg = null;
+      wsRef.__dg = null; // allow a future reconnect
       wsRef.__dgState.connecting = false;
+      // no immediate auto-reconnect; we reconnect on next media flush with backoff
     }
   });
 
@@ -704,6 +714,7 @@ const Tools = {
   async book_appointment({ name, phone, service, startISO, endISO, notes }) {
     console.log("[TOOL] book_appointment", { hasName: !!name, service, startISO, endISO });
 
+    // Re-align to utterance if weekday drifted (TZ-safe)
     const realigned = realignWindowToUtterance(startISO, endISO, LAST_UTTERANCE, BIZ_TZ);
     startISO = realigned.startISO;
     endISO   = realigned.endISO;
@@ -711,6 +722,7 @@ const Tools = {
     const ws = CALLS.get(currentTrace.callSid);
     if (!URLS.CAL_CREATE) return { ok:false };
 
+    // Single-booking guarantee: avoid duplicates within same hour for this call
     if (ws?.__confirmedBooking) {
       const b = ws.__confirmedBooking;
       const adj = adjustWindowToIntent({startISO,endISO},BIZ_TZ,LAST_UTTERANCE);
@@ -723,6 +735,7 @@ const Tools = {
       const normalizedPhone = toE164US((phone && phone.trim()) || CURRENT_FROM || "");
       const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
 
+      // Optional pre-check: verify exact hour is free
       try {
         const probe = await Tools.read_availability({ startISO: win.start_utc, endISO: win.end_utc });
         if (probe?.summary?.busy) return { ok:false, error:"time_unavailable" };
@@ -764,12 +777,13 @@ const Tools = {
       if (status === 400 && /not available/i.test(body)) {
         try {
           const win = adjustWindowToIntent({ startISO, endISO }, BIZ_TZ, LAST_UTTERANCE);
-          const { data: r } = await httpPost(URLS.CAL_READ, {
-              intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
-              window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
-              contact_phone: toE164US((phone||CURRENT_FROM||""))
-            }, { timeout:12000, tag:"CAL_READ_VERIFY",
-              trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
+          const readPayload = {
+            intent:"READ", biz:DASH_BIZ, source:DASH_SOURCE, timezone:BIZ_TZ,
+            window: { start_local: win.start_local, end_local: win.end_local, start_utc: win.start_utc, end_utc: win.end_utc },
+            contact_phone: toE164US((phone||CURRENT_FROM||""))
+          };
+          const { data: r } = await httpPost(URLS.CAL_READ, readPayload, { timeout:12000, tag:"CAL_READ_VERIFY",
+            trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
           const ev = (r?.events||[]).find(ev => ev.start_utc === win.start_utc);
           if (ev) {
             const ws = CALLS.get(currentTrace.callSid);
@@ -807,19 +821,21 @@ const Tools = {
           ? dayWindowLocal(dateISO, BIZ_TZ)
           : rangeWindowLocal(baseDate, 30, BIZ_TZ);
 
-        const { data: readData } = await httpPost(URLS.CAL_READ, {
-            intent: "READ",
-            biz: DASH_BIZ,
-            source: DASH_SOURCE,
-            timezone: BIZ_TZ,
-            window: {
-              start_local: windowObj.start_local,
-              end_local:   windowObj.end_local,
-              start_utc:   windowObj.start_utc,
-              end_utc:     windowObj.end_utc
-            },
-            contact_phone: normalizedPhone || undefined
+        const readPayload = {
+          intent: "READ",
+          biz: DASH_BIZ,
+          source: DASH_SOURCE,
+          timezone: BIZ_TZ,
+          window: {
+            start_local: windowObj.start_local,
+            end_local:   windowObj.end_local,
+            start_utc:   windowObj.start_utc,
+            end_utc:     windowObj.end_utc
           },
+          contact_phone: normalizedPhone || undefined
+        };
+
+        const { data: readData } = await httpPost(URLS.CAL_READ, readPayload,
           { timeout:12000, tag:"CAL_READ", trace:{ convoId: currentTrace.convoId, callSid: currentTrace.callSid } });
 
         const all = (readData?.events || []).filter(e => e.status !== "canceled");
@@ -1216,10 +1232,16 @@ if (!wss.__victory_handler_attached) {
       }, ms);
     }
 
+    // Flush function that respects socket state; drains only when OPEN
     ws.__flushULaw = function flushULaw() {
       if (!pendingULaw.length) return;
+
+      // Ensure a single DG socket, with backoff
       ws.__ensureDG();
+
+      // If still not open, keep buffering; we'll flush when 'open' fires
       if (!ws.__dgOpen) return;
+
       const chunk = Buffer.concat(pendingULaw);
       pendingULaw = [];
       const now = Date.now();
@@ -1232,8 +1254,10 @@ if (!wss.__victory_handler_attached) {
 
     ws.__ensureDG = function ensureDG() {
       if (ws.__dg || ws.__dgState.connecting) return ws.__dg;
+
       const now = Date.now();
-      if (now - ws.__dgState.lastConnectAt < 1500) return ws.__dg;
+      if (now - ws.__dgState.lastConnectAt < 1500) return ws.__dg; // backoff
+
       ws.__dgState.connecting = true;
       ws.__dgState.lastConnectAt = now;
       ws.__dg = newDeepgram(async (text) => {
@@ -1247,6 +1271,7 @@ if (!wss.__victory_handler_attached) {
         const tHint = parseUserTime(text);
         if (tHint) LAST_TIME_HINT = { hour24: tHint.hour24, min: tHint.min, ts: Date.now() };
 
+        // ★ Key line: caller has spoken; allow end_call after wrap-up
         ws.__awaitingReply = false;
 
         if (ws.__handling) { ws.__queuedTurn = text; return; }
@@ -1289,6 +1314,7 @@ if (!wss.__victory_handler_attached) {
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
           if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
+          // Don’t allow end_call immediately after a bot question
           if (name === "end_call" && ws.__awaitingReply) {
             console.log("[GUARD] Blocked premature end_call (awaiting reply)");
             continue;
@@ -1298,7 +1324,7 @@ if (!wss.__victory_handler_attached) {
           const impl = Tools[name];
           let toolResult = {};
           try { toolResult = await (impl ? impl(args) : {}); }
-          catch(e){ console.error("[TOOL] error", name, e.message); toolResult = {}; }
+          catch(e){ console.error("[TOOL] error]", name, e.message); toolResult = {}; }
 
           messages = [...messages, msg, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(toolResult) }];
 
@@ -1342,6 +1368,7 @@ if (!wss.__victory_handler_attached) {
       const messages = buildMessages(ws.__mem, userText, ws.__tenantPrompt);
       let finalText = await resolveToolChain(messages);
 
+      // If the model denied a requested time, re-verify that hour and correct if free
       const corrected = await verifyHourAvailability({ text: userText, replyText: finalText });
       if (corrected) finalText = corrected;
 
@@ -1392,6 +1419,7 @@ if (!wss.__victory_handler_attached) {
           }
         }
 
+        // Greet immediately via AI (no need to wait for media)
         ws.__handling = true;
         await handleTurn(ws, "<CALL_START>");
         ws.__handling = false;
@@ -1401,6 +1429,7 @@ if (!wss.__victory_handler_attached) {
 
       if (msg.event === "media") {
         ws.__sawMedia = true;
+        // Buffer audio; ensure single DG; actual send when OPEN
         ws.__ensureDG();
         ws.__lastAudioAt = Date.now();
         const ulaw = Buffer.from(msg.media?.payload || "", "base64");
