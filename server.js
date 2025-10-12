@@ -44,7 +44,6 @@ const RENDER_PROMPT        = process.env.RENDER_PROMPT || "";
 /* ===== Minimal utils ===== */
 const DEBUG = (process.env.DEBUG || "true") === "true";
 const log = (...a)=>{ if (DEBUG) console.log(...a); };
-function rid(){ return Math.random().toString(36).slice(2,8); }
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
 function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;" }[c])); }
@@ -290,13 +289,39 @@ function systemMessages(prompt){
 const Tools = {
   async read_availability(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
-    try { const { data } = await httpPost(URLS.CAL_READ, { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args }, { timeout:12000 }); return { ok:true, data }; }
-    catch(e){ return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data }; }
+    try {
+      const { dateISO, startISO, endISO, name, phone } = args || {};
+      let windowObj;
+      if (startISO && endISO) {
+        windowObj = { start_utc: startISO, end_utc: endISO };
+      } else if (dateISO) {
+        windowObj = { start_local: `${dateISO} 00:00`, end_local: `${dateISO} 23:59` };
+      }
+      const payload = {
+        intent: "READ",
+        biz: DASH_BIZ,
+        source: DASH_SRC,
+        timezone: BIZ_TZ,   // some backends expect lowercase
+        Timezone: BIZ_TZ,   // some expect uppercase
+        window: windowObj,
+        contact_name: name,
+        contact_phone: phone
+      };
+      const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
+      return { ok:true, data };
+    } catch(e){
+      return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data };
+    }
   },
   async book_appointment(args){
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
-    try { const { data } = await httpPost(URLS.CAL_CREATE, { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args }, { timeout:12000 }); return { ok:true, data }; }
-    catch(e){ return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data }; }
+    try {
+      const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args };
+      const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
+      return { ok:true, data };
+    } catch(e){
+      return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data };
+    }
   },
   async cancel_appointment(args){
     if (!URLS.CAL_DELETE) return { ok:false, error:"CAL_DELETE_URL_MISSING" };
@@ -304,13 +329,19 @@ const Tools = {
       const { data, status } = await httpPost(URLS.CAL_DELETE, { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:12000 });
       const ok = (status>=200&&status<300) || data?.ok || data?.deleted || data?.cancelled;
       return { ok: !!ok, data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data }; }
+    } catch(e){
+      return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
+    }
   },
   async find_customer_events(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
-    try { const { data } = await httpPost(URLS.CAL_READ, { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args }, { timeout:12000 });
+    try {
+      const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args };
+      const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
       return { ok:true, events: data?.events||[], data };
-    } catch(e){ return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data }; }
+    } catch(e){
+      return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
+    }
   },
   async lead_upsert(args){
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
@@ -341,7 +372,7 @@ const Tools = {
   }
 };
 
-/* ===== Turn runner — single-flight with tool execution + memory ===== */
+/* ===== Turn runner — single-flight with tool execution + memory + outcome nudge ===== */
 async function runTurn(ws, baseMessages){
   if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
@@ -358,7 +389,7 @@ async function runTurn(ws, baseMessages){
 
       if (text) {
         await speakULaw(ws, text);
-        ws.__mem.push({ role:"assistant", content:text }); // persist assistant reply
+        ws.__mem.push({ role:"assistant", content:text });
       }
       if (!calls.length) return;
 
@@ -378,7 +409,9 @@ async function runTurn(ws, baseMessages){
 
         messages = [
           ...messages,
-          { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }
+          { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) },
+          { role:"system",
+            content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not repeat the greeting. Do not mention tools or ISO strings." }
         ];
       }
     }
@@ -435,7 +468,7 @@ wss.on("connection", (ws)=>{
           { role:"user", content: text }
         ];
         await runTurn(ws, base);
-        ws.__mem.push({ role:"user", content:text }); // persist user utterance
+        ws.__mem.push({ role:"user", content:text });
       });
 
       return;
