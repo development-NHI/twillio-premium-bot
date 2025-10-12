@@ -22,8 +22,8 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE || "";
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
+const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
 
 const BIZ_TZ   = process.env.BIZ_TZ   || "America/New_York";
 const DASH_BIZ = process.env.DASH_BIZ || "The Victory Team";
@@ -285,7 +285,18 @@ function systemMessages(prompt){
   ];
 }
 
-/* ===== Slot extractor (server-side guard rails) ===== */
+/* ===== Local time helpers ===== */
+function toLocalYmdHm(iso, tz){
+  // returns "YYYY-MM-DD HH:mm" in tz without seconds
+  const d = new Date(iso);
+  const f = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
+    hour:"2-digit", minute:"2-digit", hour12:false
+  }).formatToParts(d).reduce((a,p)=>(a[p.type]=p.value,a),{});
+  return `${f.year}-${f.month}-${f.day} ${f.hour}:${f.minute}`;
+}
+
+/* ===== Slot extractor ===== */
 function normalizePhone(s){
   if (!s) return "";
   const d = s.replace(/\D/g,"");
@@ -296,30 +307,19 @@ function normalizePhone(s){
 }
 function extractSlots(ws, text){
   const t = String(text).toLowerCase();
-
-  // phone
   if (/this (is )?my number|this number/.test(t) && ws.__from) ws.__slots.phone = normalizePhone(ws.__from);
   const mPhone = text.match(/(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}/);
   if (mPhone) ws.__slots.phone = normalizePhone(mPhone[0]);
-
-  // meeting type
   if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws.__slots.meeting_type = "in-person";
   if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws.__slots.meeting_type = "virtual";
-
-  // location (very light)
   const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
   if (mAddr && !ws.__slots.location && ws.__slots.meeting_type === "in-person") ws.__slots.location = mAddr[0];
-
-  // name
   const mName = text.match(/\b(?:i[' ]?m|this is|my name is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
   if (mName) ws.__slots.name = mName[1].trim();
-
-  // service
   if (/\b(buyer|buy a home|tour)\b/.test(t)) ws.__slots.service = "buyer";
   if (/\b(seller|list my home|listing)\b/.test(t)) ws.__slots.service = "seller";
   if (/\binvest(ing|or)?\b/.test(t)) ws.__slots.service = "investor";
 }
-
 function scratchpadMessage(ws){
   const S = ws.__slots;
   const lines = [
@@ -334,7 +334,7 @@ function scratchpadMessage(ws){
   return { role:"system", content: lines };
 }
 
-/* ===== Thin tools (pure pass-through) ===== */
+/* ===== Tools ===== */
 const Tools = {
   async read_availability(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
@@ -370,7 +370,22 @@ const Tools = {
       const a = { ...args };
       a.meeting_type = a.meeting_type || "";
       a.location     = a.location     || "";
-      const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...a };
+
+      // Add both local-time strings and dual timezone keys for compatibility
+      const startLocal = (a.startISO ? toLocalYmdHm(a.startISO, BIZ_TZ) : "");
+      const endLocal   = (a.endISO   ? toLocalYmdHm(a.endISO,   BIZ_TZ) : "");
+      const payload = {
+        biz: DASH_BIZ,
+        source: DASH_SRC,
+        Timezone: BIZ_TZ,
+        timezone: BIZ_TZ,
+        Start_Time_Local: startLocal,   // expected by some backends
+        End_Time_Local: endLocal,       // expected by some backends
+        start_local: startLocal,        // alt keys for others
+        end_local: endLocal,
+        ...a
+      };
+
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
       log("[TOOL][book_appointment] ok", JSON.stringify({ startISO:a.startISO, endISO:a.endISO }));
       return { ok:true, data };
@@ -396,7 +411,7 @@ const Tools = {
   async find_customer_events(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
     try {
-      const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args };
+      const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, Timezone:BIZ_TZ, ...args };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
       log("[TOOL][find_customer_events] ok");
       return { ok:true, events: data?.events||[], data };
@@ -434,7 +449,7 @@ const Tools = {
   }
 };
 
-/* ===== Turn runner — single-flight with tool execution + memory + dedupe ===== */
+/* ===== Turn runner ===== */
 async function runTurn(ws, baseMessages){
   if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
@@ -442,7 +457,7 @@ async function runTurn(ws, baseMessages){
   try {
     let messages = [
       ...baseMessages,
-      scratchpadMessage(ws) // inject known slots every turn
+      scratchpadMessage(ws)
     ];
 
     for (let hops=0; hops<6; hops++){
@@ -458,7 +473,6 @@ async function runTurn(ws, baseMessages){
         ws.__mem.push({ role:"assistant", content:text });
       }
 
-      // store assistant message BEFORE tool messages
       messages = [...messages, assistantMsg];
 
       if (!calls?.length) {
@@ -477,11 +491,8 @@ async function runTurn(ws, baseMessages){
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-        // dedupe availability/booking by pinned window
         let windowKey = "";
-        if (args?.startISO && args?.endISO) {
-          windowKey = `${args.startISO}|${args.endISO}`;
-        }
+        if (args?.startISO && args?.endISO) windowKey = `${args.startISO}|${args.endISO}`;
 
         if ((name === "read_availability" || name === "book_appointment") && windowKey){
           if (ws.__windowFlights.has(windowKey) && name === "read_availability") {
@@ -507,7 +518,6 @@ async function runTurn(ws, baseMessages){
         const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
         log("[TOOL→LLM]", name, result?.ok ? "ok" : "fail");
 
-        // if booking succeeded, pin slots to prevent re-asks
         if (name === "book_appointment" && result?.ok) ws.__lastBooked = { startISO: args.startISO, endISO: args.endISO };
 
         messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
@@ -535,7 +545,7 @@ wss.on("connection", (ws)=>{
   ws.__llmBusy = false;
   ws.__turnQueue = null;
   ws.__ttsQ = Promise.resolve();
-  ws.__mem = []; // rolling transcript memory
+  ws.__mem = [];
   ws.__slots = { name:"", phone:"", service:"", meeting_type:"", location:"", notes:"" };
   ws.__windowFlights = new Set();
   ws.__lastBooked = null;
