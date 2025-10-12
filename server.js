@@ -122,7 +122,6 @@ function cleanTTS(s=""){
 async function speakULaw(ws, text){
   if (!text || !ws.__streamSid) return;
   const clean = cleanTTS(text);
-  // Serialize: queue utterances; Twilio hates overlap
   ws.__ttsQ = ws.__ttsQ || Promise.resolve();
   ws.__ttsQ = ws.__ttsQ.then(async ()=>{
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
@@ -142,7 +141,7 @@ async function speakULaw(ws, text){
       resp.data.on("end", resolve);
       resp.data.on("error", reject);
     });
-  }).catch(()=>{ /* swallow per-utterance errors */ });
+  }).catch(()=>{});
   return ws.__ttsQ;
 }
 
@@ -342,14 +341,14 @@ const Tools = {
   }
 };
 
-/* ===== Turn runner — single-flight with tool execution ===== */
+/* ===== Turn runner — single-flight with tool execution + memory ===== */
 async function runTurn(ws, baseMessages){
   if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
 
   try {
     let messages = baseMessages.slice();
-    const seen = new Set(); // de-dupe same tool+args in one turn
+    const seen = new Set();
 
     for (let hops=0; hops<6; hops++){
       const choice = await openaiChat(messages);
@@ -357,7 +356,10 @@ async function runTurn(ws, baseMessages){
       const text = (msg.content||"").trim();
       const calls = msg.tool_calls || [];
 
-      if (text) await speakULaw(ws, text);
+      if (text) {
+        await speakULaw(ws, text);
+        ws.__mem.push({ role:"assistant", content:text }); // persist assistant reply
+      }
       if (!calls.length) return;
 
       for (const tc of calls){
@@ -376,9 +378,8 @@ async function runTurn(ws, baseMessages){
 
         messages = [
           ...messages,
-          text ? { role:"assistant", content:text } : null,
           { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }
-        ].filter(Boolean);
+        ];
       }
     }
   } finally {
@@ -401,6 +402,7 @@ wss.on("connection", (ws)=>{
   ws.__llmBusy = false;
   ws.__turnQueue = null;
   ws.__ttsQ = Promise.resolve();
+  ws.__mem = []; // rolling transcript memory
 
   const flush = ()=>{
     if (!pending.length || !dg || dg.readyState !== WebSocket.OPEN) return;
@@ -421,6 +423,7 @@ wss.on("connection", (ws)=>{
       ws.__prompt = await getPrompt();
       const boot = [
         ...systemMessages(ws.__prompt),
+        ...ws.__mem.slice(-12),
         { role:"user", content:"<CALL_START>" }
       ];
       await runTurn(ws, boot);
@@ -428,9 +431,11 @@ wss.on("connection", (ws)=>{
       dg = newDeepgram(async (text)=>{
         const base = [
           ...systemMessages(ws.__prompt),
+          ...ws.__mem.slice(-12),
           { role:"user", content: text }
         ];
         await runTurn(ws, base);
+        ws.__mem.push({ role:"user", content:text }); // persist user utterance
       });
 
       return;
