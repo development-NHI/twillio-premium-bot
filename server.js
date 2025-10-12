@@ -2,7 +2,6 @@
    - Model decides everything via tools; JS executes verbatim
    - μ-law passthrough: Twilio → Deepgram, ElevenLabs TTS → Twilio
    - Robustness: singleton WS, serialized TTS, single-flight LLM, slim deps
-   - Trimmed, structured logs with previews (no spam)
 */
 
 import express from "express";
@@ -44,16 +43,7 @@ const RENDER_PROMPT        = process.env.RENDER_PROMPT || "";
 
 /* ===== Minimal utils ===== */
 const DEBUG = (process.env.DEBUG || "true") === "true";
-const MAX_PREVIEW = Number(process.env.LOG_PREVIEW || 240);
-const ts = () => new Date().toISOString().replace('T',' ').replace('Z','');
-const preview = (v, n=MAX_PREVIEW) => {
-  try {
-    const s = typeof v === "string" ? v : JSON.stringify(v);
-    return s.length > n ? (s.slice(0, n) + "…") : s;
-  } catch { return ""; }
-};
-const jlog = (obj) => { if (DEBUG) console.log(JSON.stringify({ t: ts(), ...obj })); };
-const log = (...a)=>{ if (DEBUG) console.log(ts(), ...a); };
+const log = (...a)=>{ if (DEBUG) console.log(...a); };
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
 function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;" }[c])); }
@@ -94,34 +84,28 @@ app.post("/handoff", (_req,res)=>{
   `.trim());
 });
 
-const server = app.listen(PORT, ()=> jlog({ evt:"INIT", port: PORT, biz:DASH_BIZ, tz:BIZ_TZ }));
+const server = app.listen(PORT, ()=> log(`[INIT] ${PORT}`));
 
 /* ===== Singleton WS ===== */
 let wss = globalThis.__wss_singleton;
 if (!wss) {
   wss = new WebSocketServer({ server, perMessageDeflate:false });
   globalThis.__wss_singleton = wss;
-  jlog({ evt:"WSS_READY" });
 }
 
 /* ===== Deepgram: single connection per call ===== */
 function newDeepgram(onFinal){
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true";
   const dg = new WebSocket(url, { headers:{ Authorization:`Token ${DEEPGRAM_API_KEY}` }, perMessageDeflate:false });
-  dg.on("open", ()=> jlog({ evt:"DG_OPEN" }));
-  dg.on("close", (c,r)=> jlog({ evt:"DG_CLOSE", code:c, reason: String(r||"") }));
-  dg.on("error", e=> jlog({ evt:"DG_ERR", msg: e?.message||String(e) }));
+  dg.on("open", ()=> log("[DG] open"));
+  dg.on("close", ()=> log("[DG] close"));
+  dg.on("error", e=> log("[DG] error", e?.message||e));
   dg.on("message", buf=>{
     try {
       const ev = JSON.parse(buf.toString());
       const t = ev?.channel?.alternatives?.[0]?.transcript?.trim();
-      if (t && (ev.is_final || ev.speech_final)) {
-        jlog({ evt:"DG_FINAL", text_preview: preview(t, 120) });
-        onFinal(t);
-      }
-    } catch (e) {
-      jlog({ evt:"DG_PARSE_ERR", msg: String(e) });
-    }
+      if (t && (ev.is_final || ev.speech_final)) onFinal(t);
+    } catch {}
   });
   return dg;
 }
@@ -139,18 +123,14 @@ async function speakULaw(ws, text){
   const clean = cleanTTS(text);
   ws.__ttsQ = ws.__ttsQ || Promise.resolve();
   ws.__ttsQ = ws.__ttsQ.then(async ()=>{
-    jlog({ evt:"TTS_START", chars: clean.length, preview: preview(clean, 100) });
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
     const resp = await httpPost(url, { text: clean }, {
       headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true },
       responseType:"stream", timeout:20000
     });
-
-    let bytes = 0;
     await new Promise((resolve,reject)=>{
       resp.data.on("data", chunk=>{
         if (ws.readyState !== WebSocket.OPEN) return;
-        bytes += chunk.length;
         ws.send(JSON.stringify({
           event:"media",
           streamSid: ws.__streamSid,
@@ -160,8 +140,7 @@ async function speakULaw(ws, text){
       resp.data.on("end", resolve);
       resp.data.on("error", reject);
     });
-    jlog({ evt:"TTS_END", bytes });
-  }).catch(e=> jlog({ evt:"TTS_ERR", msg: e?.message||String(e) }));
+  }).catch(()=>{});
   return ws.__ttsQ;
 }
 
@@ -208,15 +187,10 @@ const toolSchema = [
 
 async function openaiChat(messages, opts={}){
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", ...opts };
-  const t0 = Date.now();
-  jlog({ evt:"LLM_REQ", msgs: messages.length, last_user: preview(messages[messages.length-1], 160) });
   const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
     headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout:30000
   });
-  const choice = data?.choices?.[0] || {};
-  const tc = choice?.message?.tool_calls?.map(c=>c.function?.name) || [];
-  jlog({ evt:"LLM_RES", ms: Date.now()-t0, has_text: !!(choice?.message?.content?.trim()), tools: tc });
-  return choice;
+  return data?.choices?.[0] || {};
 }
 
 /* ===== Prompt sourcing (prompt owns all rules) ===== */
@@ -296,12 +270,7 @@ Turn Template When Acting
 async function getPrompt(){
   if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
-    try {
-      const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 });
-      if (data?.prompt) return data.prompt;
-    } catch(e){
-      jlog({ evt:"PROMPT_FETCH_ERR", msg: e?.message||String(e) });
-    }
+    try { const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 }); if (data?.prompt) return data.prompt; } catch {}
   }
   return FALLBACK_PROMPT;
 }
@@ -332,18 +301,15 @@ const Tools = {
         intent: "READ",
         biz: DASH_BIZ,
         source: DASH_SRC,
-        timezone: BIZ_TZ,   // lowercase variant
-        Timezone: BIZ_TZ,   // uppercase variant
+        timezone: BIZ_TZ,   // some backends expect lowercase
+        Timezone: BIZ_TZ,   // some expect uppercase
         window: windowObj,
         contact_name: name,
         contact_phone: phone
       };
-      jlog({ evt:"CAL_READ_REQ", payload_preview: preview(payload) });
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
-      jlog({ evt:"CAL_READ_OK", count: data?.count, events_len: data?.events?.length });
       return { ok:true, data };
     } catch(e){
-      jlog({ evt:"CAL_READ_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
       return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data };
     }
   },
@@ -351,26 +317,19 @@ const Tools = {
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     try {
       const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args };
-      jlog({ evt:"CAL_CREATE_REQ", payload_preview: preview(payload) });
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
-      jlog({ evt:"CAL_CREATE_OK", id_preview: preview(data?.id || data, 60) });
       return { ok:true, data };
     } catch(e){
-      jlog({ evt:"CAL_CREATE_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
       return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data };
     }
   },
   async cancel_appointment(args){
     if (!URLS.CAL_DELETE) return { ok:false, error:"CAL_DELETE_URL_MISSING" };
     try {
-      const payload = { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args };
-      jlog({ evt:"CAL_DELETE_REQ", payload_preview: preview(payload) });
-      const { data, status } = await httpPost(URLS.CAL_DELETE, payload, { timeout:12000 });
+      const { data, status } = await httpPost(URLS.CAL_DELETE, { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:12000 });
       const ok = (status>=200&&status<300) || data?.ok || data?.deleted || data?.cancelled;
-      jlog({ evt:"CAL_DELETE_DONE", ok: !!ok });
       return { ok: !!ok, data };
     } catch(e){
-      jlog({ evt:"CAL_DELETE_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
       return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
     }
   },
@@ -378,78 +337,44 @@ const Tools = {
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
     try {
       const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args };
-      jlog({ evt:"CAL_FIND_REQ", payload_preview: preview(payload) });
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
-      jlog({ evt:"CAL_FIND_OK", events: data?.events?.length||0 });
       return { ok:true, events: data?.events||[], data };
     } catch(e){
-      jlog({ evt:"CAL_FIND_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
       return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
     }
   },
   async lead_upsert(args){
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
-    try {
-      const payload = { biz:DASH_BIZ, source:DASH_SRC, ...args };
-      jlog({ evt:"LEAD_REQ", payload_preview: preview(payload) });
-      const { data } = await httpPost(URLS.LEAD_UPSERT, payload, { timeout:8000 });
-      jlog({ evt:"LEAD_OK" });
-      return { ok:true, data };
-    } catch(e){
-      jlog({ evt:"LEAD_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
-      return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data };
-    }
+    try { const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); return { ok:true, data }; }
+    catch(e){ return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data }; }
   },
   async faq(args){
-    try {
-      if (URLS.FAQ_LOG) {
-        const payload = { biz:DASH_BIZ, source:DASH_SRC, ...args };
-        jlog({ evt:"FAQ_REQ", payload_preview: preview(payload) });
-        await httpPost(URLS.FAQ_LOG, payload, { timeout:8000 });
-        jlog({ evt:"FAQ_OK" });
-      }
-    } catch(e){
-      jlog({ evt:"FAQ_ERR", msg: e?.message||String(e) });
-    }
+    try { if (URLS.FAQ_LOG) await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); } catch {}
     return { ok:true };
   },
   async transfer(args){
     const callSid = args.callSid || "";
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) return { ok:false, error:"TRANSFER_CONFIG_MISSING" };
-    try {
-      const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-      const handoffUrl = `https://${host}/handoff`;
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
-      const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
-      jlog({ evt:"XFER_REQ" });
-      await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:10000 });
-      jlog({ evt:"XFER_OK" });
-      return { ok:true };
-    } catch(e){
-      jlog({ evt:"XFER_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
-      return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data };
-    }
+    const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
+    const handoffUrl = `https://${host}/handoff`;
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
+    const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
+    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:10000 }); return { ok:true }; }
+    catch(e){ return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data }; }
   },
   async end_call(args){
     const callSid = args.callSid || "";
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { ok:false, error:"HANGUP_CONFIG_MISSING" };
-    try {
-      const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
-      const params = new URLSearchParams({ Status:"completed" });
-      jlog({ evt:"HANGUP_REQ" });
-      await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:8000 });
-      jlog({ evt:"HANGUP_OK" });
-      return { ok:true };
-    } catch(e){
-      jlog({ evt:"HANGUP_ERR", status: e?.response?.status||0, body_preview: preview(e?.response?.data) });
-      return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data };
-    }
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
+    const params = new URLSearchParams({ Status:"completed" });
+    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:8000 }); return { ok:true }; }
+    catch(e){ return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data }; }
   }
 };
 
 /* ===== Turn runner — single-flight with tool execution + memory + outcome nudge ===== */
 async function runTurn(ws, baseMessages){
-  if (ws.__llmBusy) { ws.__turnQueue = baseMessages; jlog({ evt:"TURN_QUEUE" }); return; }
+  if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
 
   try {
@@ -457,7 +382,6 @@ async function runTurn(ws, baseMessages){
     const seen = new Set();
 
     for (let hops=0; hops<6; hops++){
-      jlog({ evt:"TURN_HOP", hop:hops });
       const choice = await openaiChat(messages);
       const msg = choice?.message || {};
       const text = (msg.content||"").trim();
@@ -466,26 +390,22 @@ async function runTurn(ws, baseMessages){
       if (text) {
         await speakULaw(ws, text);
         ws.__mem.push({ role:"assistant", content:text });
-        jlog({ evt:"SPOKEN", preview: preview(text, 120) });
       }
-      if (!calls.length) { jlog({ evt:"NO_TOOLS" }); return; }
-
-      jlog({ evt:"TOOL_CALLS", names: calls.map(c=>c.function?.name) });
+      if (!calls.length) return;
 
       for (const tc of calls){
         const name = tc.function?.name || "";
         let args = {};
         try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
         const key = `${name}|${JSON.stringify(args)}`;
-        if (seen.has(key)) { jlog({ evt:"TOOL_DEDUP", name }); continue; }
+        if (seen.has(key)) continue;
         seen.add(key);
 
         const impl = Tools[name];
-        jlog({ evt:"TOOL_EXEC", name, args_preview: preview(args) });
         const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
-        jlog({ evt:"TOOL_RESULT", name, ok: result?.ok !== false });
 
         messages = [
           ...messages,
@@ -495,16 +415,9 @@ async function runTurn(ws, baseMessages){
         ];
       }
     }
-    jlog({ evt:"TURN_HOP_LIMIT" });
-  } catch(e){
-    jlog({ evt:"TURN_ERR", msg: e?.message||String(e) });
   } finally {
     ws.__llmBusy = false;
-    if (ws.__turnQueue) {
-      const q = ws.__turnQueue; ws.__turnQueue = null;
-      jlog({ evt:"TURN_DEQUEUE" });
-      runTurn(ws, q);
-    }
+    if (ws.__turnQueue) { const q = ws.__turnQueue; ws.__turnQueue = null; runTurn(ws, q); }
   }
 }
 
@@ -524,23 +437,21 @@ wss.on("connection", (ws)=>{
   ws.__ttsQ = Promise.resolve();
   ws.__mem = []; // rolling transcript memory
 
-  jlog({ evt:"WS_CONN" });
-
   const flush = ()=>{
     if (!pending.length || !dg || dg.readyState !== WebSocket.OPEN) return;
     const chunk = Buffer.concat(pending); pending = [];
-    try { dg.send(chunk); jlog({ evt:"DG_FLUSH", bytes: chunk.length }); } catch(e){ jlog({ evt:"DG_FLUSH_ERR", msg:String(e) }); }
+    try { dg.send(chunk); } catch {}
   };
 
   ws.on("message", async raw=>{
-    let msg; try { msg = JSON.parse(raw.toString()); } catch { jlog({ evt:"WS_PARSE_ERR" }); return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start"){
       ws.__streamSid = msg.start?.streamSid || "";
       const cp = msg.start?.customParameters || {};
       ws.__from    = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
-      jlog({ evt:"CALL_START", callSid: ws.__callSid, from: ws.__from });
+      log("[CALL] start", ws.__callSid);
 
       ws.__prompt = await getPrompt();
       const boot = [
@@ -573,7 +484,6 @@ wss.on("connection", (ws)=>{
     }
 
     if (msg.event === "stop"){
-      jlog({ evt:"CALL_STOP" });
       try { flush(); } catch {}
       try { dg?.close(); } catch {}
       try { ws.close(); } catch {}
@@ -581,6 +491,6 @@ wss.on("connection", (ws)=>{
     }
   });
 
-  ws.on("close", ()=> { jlog({ evt:"WS_CLOSE" }); try { dg?.close(); } catch {} });
-  ws.on("error", (e)=> { jlog({ evt:"WS_ERR", msg: e?.message||String(e) }); try { dg?.close(); } catch {} });
+  ws.on("close", ()=> { try { dg?.close(); } catch {} });
+  ws.on("error", ()=> { try { dg?.close(); } catch {} });
 });
