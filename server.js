@@ -22,8 +22,8 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN  = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID   || "";
-const OWNER_PHONE        = process.env.OWNER_PHONE        || "";
+const TWILIO_CALLER_ID   = process.env.TWILIO_CALLER_ID || "";
+const OWNER_PHONE        = process.env.OWNER_PHONE || "";
 
 const BIZ_TZ   = process.env.BIZ_TZ   || "America/New_York";
 const DASH_BIZ = process.env.DASH_BIZ || "The Victory Team";
@@ -285,6 +285,55 @@ function systemMessages(prompt){
   ];
 }
 
+/* ===== Slot extractor (server-side guard rails) ===== */
+function normalizePhone(s){
+  if (!s) return "";
+  const d = s.replace(/\D/g,"");
+  if (d.length === 10) return `+1${d}`;
+  if (d.length === 11 && d.startsWith("1")) return `+${d}`;
+  if (d.startsWith("+")) return d;
+  return "";
+}
+function extractSlots(ws, text){
+  const t = String(text).toLowerCase();
+
+  // phone
+  if (/this (is )?my number|this number/.test(t) && ws.__from) ws.__slots.phone = normalizePhone(ws.__from);
+  const mPhone = text.match(/(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}/);
+  if (mPhone) ws.__slots.phone = normalizePhone(mPhone[0]);
+
+  // meeting type
+  if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws.__slots.meeting_type = "in-person";
+  if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws.__slots.meeting_type = "virtual";
+
+  // location (very light)
+  const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
+  if (mAddr && !ws.__slots.location && ws.__slots.meeting_type === "in-person") ws.__slots.location = mAddr[0];
+
+  // name
+  const mName = text.match(/\b(?:i[' ]?m|this is|my name is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+  if (mName) ws.__slots.name = mName[1].trim();
+
+  // service
+  if (/\b(buyer|buy a home|tour)\b/.test(t)) ws.__slots.service = "buyer";
+  if (/\b(seller|list my home|listing)\b/.test(t)) ws.__slots.service = "seller";
+  if (/\binvest(ing|or)?\b/.test(t)) ws.__slots.service = "investor";
+}
+
+function scratchpadMessage(ws){
+  const S = ws.__slots;
+  const lines = [
+    `Scratchpad`,
+    `- Name: ${S.name||""}`,
+    `- Phone: ${S.phone||""}`,
+    `- Service: ${S.service||""}`,
+    `- Meeting Type: ${S.meeting_type||""}`,
+    `- Location: ${S.location||""}`,
+    `- Notes: ${S.notes||""}`
+  ].join("\n");
+  return { role:"system", content: lines };
+}
+
 /* ===== Thin tools (pure pass-through) ===== */
 const Tools = {
   async read_availability(args){
@@ -308,7 +357,7 @@ const Tools = {
         contact_phone: phone
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
-      log("[TOOL][read_availability] ok");
+      log("[TOOL][read_availability] ok", windowObj ? JSON.stringify(windowObj) : "");
       return { ok:true, data };
     } catch(e){
       log("[TOOL][read_availability] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
@@ -318,17 +367,18 @@ const Tools = {
   async book_appointment(args){
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     try {
-      // Light guard to avoid backend 400s if the model omitted fields
       const a = { ...args };
       a.meeting_type = a.meeting_type || "";
       a.location     = a.location     || "";
       const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...a };
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
-      log("[TOOL][book_appointment] ok");
+      log("[TOOL][book_appointment] ok", JSON.stringify({ startISO:a.startISO, endISO:a.endISO }));
       return { ok:true, data };
     } catch(e){
-      log("[TOOL][book_appointment] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data };
+      const status = e?.response?.status;
+      const msg = e?.response?.data?.error || e?.response?.data?.message || e?.message;
+      log("[TOOL][book_appointment] fail:", status, msg?.slice?.(0,160));
+      return { ok:false, status: status||0, error:"CREATE_FAILED", body:e.response?.data };
     }
   },
   async cancel_appointment(args){
@@ -384,13 +434,16 @@ const Tools = {
   }
 };
 
-/* ===== Turn runner — single-flight with tool execution + memory ===== */
+/* ===== Turn runner — single-flight with tool execution + memory + dedupe ===== */
 async function runTurn(ws, baseMessages){
   if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
 
   try {
-    let messages = baseMessages.slice();
+    let messages = [
+      ...baseMessages,
+      scratchpadMessage(ws) // inject known slots every turn
+    ];
 
     for (let hops=0; hops<6; hops++){
       log("[LLM] hop", hops, "msgs:", messages.length);
@@ -399,14 +452,13 @@ async function runTurn(ws, baseMessages){
       const text = (assistantMsg.content || "").trim();
       const calls = assistantMsg.tool_calls || [];
 
-      // Speak and memorize assistant speech
       if (text) {
-        log("[LLM] say:", text.slice(0, 120));
+        log("[LLM] say:", text.slice(0, 140));
         await speakULaw(ws, text);
         ws.__mem.push({ role:"assistant", content:text });
       }
 
-      // Critical: append assistant message BEFORE any tool messages
+      // store assistant message BEFORE tool messages
       messages = [...messages, assistantMsg];
 
       if (!calls?.length) {
@@ -414,7 +466,6 @@ async function runTurn(ws, baseMessages){
         return;
       }
 
-      // Execute tool calls in-order, de-dupe by tool_call id
       const seenIds = new Set();
       for (const tc of calls){
         if (!tc?.id || seenIds.has(tc.id)) continue;
@@ -426,16 +477,38 @@ async function runTurn(ws, baseMessages){
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-        // Small booking guard to avoid obvious backend 400s
-        if (name === "book_appointment") {
-          args.meeting_type = args.meeting_type ?? "";
-          args.location     = args.location     ?? "";
+        // dedupe availability/booking by pinned window
+        let windowKey = "";
+        if (args?.startISO && args?.endISO) {
+          windowKey = `${args.startISO}|${args.endISO}`;
         }
 
-        log("[LLM→TOOL]", name, JSON.stringify(args).slice(0, 160));
+        if ((name === "read_availability" || name === "book_appointment") && windowKey){
+          if (ws.__windowFlights.has(windowKey) && name === "read_availability") {
+            log("[DEDUP] skip read_availability", windowKey);
+            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true }) });
+            messages.push({ role:"system",
+              content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not mention tools or ISO strings." });
+            continue;
+          }
+          ws.__windowFlights.add(windowKey);
+        }
+
+        if (name === "book_appointment") {
+          args.meeting_type = args.meeting_type ?? ws.__slots.meeting_type ?? "";
+          args.location     = args.location     ?? ws.__slots.location ?? "";
+          args.name  = args.name  ?? ws.__slots.name  ?? "";
+          args.phone = args.phone ?? ws.__slots.phone ?? "";
+          args.service = args.service ?? ws.__slots.service ?? "";
+        }
+
+        log("[LLM→TOOL]", name, JSON.stringify(args).slice(0, 180));
         const impl = Tools[name];
         const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
         log("[TOOL→LLM]", name, result?.ok ? "ok" : "fail");
+
+        // if booking succeeded, pin slots to prevent re-asks
+        if (name === "book_appointment" && result?.ok) ws.__lastBooked = { startISO: args.startISO, endISO: args.endISO };
 
         messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
         messages.push({ role:"system",
@@ -463,6 +536,9 @@ wss.on("connection", (ws)=>{
   ws.__turnQueue = null;
   ws.__ttsQ = Promise.resolve();
   ws.__mem = []; // rolling transcript memory
+  ws.__slots = { name:"", phone:"", service:"", meeting_type:"", location:"", notes:"" };
+  ws.__windowFlights = new Set();
+  ws.__lastBooked = null;
 
   const flush = ()=>{
     if (!pending.length || !dg || dg.readyState !== WebSocket.OPEN) return;
@@ -478,19 +554,23 @@ wss.on("connection", (ws)=>{
       const cp = msg.start?.customParameters || {};
       ws.__from    = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
+      ws.__slots.phone = normalizePhone(ws.__from) || ws.__slots.phone;
       log("[CALL] start", ws.__callSid);
 
       ws.__prompt = await getPrompt();
       const boot = [
         ...systemMessages(ws.__prompt),
+        scratchpadMessage(ws),
         ...ws.__mem.slice(-12),
         { role:"user", content:"<CALL_START>" }
       ];
       await runTurn(ws, boot);
 
       dg = newDeepgram(async (text)=>{
+        extractSlots(ws, text);
         const base = [
           ...systemMessages(ws.__prompt),
+          scratchpadMessage(ws),
           ...ws.__mem.slice(-12),
           { role:"user", content: text }
         ];
