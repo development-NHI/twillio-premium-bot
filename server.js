@@ -1,7 +1,7 @@
-/* server.js — Prompt-driven voice agent (transport + thin tools only)
-   - Streams audio, calls the model, executes tool HTTP calls verbatim
-   - No scheduling logic in JS. All rules live in the prompt
-   - μ-law passthrough: Twilio ⇄ Deepgram; ElevenLabs TTS → Twilio
+/* server.js — Prompt-driven voice agent (transport only)
+   - Model decides everything via tools; JS executes verbatim
+   - μ-law passthrough: Twilio → Deepgram, ElevenLabs TTS → Twilio
+   - Robustness: singleton WS, serialized TTS, single-flight LLM, slim deps
 */
 
 import express from "express";
@@ -41,21 +41,18 @@ const URLS = {
 const PRE_CONNECT_GREETING = process.env.PRE_CONNECT_GREETING || "";
 const RENDER_PROMPT        = process.env.RENDER_PROMPT || "";
 
-/* ===== Minimal helpers ===== */
+/* ===== Minimal utils ===== */
+const DEBUG = (process.env.DEBUG || "true") === "true";
+const log = (...a)=>{ if (DEBUG) console.log(...a); };
 function rid(){ return Math.random().toString(36).slice(2,8); }
-async function httpPost(url, data, cfg={}) {
-  return axios.post(url, data, cfg);
-}
-async function httpGet(url, cfg={}) {
-  return axios.get(url, cfg);
-}
+async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
+async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
 function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;" }[c])); }
 
 /* ===== App / TwiML ===== */
 const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
 app.use(bodyParser.json());
-
 app.get("/", (_req,res)=>res.status(200).send("OK"));
 app.get("/healthz", (_req,res)=>res.status(200).send("ok"));
 
@@ -88,49 +85,68 @@ app.post("/handoff", (_req,res)=>{
   `.trim());
 });
 
-const server = app.listen(PORT, ()=> console.log(`[INIT] ${PORT}`));
+const server = app.listen(PORT, ()=> log(`[INIT] ${PORT}`));
 
-/* ===== WS server (singleton to avoid redeclare on hot reload) ===== */
+/* ===== Singleton WS ===== */
 let wss = globalThis.__wss_singleton;
 if (!wss) {
   wss = new WebSocketServer({ server, perMessageDeflate:false });
   globalThis.__wss_singleton = wss;
 }
 
-/* ===== Deepgram client (μ-law passthrough) ===== */
+/* ===== Deepgram: single connection per call ===== */
 function newDeepgram(onFinal){
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true";
   const dg = new WebSocket(url, { headers:{ Authorization:`Token ${DEEPGRAM_API_KEY}` }, perMessageDeflate:false });
+  dg.on("open", ()=> log("[DG] open"));
+  dg.on("close", ()=> log("[DG] close"));
+  dg.on("error", e=> log("[DG] error", e?.message||e));
   dg.on("message", buf=>{
     try {
       const ev = JSON.parse(buf.toString());
-      const txt = ev?.channel?.alternatives?.[0]?.transcript?.trim() || "";
-      if (txt && (ev.is_final || ev.speech_final)) onFinal(txt);
+      const t = ev?.channel?.alternatives?.[0]?.transcript?.trim();
+      if (t && (ev.is_final || ev.speech_final)) onFinal(t);
     } catch {}
   });
   return dg;
 }
 
-/* ===== ElevenLabs TTS → Twilio media frames ===== */
+/* ===== ElevenLabs TTS: serialized to avoid overlap ===== */
 function cleanTTS(s=""){
-  return String(s).replace(/`{3}[\s\S]*?`{3}/g,"").replace(/\[(.*?)\]\((.*?)\)/g,"$1").replace(/\s{2,}/g," ").trim();
+  return String(s)
+    .replace(/```[\s\S]*?```/g,"")
+    .replace(/\[(.*?)\]\((.*?)\)/g,"$1")
+    .replace(/\s{2,}/g," ")
+    .trim();
 }
 async function speakULaw(ws, text){
   if (!text || !ws.__streamSid) return;
   const clean = cleanTTS(text);
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
-  const resp = await httpPost(url, { text: clean }, { headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true }, responseType:"stream", timeout:20000 });
-  await new Promise((resolve,reject)=>{
-    resp.data.on("data", chunk=>{
-      if (ws.readyState !== WebSocket.OPEN) return;
-      ws.send(JSON.stringify({ event:"media", streamSid:ws.__streamSid, media:{ payload: Buffer.from(chunk).toString("base64") } }));
+  // Serialize: queue utterances; Twilio hates overlap
+  ws.__ttsQ = ws.__ttsQ || Promise.resolve();
+  ws.__ttsQ = ws.__ttsQ.then(async ()=>{
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+    const resp = await httpPost(url, { text: clean }, {
+      headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true },
+      responseType:"stream", timeout:20000
     });
-    resp.data.on("end", resolve);
-    resp.data.on("error", reject);
-  });
+    await new Promise((resolve,reject)=>{
+      resp.data.on("data", chunk=>{
+        if (ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({
+          event:"media",
+          streamSid: ws.__streamSid,
+          media:{ payload: Buffer.from(chunk).toString("base64") }
+        }));
+      });
+      resp.data.on("end", resolve);
+      resp.data.on("error", reject);
+    });
+  }).catch(()=>{ /* swallow per-utterance errors */ });
+  return ws.__ttsQ;
 }
 
-/* ===== LLM with tools (model decides everything) ===== */
+/* ===== LLM with tools ===== */
 const toolSchema = [
   { type:"function", function:{ name:"read_availability",
     description:"Read calendar availability. Pass through exactly what you intend.",
@@ -173,11 +189,13 @@ const toolSchema = [
 
 async function openaiChat(messages, opts={}){
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", ...opts };
-  const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, { headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout:30000 });
+  const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
+    headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout:30000
+  });
   return data?.choices?.[0] || {};
 }
 
-/* ===== Prompt sourcing ===== */
+/* ===== Prompt sourcing (prompt owns all rules) ===== */
 const FALLBACK_PROMPT = `
 [Prompt-Version: 2025-10-12T02:20Z • confirm-before-book • include-meeting-type+location • same-turn end_call • status+tool pairing • single-flight • pinned-ISO • no-tool-speech]
 
@@ -205,10 +223,9 @@ Identity and Numbers
 
 Status/Tool Pairing Contract
 - A status line MUST be followed by the matching tool call in the SAME turn.
-- After the tool result, say exactly one short outcome line, then ask one question.
-- Max one status line every 2.5 seconds.
+- After the tool result, say one short outcome line, then ask one question.
 - Single-flight: never call the same tool twice for the same ISO window; dedupe by “startISO|endISO.”
-- Never say function names, arguments, code, or ISO strings.
+- Never say function names, arguments, or ISO strings.
 
 Required Fields BEFORE any read_availability or book_appointment
 - You MUST have: service, name, phone, meeting type (in-person or virtual), and location (if in-person).
@@ -226,10 +243,6 @@ Reschedule / Cancel
 - Use find_customer_events(name, phone, days=30). If one future match, capture event_id.
 - Reschedule: verify new hour via read_availability → cancel_appointment(event_id) → book_appointment with the verified ISOs.
 - Cancel: cancel_appointment(event_id). Outcome line. Ask if they want to rebook.
-- If multiple or none, ask only the missing disambiguator.
-
-Ambiguous Times
-- If caller says “1:00” and context suggests afternoon, assume 1 PM once and confirm; otherwise ask “1 AM or 1 PM?”
 
 Transfer / End
 - If caller asks for a human, call transfer(reason, callSid) and stop.
@@ -259,41 +272,37 @@ Turn Template When Acting
 async function getPrompt(){
   if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
-    try {
-      const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 });
-      if (data?.prompt) return data.prompt;
-    } catch {}
+    try { const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 }); if (data?.prompt) return data.prompt; } catch {}
   }
   return FALLBACK_PROMPT;
 }
 
 function systemMessages(prompt){
-  const today = new Intl.DateTimeFormat("en-CA",{ timeZone:BIZ_TZ, year:"numeric", month:"2-digit", day:"2-digit" })
+  const parts = new Intl.DateTimeFormat("en-CA",{ timeZone:BIZ_TZ, year:"numeric", month:"2-digit", day:"2-digit" })
     .formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value,a),{});
-  const iso = `${today.year}-${today.month}-${today.day}`;
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
   return [
-    { role:"system", content:`Today is ${iso}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
+    { role:"system", content:`Today is ${today}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
     { role:"system", content: prompt }
   ];
 }
 
-/* ===== Thin tool implementations (pass-through) ===== */
+/* ===== Thin tools (pure pass-through) ===== */
 const Tools = {
   async read_availability(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING" };
-    const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, ...args, timezone:BIZ_TZ };
-    try { const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 }); return { ok:true, data }; }
+    try { const { data } = await httpPost(URLS.CAL_READ, { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args }, { timeout:12000 }); return { ok:true, data }; }
     catch(e){ return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data }; }
   },
   async book_appointment(args){
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
-    const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args };
-    try { const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 }); return { ok:true, data }; }
+    try { const { data } = await httpPost(URLS.CAL_CREATE, { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args }, { timeout:12000 }); return { ok:true, data }; }
     catch(e){ return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data }; }
   },
   async cancel_appointment(args){
     if (!URLS.CAL_DELETE) return { ok:false, error:"CAL_DELETE_URL_MISSING" };
-    try { const { data, status } = await httpPost(URLS.CAL_DELETE, { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:12000 });
+    try {
+      const { data, status } = await httpPost(URLS.CAL_DELETE, { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:12000 });
       const ok = (status>=200&&status<300) || data?.ok || data?.deleted || data?.cancelled;
       return { ok: !!ok, data };
     } catch(e){ return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data }; }
@@ -333,29 +342,48 @@ const Tools = {
   }
 };
 
-/* ===== Tool loop: speak any assistant text, run tools verbatim, feed results back ===== */
+/* ===== Turn runner — single-flight with tool execution ===== */
 async function runTurn(ws, baseMessages){
-  let messages = baseMessages.slice();
-  for (let hops=0; hops<6; hops++){
-    const choice = await openaiChat(messages);
-    const msg = choice?.message || {};
-    const said = (msg.content||"").trim();
+  if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
+  ws.__llmBusy = true;
 
-    if (said) await speakULaw(ws, said);   // model decides what to say
+  try {
+    let messages = baseMessages.slice();
+    const seen = new Set(); // de-dupe same tool+args in one turn
 
-    const calls = msg.tool_calls || [];
-    if (!calls.length) return;             // nothing to execute
+    for (let hops=0; hops<6; hops++){
+      const choice = await openaiChat(messages);
+      const msg = choice?.message || {};
+      const text = (msg.content||"").trim();
+      const calls = msg.tool_calls || [];
 
-    for (const tc of calls){
-      const name = tc.function?.name || "";
-      let args = {};
-      try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
-      if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+      if (text) await speakULaw(ws, text);
+      if (!calls.length) return;
 
-      const impl = Tools[name];
-      const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
-      messages = [...messages, { role:"assistant", content: said }, { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }];
+      for (const tc of calls){
+        const name = tc.function?.name || "";
+        let args = {};
+        try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+
+        if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
+
+        const key = `${name}|${JSON.stringify(args)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const impl = Tools[name];
+        const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
+
+        messages = [
+          ...messages,
+          text ? { role:"assistant", content:text } : null,
+          { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) }
+        ].filter(Boolean);
+      }
     }
+  } finally {
+    ws.__llmBusy = false;
+    if (ws.__turnQueue) { const q = ws.__turnQueue; ws.__turnQueue = null; runTurn(ws, q); }
   }
 }
 
@@ -366,11 +394,13 @@ wss.on("connection", (ws)=>{
   const BATCH = 6;
   let timer = null;
 
-  ws.__mem = [];
   ws.__streamSid = "";
   ws.__callSid = "";
   ws.__from = "";
   ws.__prompt = "";
+  ws.__llmBusy = false;
+  ws.__turnQueue = null;
+  ws.__ttsQ = Promise.resolve();
 
   const flush = ()=>{
     if (!pending.length || !dg || dg.readyState !== WebSocket.OPEN) return;
@@ -379,18 +409,18 @@ wss.on("connection", (ws)=>{
   };
 
   ws.on("message", async raw=>{
-    let msg; try{ msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.event === "start"){
       ws.__streamSid = msg.start?.streamSid || "";
       const cp = msg.start?.customParameters || {};
       ws.__from    = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
+      log("[CALL] start", ws.__callSid);
 
       ws.__prompt = await getPrompt();
       const boot = [
         ...systemMessages(ws.__prompt),
-        ...ws.__mem.slice(-12),
         { role:"user", content:"<CALL_START>" }
       ];
       await runTurn(ws, boot);
@@ -398,11 +428,9 @@ wss.on("connection", (ws)=>{
       dg = newDeepgram(async (text)=>{
         const base = [
           ...systemMessages(ws.__prompt),
-          ...ws.__mem.slice(-12),
           { role:"user", content: text }
         ];
         await runTurn(ws, base);
-        ws.__mem.push({ role:"user", content:text });
       });
 
       return;
