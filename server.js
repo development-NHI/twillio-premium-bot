@@ -301,8 +301,8 @@ const Tools = {
         intent: "READ",
         biz: DASH_BIZ,
         source: DASH_SRC,
-        timezone: BIZ_TZ,   // some backends expect lowercase
-        Timezone: BIZ_TZ,   // some expect uppercase
+        timezone: BIZ_TZ,
+        Timezone: BIZ_TZ,
         window: windowObj,
         contact_name: name,
         contact_phone: phone
@@ -372,27 +372,32 @@ const Tools = {
   }
 };
 
-/* ===== Turn runner — single-flight with tool execution + memory + outcome nudge ===== */
+/* ===== Turn runner — single-flight with tool execution + memory ===== */
 async function runTurn(ws, baseMessages){
   if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
 
   try {
     let messages = baseMessages.slice();
-    const seen = new Set();
 
     for (let hops=0; hops<6; hops++){
       const choice = await openaiChat(messages);
-      const msg = choice?.message || {};
-      const text = (msg.content||"").trim();
-      const calls = msg.tool_calls || [];
+      const assistantMsg = choice?.message || {};
+      const text = (assistantMsg.content || "").trim();
+      const calls = assistantMsg.tool_calls || [];
 
+      // speak and memorize assistant speech
       if (text) {
         await speakULaw(ws, text);
         ws.__mem.push({ role:"assistant", content:text });
       }
+
+      // **** critical pairing: append assistant message BEFORE any tool messages ****
+      messages = [...messages, assistantMsg];
+
       if (!calls.length) return;
 
+      const seen = new Set();
       for (const tc of calls){
         const name = tc.function?.name || "";
         let args = {};
@@ -407,12 +412,9 @@ async function runTurn(ws, baseMessages){
         const impl = Tools[name];
         const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
 
-        messages = [
-          ...messages,
-          { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) },
-          { role:"system",
-            content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not repeat the greeting. Do not mention tools or ISO strings." }
-        ];
+        messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
+        messages.push({ role:"system",
+          content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not repeat the greeting. Do not mention tools or ISO strings." });
       }
     }
   } finally {
