@@ -84,7 +84,7 @@ app.post("/handoff", (_req,res)=>{
   `.trim());
 });
 
-const server = app.listen(PORT, ()=> log(`[INIT] ${PORT}`));
+const server = app.listen(PORT, ()=> log("[INIT]", PORT));
 
 /* ===== Singleton WS ===== */
 let wss = globalThis.__wss_singleton;
@@ -99,7 +99,7 @@ function newDeepgram(onFinal){
   const dg = new WebSocket(url, { headers:{ Authorization:`Token ${DEEPGRAM_API_KEY}` }, perMessageDeflate:false });
   dg.on("open", ()=> log("[DG] open"));
   dg.on("close", ()=> log("[DG] close"));
-  dg.on("error", e=> log("[DG] error", e?.message||e));
+  dg.on("error", e=> log("[DG] error:", e?.message||e));
   dg.on("message", buf=>{
     try {
       const ev = JSON.parse(buf.toString());
@@ -193,7 +193,7 @@ async function openaiChat(messages, opts={}){
   return data?.choices?.[0] || {};
 }
 
-/* ===== Prompt sourcing (prompt owns all rules) ===== */
+/* ===== Prompt sourcing ===== */
 const FALLBACK_PROMPT = `
 [Prompt-Version: 2025-10-12T02:20Z • confirm-before-book • include-meeting-type+location • same-turn end_call • status+tool pairing • single-flight • pinned-ISO • no-tool-speech]
 
@@ -308,18 +308,26 @@ const Tools = {
         contact_phone: phone
       };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
+      log("[TOOL][read_availability] ok");
       return { ok:true, data };
     } catch(e){
+      log("[TOOL][read_availability] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
       return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data };
     }
   },
   async book_appointment(args){
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     try {
-      const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...args };
+      // Light guard to avoid backend 400s if the model omitted fields
+      const a = { ...args };
+      a.meeting_type = a.meeting_type || "";
+      a.location     = a.location     || "";
+      const payload = { biz:DASH_BIZ, source:DASH_SRC, Timezone:BIZ_TZ, ...a };
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
+      log("[TOOL][book_appointment] ok");
       return { ok:true, data };
     } catch(e){
+      log("[TOOL][book_appointment] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
       return { ok:false, status:e.response?.status||0, error:"CREATE_FAILED", body:e.response?.data };
     }
   },
@@ -328,8 +336,10 @@ const Tools = {
     try {
       const { data, status } = await httpPost(URLS.CAL_DELETE, { intent:"DELETE", biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:12000 });
       const ok = (status>=200&&status<300) || data?.ok || data?.deleted || data?.cancelled;
+      log("[TOOL][cancel_appointment]", ok?"ok":"not-ok");
       return { ok: !!ok, data };
     } catch(e){
+      log("[TOOL][cancel_appointment] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
       return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
     }
   },
@@ -338,18 +348,20 @@ const Tools = {
     try {
       const payload = { intent:"READ", biz:DASH_BIZ, source:DASH_SRC, timezone:BIZ_TZ, ...args };
       const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
+      log("[TOOL][find_customer_events] ok");
       return { ok:true, events: data?.events||[], data };
     } catch(e){
+      log("[TOOL][find_customer_events] fail:", e?.response?.status, e?.response?.data?.error || e?.message);
       return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
     }
   },
   async lead_upsert(args){
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
-    try { const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); return { ok:true, data }; }
-    catch(e){ return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data }; }
+    try { const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); log("[TOOL][lead_upsert] ok"); return { ok:true, data }; }
+    catch(e){ log("[TOOL][lead_upsert] fail:", e?.response?.status, e?.response?.data?.error || e?.message); return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data }; }
   },
   async faq(args){
-    try { if (URLS.FAQ_LOG) await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); } catch {}
+    try { if (URLS.FAQ_LOG) { await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); log("[TOOL][faq] ok"); } } catch(e){ log("[TOOL][faq] fail:", e?.message); }
     return { ok:true };
   },
   async transfer(args){
@@ -359,16 +371,16 @@ const Tools = {
     const handoffUrl = `https://${host}/handoff`;
     const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
     const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
-    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:10000 }); return { ok:true }; }
-    catch(e){ return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data }; }
+    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:10000 }); log("[TOOL][transfer] ok"); return { ok:true }; }
+    catch(e){ log("[TOOL][transfer] fail:", e?.response?.status, e?.response?.data?.message || e?.message); return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data }; }
   },
   async end_call(args){
     const callSid = args.callSid || "";
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { ok:false, error:"HANGUP_CONFIG_MISSING" };
     const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
     const params = new URLSearchParams({ Status:"completed" });
-    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:8000 }); return { ok:true }; }
-    catch(e){ return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data }; }
+    try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:8000 }); log("[TOOL][end_call] ok"); return { ok:true }; }
+    catch(e){ log("[TOOL][end_call] fail:", e?.response?.status, e?.response?.data?.message || e?.message); return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data }; }
   }
 };
 
@@ -381,36 +393,49 @@ async function runTurn(ws, baseMessages){
     let messages = baseMessages.slice();
 
     for (let hops=0; hops<6; hops++){
+      log("[LLM] hop", hops, "msgs:", messages.length);
       const choice = await openaiChat(messages);
       const assistantMsg = choice?.message || {};
       const text = (assistantMsg.content || "").trim();
       const calls = assistantMsg.tool_calls || [];
 
-      // speak and memorize assistant speech
+      // Speak and memorize assistant speech
       if (text) {
+        log("[LLM] say:", text.slice(0, 120));
         await speakULaw(ws, text);
         ws.__mem.push({ role:"assistant", content:text });
       }
 
-      // **** critical pairing: append assistant message BEFORE any tool messages ****
+      // Critical: append assistant message BEFORE any tool messages
       messages = [...messages, assistantMsg];
 
-      if (!calls.length) return;
+      if (!calls?.length) {
+        log("[LLM] no tool calls");
+        return;
+      }
 
-      const seen = new Set();
+      // Execute tool calls in-order, de-dupe by tool_call id
+      const seenIds = new Set();
       for (const tc of calls){
+        if (!tc?.id || seenIds.has(tc.id)) continue;
+        seenIds.add(tc.id);
+
         const name = tc.function?.name || "";
         let args = {};
         try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
-        const key = `${name}|${JSON.stringify(args)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
+        // Small booking guard to avoid obvious backend 400s
+        if (name === "book_appointment") {
+          args.meeting_type = args.meeting_type ?? "";
+          args.location     = args.location     ?? "";
+        }
 
+        log("[LLM→TOOL]", name, JSON.stringify(args).slice(0, 160));
         const impl = Tools[name];
         const result = impl ? await impl(args) : { ok:false, error:"TOOL_NOT_FOUND" };
+        log("[TOOL→LLM]", name, result?.ok ? "ok" : "fail");
 
         messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
         messages.push({ role:"system",
