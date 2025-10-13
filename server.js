@@ -51,7 +51,7 @@ function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;
 /* ===== App / TwiML ===== */
 const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
-app.use(bodyParser.json()));
+app.use(bodyParser.json());
 app.get("/", (_req,res)=>res.status(200).send("OK"));
 app.get("/healthz", (_req,res)=>res.status(200).send("ok"));
 
@@ -612,3 +612,4 @@ wss.on("connection", (ws)=>{
   ws.on("close", ()=> { try { dg?.close(); } catch {} });
   ws.on("error", ()=> { try { dg?.close(); } catch {} });
 });
+
