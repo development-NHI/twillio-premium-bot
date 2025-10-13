@@ -46,12 +46,12 @@ const DEBUG = (process.env.DEBUG || "true") === "true";
 const log = (...a)=>{ if (DEBUG) console.log(...a); };
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
-function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;" }[c])); }
+function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'amp','"':'&quot;',"'":"&apos;" }[c])); }
 
 /* ===== App / TwiML ===== */
 const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
-app.use(bodyParser.json());
+app.use(bodyParser.json()));
 app.get("/", (_req,res)=>res.status(200).send("OK"));
 app.get("/healthz", (_req,res)=>res.status(200).send("ok"));
 
@@ -157,6 +157,7 @@ const toolSchema = [
     parameters:{ type:"object", properties:{
       name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
       startISO:{type:"string"}, endISO:{type:"string"},
+      title:{type:"string"},               // <-- added
       notes:{type:"string"}, meeting_type:{type:"string"}, location:{type:"string"}
     }, required:["service","startISO","endISO"] } } },
   { type:"function", function:{ name:"cancel_appointment",
@@ -252,7 +253,7 @@ Latency / Failure
 
 Tools you may call
 - read_availability(dateISO?, startISO?, endISO?, name?, phone?)
-- book_appointment(name, phone, service, startISO, endISO, notes?, meeting_type?, location?)
+- book_appointment(name, phone, service, startISO, endISO, title?, notes?, meeting_type?, location?)
 - cancel_appointment(event_id?, name?, phone?, dateISO?)
 - find_customer_events(name?, phone?, days?)
 - lead_upsert(name, phone, intent?, notes?)
@@ -379,11 +380,11 @@ const Tools = {
         source: DASH_SRC,
         Timezone: BIZ_TZ,
         timezone: BIZ_TZ,
-        Start_Time_Local: startLocal,   // expected by some backends
-        End_Time_Local: endLocal,       // expected by some backends
-        start_local: startLocal,        // alt keys for others
+        Start_Time_Local: startLocal,
+        End_Time_Local: endLocal,
+        start_local: startLocal,
         end_local: endLocal,
-        ...a
+        ...a                     // passes title through untouched if provided
       };
 
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
