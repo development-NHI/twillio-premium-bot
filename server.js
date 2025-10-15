@@ -124,7 +124,7 @@ function cleanTTS(s=""){
     .trim();
 }
 async function speakULaw(ws, text){
-  if (!text || !ws.__streamSid) return;
+  if (!text || !ws._streamSid) return;
   const clean = cleanTTS(text);
   ws._ttsQ = ws._ttsQ || Promise.resolve();
   ws._ttsQ = ws._ttsQ.then(async ()=>{
@@ -138,7 +138,7 @@ async function speakULaw(ws, text){
         if (ws.readyState !== WebSocket.OPEN) return;
         ws.send(JSON.stringify({
           event:"media",
-          streamSid: ws.__streamSid,
+          streamSid: ws._streamSid,
           media:{ payload: Buffer.from(chunk).toString("base64") }
         }));
       });
@@ -629,7 +629,7 @@ async function runTurn(ws, baseMessages){
       messages = [...messages, assistantMsg];
 
       if (!calls?.length) {
-        log("[LLM] no tool calls");
+        log("[LLM] no tool calls]");
         return;
       }
 
@@ -766,4 +766,3 @@ wss.on("connection", (ws)=>{
 });
 
 log(`[READY] Voice agent with ReceptorX integration on port ${PORT}`);
-
