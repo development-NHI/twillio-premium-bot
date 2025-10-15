@@ -188,7 +188,7 @@ const toolSchema = [
     parameters:{ type:"object", properties:{ reason:{type:"string"}, callSid:{type:"string"} }, required:[] } } },
   { type:"function", function:{ name:"end_call",
     description:"End the call.",
-    parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] } }
+    parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] } } }
 ];
 
 async function openaiChat(messages, opts={}){
