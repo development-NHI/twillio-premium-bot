@@ -46,9 +46,7 @@ const DEBUG = (process.env.DEBUG || "true") === "true";
 const log = (...a)=>{ if (DEBUG) console.log(...a); };
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
-function escapeXml(s=""){
-  return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":"&apos;" }[c]));
-}
+function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'amp','"':'&quot;',"'":"&apos;" }[c])); }
 
 /* ===== App / TwiML ===== */
 const app = express();
@@ -60,8 +58,8 @@ app.get("/healthz", (_req,res)=>res.status(200).send("ok"));
 app.post("/twiml", (req,res)=>{
   const from = req.body?.From || "";
   const callSid = req.body?.CallSid || "";
-  const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-  const say = PRE_CONNECT_GREETING ? `<Say>${escapeXml(PRE_CONNECT_GREETING)}</Say>` : "";
+  const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
+  const say = PRE_CONNECT_GREETING ? <Say>${escapeXml(PRE_CONNECT_GREETING)}</Say> : "";
   res.type("text/xml").send(`
     <Response>
       ${say}
@@ -98,7 +96,7 @@ if (!wss) {
 /* ===== Deepgram: single connection per call ===== */
 function newDeepgram(onFinal){
   const url = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&model=nova-2-phonecall&interim_results=true&smart_format=true";
-  const dg = new WebSocket(url, { headers:{ Authorization:`Token ${DEEPGRAM_API_KEY}` }, perMessageDeflate:false });
+  const dg = new WebSocket(url, { headers:{ Authorization:Token ${DEEPGRAM_API_KEY} }, perMessageDeflate:false });
   dg.on("open", ()=> log("[DG] open"));
   dg.on("close", ()=> log("[DG] close"));
   dg.on("error", e=> log("[DG] error:", e?.message||e));
@@ -115,17 +113,17 @@ function newDeepgram(onFinal){
 /* ===== ElevenLabs TTS: serialized to avoid overlap ===== */
 function cleanTTS(s=""){
   return String(s)
-    .replace(/```[\s\S]*?```/g,"")
-    .replace(/\[(.*?)\]\((.*?)\)/g,"$1")
+    .replace(/[\s\S]*?/g,"")
+    .replace(/\[(.?)\]\((.?)\)/g,"$1")
     .replace(/\s{2,}/g," ")
     .trim();
 }
 async function speakULaw(ws, text){
   if (!text || !ws.__streamSid) return;
   const clean = cleanTTS(text);
-  ws.__ttsQ = ws.__ttsQ || Promise.resolve();
-  ws.__ttsQ = ws.__ttsQ.then(async ()=>{
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000`;
+  ws._ttsQ = ws._ttsQ || Promise.resolve();
+  ws._ttsQ = ws._ttsQ.then(async ()=>{
+    const url = https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?optimize_streaming_latency=3&output_format=ulaw_8000;
     const resp = await httpPost(url, { text: clean }, {
       headers:{ "xi-api-key":ELEVENLABS_API_KEY, acceptStream:true },
       responseType:"stream", timeout:20000
@@ -159,9 +157,9 @@ const toolSchema = [
     parameters:{ type:"object", properties:{
       name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
       startISO:{type:"string"}, endISO:{type:"string"},
-      title:{type:"string"},
+      title:{type:"string"},               // <-- added
       notes:{type:"string"}, meeting_type:{type:"string"}, location:{type:"string"}
-    }, required:["service","startISO","endISO","title"] } } },
+    }, required:["service","startISO","endISO"] } } },
   { type:"function", function:{ name:"cancel_appointment",
     description:"Cancel an event. Prefer event_id.",
     parameters:{ type:"object", properties:{
@@ -191,99 +189,89 @@ const toolSchema = [
 async function openaiChat(messages, opts={}){
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", ...opts };
   const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
-    headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout:30000
+    headers:{ Authorization:Bearer ${OPENAI_API_KEY} }, timeout:30000
   });
   return data?.choices?.[0] || {};
 }
 
 /* ===== Prompt sourcing ===== */
 const FALLBACK_PROMPT = `
-[Prompt-Version: 2025-10-15T20:45Z — Single-pass capture • End-only confirm • Title must include Name • Default notes • No office address requests]
+[Prompt-Version: 2025-10-12T02:20Z • confirm-before-book • include-meeting-type+location • same-turn end_call • status+tool pairing • single-flight • pinned-ISO • no-tool-speech]
 
-You are the AI phone receptionist for \${DASH_BIZ} (VictoryTeamSells.com) — Maryland real estate.
-Timezone: \${BIZ_TZ}. Hours: Mon–Fri 09:00–17:00 local.
+You are the AI phone receptionist for ${DASH_BIZ} (VictoryTeamSells.com) — Maryland real estate.
+Timezone: ${BIZ_TZ}. Hours: Mon–Fri 09:00–17:00.
 
-Brand voice
-- Confident, natural, brief. No robotic repeats. Short confirmations only.
+Brand
+- Friendly, concise, confident, local.
+- Office: 1316 E Churchville Rd, Bel Air MD 21014. Main: 833-888-1754.
+- Services: buyer consults and tours; seller/listing consults (mention 1.75% if asked); investors; general Q&A.
 
-Greeting
-- “Thanks for calling The Victory Team. How can I help today?”
+Opening
+- Say: “Thanks for calling The Victory Team. How can I help today?”
+
+Core Interaction Rules
+- Prompt-driven only. Transport executes exactly the tool calls you request.
+- One question at a time. ≤15 words unless reading back details.
+- Respect barge-in. No repeats. Check your scratchpad before asking.
 
 Scratchpad
-- Name, Phone (+1XXXXXXXXXX normalized), Service, Meeting Type (in-person|virtual), Location, Notes.
-- Always check the scratchpad first. Never re-ask a captured field unless the caller changes it.
+- Name, Phone (+1XXXXXXXXXX normalized), Role, Service, Property/MLS, Date, Time, Meeting Type, Location, Notes.
 
-Conversation policy
-- One question at a time, ≤15 words.
-- Single-pass capture: gather missing REQUIRED fields with minimal questions, then move on.
-- No mid-flow confirmations; confirm once at the very end only.
-- If caller says “this number,” use caller ID. Never read full numbers. If pressed, confirm only last two digits.
+Identity and Numbers
+- Use caller ID if they say “this number.” Never speak full phone numbers. If pressed, confirm only the last two digits.
 
-Booking preconditions (required before any tool)
-- Must have: service, name, phone, meeting_type, and location if in-person.
-- Location “office” needs no address. Do NOT ask for the office address.
-- If meeting is virtual, no platform selection is required.
+Status/Tool Pairing Contract
+- A status line MUST be followed by the matching tool call in the SAME turn.
+- After the tool result, say one short outcome line, then ask one question.
+- Single-flight: never call the same tool twice for the same ISO window; dedupe by “startISO|endISO.”
+- Never say function names, arguments, or ISO strings.
 
-Calendar title rule (must follow)
-- Title = “{Type} — {Name}”.
-  - Type ∈ {Buyer Consultation, Seller Consultation, Home Tour, Investor Consultation, Consultation}.
-  - Name is the caller’s name. Never use “Voice Customer”.
+Required Fields BEFORE any read_availability or book_appointment
+- You MUST have: service, name, phone, meeting type (in-person or virtual), and location (if in-person).
+- If any are missing, ask exactly one question to get the next missing item.
 
-Notes rule
-- Never ask for notes unless the caller volunteers details.
-- If none provided, synthesize concise default notes from known fields:
-  “Service: {service}. Type: {meeting_type}. Location: {location}. Caller: {Name}. Phone: ends {last2}.”
+Confirm-Then-Book (strict)
+1) Propose the time and get an explicit “yes.”
+2) Encode the exact local hour in ${BIZ_TZ} with correct offset, e.g., 2025-10-13T15:00:00-04:00 to 16:00:00-04:00.
+3) Call read_availability(startISO,endISO) in the SAME turn.
+4) If free → outcome “That hour is open.” Then call book_appointment in the SAME turn with the SAME startISO/endISO. Include meeting_type and location, and copy them into Notes.
+5) If busy or booking fails → outcome line (≤12 words). Offer 2–3 nearby in-hours options and ask one question.
+6) After booking, confirm weekday + full date, time, meeting type, location, and notes. Then ask if they need anything else.
 
-Confirm-then-book
-1) Ask for the caller’s preferred date/time once.
-2) Say one short status, then call read_availability(startISO,endISO) in the SAME turn.
-3) If free → outcome “That time is open.” Then call book_appointment in the SAME turn with SAME ISOs, including name, phone, service, meeting_type, location, **title**, **notes**.
-4) If busy/fails → short outcome. Offer 2–3 nearby in-hours options. Ask one question.
+Reschedule / Cancel
+- Use find_customer_events(name, phone, days=30). If one future match, capture event_id.
+- Reschedule: verify new hour via read_availability → cancel_appointment(event_id) → book_appointment with the verified ISOs.
+- Cancel: cancel_appointment(event_id). Outcome line. Ask if they want to rebook.
 
-After booking (single end-confirm)
-- Read back exactly: name, weekday + full date/time, and location.
-- State: “Title set to ‘{Type} — {Name}’.” Then ask: “Anything else you need?”
+Transfer / End
+- If caller asks for a human, call transfer(reason, callSid) and stop.
+- When the caller declines more help or says goodbye, say “Thanks for calling The Victory Team. Have a great day. Goodbye.” and in the SAME TURN call end_call(callSid).
 
-Reschedule / cancel
-- find_customer_events(name, phone, days=30). If one future match, capture event_id.
-- Reschedule: verify new time via read_availability → cancel_appointment(event_id) → book_appointment with verified ISOs and same title pattern.
-- Cancel: cancel_appointment(event_id). Short outcome. Offer to rebook.
+Latency / Failure
+- If a tool will run, first say one short status line, then call the tool in the same turn.
+- If a tool fails, give a 5–10 word outcome and propose one concrete next step.
 
-Transfers / end
-- If caller asks for an agent → transfer(reason, callSid) and stop.
-- If caller says goodbye → “Thanks for calling The Victory Team. Have a great day.” → end_call(callSid) in the same turn.
+Tools you may call
+- read_availability(dateISO?, startISO?, endISO?, name?, phone?)
+- book_appointment(name, phone, service, startISO, endISO, title?, notes?, meeting_type?, location?)
+- cancel_appointment(event_id?, name?, phone?, dateISO?)
+- find_customer_events(name?, phone?, days?)
+- lead_upsert(name, phone, intent?, notes?)
+- faq(topic?, service?)
+- transfer(reason?, callSid?)
+- end_call(callSid?, reason?)
 
-Latency / failure
-- Before any tool, say one short status.
-- If a tool fails, give ≤10-word outcome and one clear next step.
-
-Status/tool pairing + single-flight
-- Status line → matching tool call in the SAME turn.
-- After tool result → one short outcome, then one question.
-- Dedupe by “startISO|endISO”. Never repeat reads for the same window.
-- Never mention tool names or ISO strings.
-
-Turn template
+Turn Template When Acting
 1) Status line (≤6 words)
 2) Tool call(s)
-3) One short outcome (≤12 words)
-4) One natural next question
+3) One short outcome line
+4) One question
 `;
-
-/* Extra guardrails injected each hop to stop re-asking and note prompts */
-const GUARDRAILS = {
-  role: "system",
-  content:
-    "Do not re-ask fields already in the scratchpad. Do not ask for notes; synthesize defaults if none were provided. Confirm only once at the end. Never request the office address."
-};
 
 async function getPrompt(){
   if (RENDER_PROMPT) return RENDER_PROMPT;
   if (URLS.PROMPT_FETCH) {
-    try {
-      const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 });
-      if (data?.prompt) return data.prompt;
-    } catch {}
+    try { const { data } = await httpGet(URLS.PROMPT_FETCH, { params:{ biz:DASH_BIZ }, timeout:8000 }); if (data?.prompt) return data.prompt; } catch {}
   }
   return FALLBACK_PROMPT;
 }
@@ -291,42 +279,42 @@ async function getPrompt(){
 function systemMessages(prompt){
   const parts = new Intl.DateTimeFormat("en-CA",{ timeZone:BIZ_TZ, year:"numeric", month:"2-digit", day:"2-digit" })
     .formatToParts(new Date()).reduce((a,x)=> (a[x.type]=x.value,a),{});
-  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  const today = ${parts.year}-${parts.month}-${parts.day};
   return [
-    { role:"system", content:`Today is ${today}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone.` },
+    { role:"system", content:Today is ${today}. Business timezone: ${BIZ_TZ}. Resolve relative dates in this timezone. },
     { role:"system", content: prompt }
   ];
 }
 
 /* ===== Local time helpers ===== */
 function toLocalYmdHm(iso, tz){
+  // returns "YYYY-MM-DD HH:mm" in tz without seconds
   const d = new Date(iso);
   const f = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year:"numeric", month:"2-digit", day:"2-digit",
     hour:"2-digit", minute:"2-digit", hour12:false
   }).formatToParts(d).reduce((a,p)=>(a[p.type]=p.value,a),{});
-  return `${f.year}-${f.month}-${f.day} ${f.hour}:${f.minute}`;
+  return ${f.year}-${f.month}-${f.day} ${f.hour}:${f.minute};
 }
 
 /* ===== Slot extractor ===== */
 function normalizePhone(s){
   if (!s) return "";
   const d = s.replace(/\D/g,"");
-  if (d.length === 10) return `+1${d}`;
-  if (d.length === 11 && d.startsWith("1")) return `+${d}`;
+  if (d.length === 10) return +1${d};
+  if (d.length === 11 && d.startsWith("1")) return +${d};
   if (d.startsWith("+")) return d;
   return "";
 }
 function extractSlots(ws, text){
   const t = String(text).toLowerCase();
-  if (/this (is )?my number|this number/.test(t) && ws.__from) ws.__slots.phone = normalizePhone(ws.__from);
+  if (/this (is )?my number|this number/.test(t) && ws._from) ws.slots.phone = normalizePhone(ws._from);
   const mPhone = text.match(/(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}/);
   if (mPhone) ws.__slots.phone = normalizePhone(mPhone[0]);
   if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws.__slots.meeting_type = "in-person";
   if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws.__slots.meeting_type = "virtual";
-  if (/\boffice\b/.test(t)) ws.__slots.location = "office";
   const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
-  if (mAddr && !ws.__slots.location && ws.__slots.meeting_type === "in-person") ws.__slots.location = mAddr[0];
+  if (mAddr && !ws._slots.location && ws.slots.meeting_type === "in-person") ws._slots.location = mAddr[0];
   const mName = text.match(/\b(?:i[' ]?m|this is|my name is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
   if (mName) ws.__slots.name = mName[1].trim();
   if (/\b(buyer|buy a home|tour)\b/.test(t)) ws.__slots.service = "buyer";
@@ -336,13 +324,13 @@ function extractSlots(ws, text){
 function scratchpadMessage(ws){
   const S = ws.__slots;
   const lines = [
-    `Scratchpad`,
-    `- Name: ${S.name||""}`,
-    `- Phone: ${S.phone||""}`,
-    `- Service: ${S.service||""}`,
-    `- Meeting Type: ${S.meeting_type||""}`,
-    `- Location: ${S.location||""}`,
-    `- Notes: ${S.notes||""}`
+    Scratchpad,
+    - Name: ${S.name||""},
+    - Phone: ${S.phone||""},
+    - Service: ${S.service||""},
+    - Meeting Type: ${S.meeting_type||""},
+    - Location: ${S.location||""},
+    - Notes: ${S.notes||""}
   ].join("\n");
   return { role:"system", content: lines };
 }
@@ -357,7 +345,7 @@ const Tools = {
       if (startISO && endISO) {
         windowObj = { start_utc: startISO, end_utc: endISO };
       } else if (dateISO) {
-        windowObj = { start_local: `${dateISO} 00:00`, end_local: `${dateISO} 23:59` };
+        windowObj = { start_local: ${dateISO} 00:00, end_local: ${dateISO} 23:59 };
       }
       const payload = {
         intent: "READ",
@@ -377,7 +365,6 @@ const Tools = {
       return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data };
     }
   },
-
   async book_appointment(args){
     if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     try {
@@ -385,24 +372,7 @@ const Tools = {
       a.meeting_type = a.meeting_type || "";
       a.location     = a.location     || "";
 
-      const nm = (a.name||"").trim();
-      const title = (a.title||"").trim();
-      const badGeneric = /voice customer|consultation with voice customer/i.test(title);
-      const nameMissing = nm.length === 0;
-      const nameNotInTitle = nm && !new RegExp(`\\b${nm.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}\\b`,'i').test(title);
-      if (!title || nameMissing || nameNotInTitle || badGeneric) {
-        log("[TOOL][book_appointment] invalid title:", title);
-        return { ok:false, status:400, error:"INVALID_TITLE",
-          body:{ message:"Title must be '{Type} — {Name}' and include caller name." } };
-      }
-
-      if (!a.notes || !String(a.notes).trim()) {
-        const last2 = (a.phone||"").replace(/\D/g,"").slice(-2) || "";
-        a.notes = `Service: ${a.service||""}. Type: ${a.meeting_type||""}. `
-                + `Location: ${a.location||""}. Caller: ${nm}.`
-                + (last2 ? ` Phone: ends ${last2}.` : "");
-      }
-
+      // Add both local-time strings and dual timezone keys for compatibility
       const startLocal = (a.startISO ? toLocalYmdHm(a.startISO, BIZ_TZ) : "");
       const endLocal   = (a.endISO   ? toLocalYmdHm(a.endISO,   BIZ_TZ) : "");
       const payload = {
@@ -414,7 +384,7 @@ const Tools = {
         End_Time_Local: endLocal,
         start_local: startLocal,
         end_local: endLocal,
-        ...a
+        ...a                     // passes title through untouched if provided
       };
 
       const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
@@ -427,7 +397,6 @@ const Tools = {
       return { ok:false, status: status||0, error:"CREATE_FAILED", body:e.response?.data };
     }
   },
-
   async cancel_appointment(args){
     if (!URLS.CAL_DELETE) return { ok:false, error:"CAL_DELETE_URL_MISSING" };
     try {
@@ -440,7 +409,6 @@ const Tools = {
       return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
     }
   },
-
   async find_customer_events(args){
     if (!URLS.CAL_READ) return { ok:false, error:"CAL_READ_URL_MISSING", events:[] };
     try {
@@ -453,34 +421,29 @@ const Tools = {
       return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
     }
   },
-
   async lead_upsert(args){
     if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_URL_MISSING" };
     try { const { data } = await httpPost(URLS.LEAD_UPSERT, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); log("[TOOL][lead_upsert] ok"); return { ok:true, data }; }
     catch(e){ log("[TOOL][lead_upsert] fail:", e?.response?.status, e?.response?.data?.error || e?.message); return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data }; }
   },
-
   async faq(args){
-    try { if (URLS.FAQ_LOG) { await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); log("[TOOL][faq] ok"); } }
-    catch(e){ log("[TOOL][faq] fail:", e?.message); }
+    try { if (URLS.FAQ_LOG) { await httpPost(URLS.FAQ_LOG, { biz:DASH_BIZ, source:DASH_SRC, ...args }, { timeout:8000 }); log("[TOOL][faq] ok"); } } catch(e){ log("[TOOL][faq] fail:", e?.message); }
     return { ok:true };
   },
-
   async transfer(args){
     const callSid = args.callSid || "";
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !OWNER_PHONE || !callSid) return { ok:false, error:"TRANSFER_CONFIG_MISSING" };
-    const host = process.env.RENDER_EXTERNAL_HOSTNAME || `localhost:${PORT}`;
-    const handoffUrl = `https://${host}/handoff`;
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
+    const host = process.env.RENDER_EXTERNAL_HOSTNAME || localhost:${PORT};
+    const handoffUrl = https://${host}/handoff;
+    const url = https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json;
     const params = new URLSearchParams({ Url: handoffUrl, Method:"POST" });
     try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:10000 }); log("[TOOL][transfer] ok"); return { ok:true }; }
     catch(e){ log("[TOOL][transfer] fail:", e?.response?.status, e?.response?.data?.message || e?.message); return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data }; }
   },
-
   async end_call(args){
     const callSid = args.callSid || "";
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { ok:false, error:"HANGUP_CONFIG_MISSING" };
-    const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
+    const url = https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json;
     const params = new URLSearchParams({ Status:"completed" });
     try { await httpPost(url, params, { auth:{ username:TWILIO_ACCOUNT_SID, password:TWILIO_AUTH_TOKEN }, headers:{ "Content-Type":"application/x-www-form-urlencoded" }, timeout:8000 }); log("[TOOL][end_call] ok"); return { ok:true }; }
     catch(e){ log("[TOOL][end_call] fail:", e?.response?.status, e?.response?.data?.message || e?.message); return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data }; }
@@ -489,14 +452,13 @@ const Tools = {
 
 /* ===== Turn runner ===== */
 async function runTurn(ws, baseMessages){
-  if (ws.__llmBusy) { ws.__turnQueue = baseMessages; return; }
+  if (ws._llmBusy) { ws._turnQueue = baseMessages; return; }
   ws.__llmBusy = true;
 
   try {
     let messages = [
       ...baseMessages,
-      scratchpadMessage(ws),
-      GUARDRAILS
+      scratchpadMessage(ws)
     ];
 
     for (let hops=0; hops<6; hops++){
@@ -531,13 +493,14 @@ async function runTurn(ws, baseMessages){
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws.__callSid || "";
 
         let windowKey = "";
-        if (args?.startISO && args?.endISO) windowKey = `${args.startISO}|${args.endISO}`;
+        if (args?.startISO && args?.endISO) windowKey = ${args.startISO}|${args.endISO};
 
         if ((name === "read_availability" || name === "book_appointment") && windowKey){
           if (ws.__windowFlights.has(windowKey) && name === "read_availability") {
             log("[DEDUP] skip read_availability", windowKey);
             messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true }) });
-            messages.push(GUARDRAILS);
+            messages.push({ role:"system",
+              content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not mention tools or ISO strings." });
             continue;
           }
           ws.__windowFlights.add(windowKey);
@@ -559,12 +522,13 @@ async function runTurn(ws, baseMessages){
         if (name === "book_appointment" && result?.ok) ws.__lastBooked = { startISO: args.startISO, endISO: args.endISO };
 
         messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
-        messages.push(GUARDRAILS);
+        messages.push({ role:"system",
+          content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not repeat the greeting. Do not mention tools or ISO strings." });
       }
     }
   } finally {
     ws.__llmBusy = false;
-    if (ws.__turnQueue) { const q = ws.__turnQueue; ws.__turnQueue = null; runTurn(ws, q); }
+    if (ws._turnQueue) { const q = ws.turnQueue; ws._turnQueue = null; runTurn(ws, q); }
   }
 }
 
@@ -601,14 +565,13 @@ wss.on("connection", (ws)=>{
       const cp = msg.start?.customParameters || {};
       ws.__from    = cp.from || "";
       ws.__callSid = cp.CallSid || cp.callSid || "";
-      ws.__slots.phone = normalizePhone(ws.__from) || ws.__slots.phone;
+      ws._slots.phone = normalizePhone(ws.from) || ws._slots.phone;
       log("[CALL] start", ws.__callSid);
 
       ws.__prompt = await getPrompt();
       const boot = [
         ...systemMessages(ws.__prompt),
         scratchpadMessage(ws),
-        GUARDRAILS,
         ...ws.__mem.slice(-12),
         { role:"user", content:"<CALL_START>" }
       ];
@@ -619,7 +582,6 @@ wss.on("connection", (ws)=>{
         const base = [
           ...systemMessages(ws.__prompt),
           scratchpadMessage(ws),
-          GUARDRAILS,
           ...ws.__mem.slice(-12),
           { role:"user", content: text }
         ];
@@ -648,5 +610,5 @@ wss.on("connection", (ws)=>{
   });
 
   ws.on("close", ()=> { try { dg?.close(); } catch {} });
-  ws.on("error", ()=> { try { dg?.close(); } catch {} });
+  ws.on("error", ()=> { try { dg?.close(); } catch {} });
 });
