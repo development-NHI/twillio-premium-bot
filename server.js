@@ -68,13 +68,13 @@ app.post("/twiml", (req,res)=>{
   res.type("text/xml").send(`
     <Response>
       ${say}
-      <Connect>
+      <Start>
         <Stream url="wss://${host}" track="both_tracks">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
-      </Connect>
+      </Start>
     </Response>
   `.trim());
 });
