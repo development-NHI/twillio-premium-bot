@@ -149,46 +149,65 @@ async function speakULaw(ws, text){
   return ws._ttsQ;
 }
 
-/* ===== LLM with tools ===== */
+/* ===== LLM with tools - EXACT SCHEMAS MATCHING PROMPT ===== */
 const toolSchema = [
   { type:"function", function:{ name:"read_availability",
-    description:"Read calendar availability. Pass through exactly what you intend.",
+    description:"Check if a time slot is available. REQUIRED: startISO and endISO in ISO format (e.g., '2025-10-16T14:00:00'). Returns: {ok, available, conflicts}",
     parameters:{ type:"object", properties:{
-      dateISO:{type:"string"}, startISO:{type:"string"}, endISO:{type:"string"},
-      name:{type:"string"}, phone:{type:"string"}
-    }, required:[] } } },
+      startISO:{type:"string", description:"REQUIRED: ISO timestamp for start (e.g., '2025-10-16T14:00:00')"},
+      endISO:{type:"string", description:"REQUIRED: ISO timestamp for end (e.g., '2025-10-16T15:00:00')"}
+    }, required:["startISO","endISO"] } } },
   { type:"function", function:{ name:"book_appointment",
-    description:"Book with the exact startISO/endISO you confirmed.",
+    description:"Create appointment. REQUIRED: name, phone (+1XXXXXXXXXX), service, startISO, endISO, meeting_type ('in-person'/'virtual'), location, title ('{Type} — {Name}'). Returns: {ok, appointmentId, title, startTime, endTime}",
     parameters:{ type:"object", properties:{
-      name:{type:"string"}, phone:{type:"string"}, service:{type:"string"},
-      startISO:{type:"string"}, endISO:{type:"string"},
-      title:{type:"string"},
-      notes:{type:"string"}, meeting_type:{type:"string"}, location:{type:"string"}
-    }, required:["service","startISO","endISO"] } } },
+      name:{type:"string", description:"REQUIRED: Caller's full name"},
+      phone:{type:"string", description:"REQUIRED: Normalized phone +1XXXXXXXXXX"},
+      service:{type:"string", description:"REQUIRED: Service type (buyer/seller/investor)"},
+      startISO:{type:"string", description:"REQUIRED: ISO timestamp start"},
+      endISO:{type:"string", description:"REQUIRED: ISO timestamp end"},
+      meeting_type:{type:"string", description:"REQUIRED: 'in-person' or 'virtual'"},
+      location:{type:"string", description:"REQUIRED: Address if in-person, '' if virtual"},
+      title:{type:"string", description:"REQUIRED: Format '{Type} — {Name}'"},
+      notes:{type:"string", description:"OPTIONAL: Appointment details"}
+    }, required:["name","phone","service","startISO","endISO","meeting_type","location","title"] } } },
   { type:"function", function:{ name:"cancel_appointment",
-    description:"Cancel an event. Prefer event_id.",
+    description:"Cancel appointment. REQUIRED: event_id from find_customer_events. Returns: {ok, cancelled, appointmentId, title}",
     parameters:{ type:"object", properties:{
-      event_id:{type:"string"}, name:{type:"string"}, phone:{type:"string"}, dateISO:{type:"string"}
-    }, required:[] } } },
+      event_id:{type:"string", description:"REQUIRED: Event ID from find_customer_events"}
+    }, required:["event_id"] } } },
   { type:"function", function:{ name:"find_customer_events",
-    description:"Find upcoming events for a contact over a horizon.",
+    description:"Find appointments for customer. REQUIRED: name, phone (+1XXXXXXXXXX), days (use 30). Returns: {ok, events[{event_id, title, start, end, location}]}",
     parameters:{ type:"object", properties:{
-      name:{type:"string"}, phone:{type:"string"}, days:{type:"number"}
-    }, required:[] } } },
+      name:{type:"string", description:"REQUIRED: Customer's name"},
+      phone:{type:"string", description:"REQUIRED: Normalized phone +1XXXXXXXXXX"},
+      days:{type:"number", description:"REQUIRED: Days to search (use 30)"}
+    }, required:["name","phone","days"] } } },
   { type:"function", function:{ name:"lead_upsert",
-    description:"Create/update a lead.",
+    description:"Create/update lead. REQUIRED: name, phone (+1XXXXXXXXXX). OPTIONAL: intent, notes. Returns: {ok, leadId, name, phone}",
     parameters:{ type:"object", properties:{
-      name:{type:"string"}, phone:{type:"string"}, intent:{type:"string"}, notes:{type:"string"}
+      name:{type:"string", description:"REQUIRED: Lead's name"},
+      phone:{type:"string", description:"REQUIRED: Normalized phone +1XXXXXXXXXX"},
+      intent:{type:"string", description:"OPTIONAL: What they're interested in"},
+      notes:{type:"string", description:"OPTIONAL: Call details"}
     }, required:["name","phone"] } } },
   { type:"function", function:{ name:"faq",
-    description:"Log FAQ.",
-    parameters:{ type:"object", properties:{ topic:{type:"string"}, service:{type:"string"} }, required:[] } } },
+    description:"Log FAQ call. OPTIONAL: topic, service. Returns: {ok}",
+    parameters:{ type:"object", properties:{ 
+      topic:{type:"string", description:"OPTIONAL: What they asked about"},
+      service:{type:"string", description:"OPTIONAL: Related service"}
+    }, required:[] } } },
   { type:"function", function:{ name:"transfer",
-    description:"Transfer caller to a human and stop.",
-    parameters:{ type:"object", properties:{ reason:{type:"string"}, callSid:{type:"string"} }, required:[] } } },
+    description:"Transfer to human agent. OPTIONAL: reason. callSid auto-filled. Call transfers immediately.",
+    parameters:{ type:"object", properties:{ 
+      reason:{type:"string", description:"OPTIONAL: Why transfer needed"},
+      callSid:{type:"string", description:"AUTO-FILLED by system"}
+    }, required:[] } } },
   { type:"function", function:{ name:"end_call",
-    description:"End the call.",
-    parameters:{ type:"object", properties:{ callSid:{type:"string"}, reason:{type:"string"} }, required:[] } } }
+    description:"End the call. OPTIONAL: reason. callSid auto-filled. Call ends immediately.",
+    parameters:{ type:"object", properties:{ 
+      callSid:{type:"string", description:"AUTO-FILLED by system"},
+      reason:{type:"string", description:"OPTIONAL: Why call ending"}
+    }, required:[] } } }
 ];
 
 async function openaiChat(messages, opts={}){
@@ -212,7 +231,11 @@ Brand
 - Services: buyer consults and tours; seller/listing consults (mention 1.75% if asked); investors; general Q&A.
 
 Opening
-- Say: "Thanks for calling The Victory Team. How can I help today?"
+- Say EXACTLY: "Thanks for calling The Victory Team. How can I help you today?"
+
+Question Phrasing (use natural variations)
+- Instead of "What brings you in?" → "What can I help you with?" OR "Are you looking to buy or sell?"
+- Keep responses brief, conversational, and natural
 
 Core Interaction Rules
 - Prompt-driven only. Transport executes exactly the tool calls you request.
