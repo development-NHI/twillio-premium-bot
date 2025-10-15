@@ -312,21 +312,21 @@ function normalizePhone(s){
 }
 function extractSlots(ws, text){
   const t = String(text).toLowerCase();
-  if (/this (is )?my number|this number/.test(t) && ws._from) ws.__slots.phone = normalizePhone(ws._from);
+  if (/this (is )?my number|this number/.test(t) && ws._from) ws._slots.phone = normalizePhone(ws._from);
   const mPhone = text.match(/(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}/);
-  if (mPhone) ws.__slots.phone = normalizePhone(mPhone[0]);
-  if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws.__slots.meeting_type = "in-person";
-  if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws.__slots.meeting_type = "virtual";
+  if (mPhone) ws._slots.phone = normalizePhone(mPhone[0]);
+  if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws._slots.meeting_type = "in-person";
+  if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws._slots.meeting_type = "virtual";
   const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
-  if (mAddr && !ws.__slots.location && ws.__slots.meeting_type === "in-person") ws.__slots.location = mAddr[0];
+  if (mAddr && !ws._slots.location && ws._slots.meeting_type === "in-person") ws._slots.location = mAddr[0];
   const mName = text.match(/\b(?:i[' ]?m|this is|my name is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
-  if (mName) ws.__slots.name = mName[1].trim();
-  if (/\b(buyer|buy a home|tour)\b/.test(t)) ws.__slots.service = "buyer";
-  if (/\b(seller|list my home|listing)\b/.test(t)) ws.__slots.service = "seller";
-  if (/\binvest(ing|or)?\b/.test(t)) ws.__slots.service = "investor";
+  if (mName) ws._slots.name = mName[1].trim();
+  if (/\b(buyer|buy a home|tour)\b/.test(t)) ws._slots.service = "buyer";
+  if (/\b(seller|list my home|listing)\b/.test(t)) ws._slots.service = "seller";
+  if (/\binvest(ing|or)?\b/.test(t)) ws._slots.service = "investor";
 }
 function scratchpadMessage(ws){
-  const S = ws.__slots;
+  const S = ws._slots;
   const lines = [
     "Scratchpad",
     `- Name: ${S.name||""}`,
