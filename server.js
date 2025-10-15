@@ -51,7 +51,16 @@ const DEBUG = (process.env.DEBUG || "true") === "true";
 const log = (...a)=>{ if (DEBUG) console.log(...a); };
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
-function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp','"':'&quot;',"'':'&apos;' }[c])); }
+function escapeXml(s = "") {
+  return s.replace(/[<>&'"]/g, c => ({
+    '<': '&lt;',
+    '>': '&gt;',
+    '&': '&amp;',
+    '"': '&quot;',
+    "'": '&apos;',
+  }[c]));
+}
+
 
 /* ===== App / TwiML ===== */
 const app = express();
@@ -766,3 +775,4 @@ wss.on("connection", (ws)=>{
 });
 
 log(`[READY] Voice agent with ReceptorX integration on port ${PORT}`);
+
