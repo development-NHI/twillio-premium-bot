@@ -56,7 +56,7 @@ function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;
 /* ===== App / TwiML ===== */
 const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
-app.use(bodyParser.json());
+app.use(bodyParser.json()));
 app.get("/", (_req,res)=>res.status(200).send("OK"));
 app.get("/healthz", (_req,res)=>res.status(200).send("ok"));
 
@@ -69,7 +69,7 @@ app.post("/twiml", (req,res)=>{
     <Response>
       ${say}
       <Connect>
-        <Stream url="wss://${host}" track="inbound_track">
+        <Stream url="wss://${host}" track="both_tracks">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
