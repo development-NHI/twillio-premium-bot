@@ -51,7 +51,7 @@ const DEBUG = (process.env.DEBUG || "true") === "true";
 const log = (...a)=>{ if (DEBUG) console.log(...a); };
 async function httpPost(url, data, cfg={}){ return axios.post(url, data, cfg); }
 async function httpGet(url, cfg={}){ return axios.get(url, cfg); }
-function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp','"':'&quot;',"'":"&apos;" }[c])); }
+function escapeXml(s=""){ return s.replace(/[<>&'"]/g,c=>({ '<':'&lt;','>':'&gt;','&':'&amp','"':'&quot;',"'':'&apos;' }[c])); }
 
 /* ===== App / TwiML ===== */
 const app = express();
@@ -68,13 +68,13 @@ app.post("/twiml", (req,res)=>{
   res.type("text/xml").send(`
     <Response>
       ${say}
-      <Start>
-        <Stream url="wss://${host}" track="both_tracks">
+      <Connect>
+        <Stream url="wss://${host}" track="inbound_track">
           <Parameter name="from" value="${from}"/>
           <Parameter name="CallSid" value="${callSid}"/>
           <Parameter name="callSid" value="${callSid}"/>
         </Stream>
-      </Start>
+      </Connect>
     </Response>
   `.trim());
 });
