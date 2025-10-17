@@ -414,7 +414,11 @@ function transformToReceptorX(voiceData) {
 const Tools = {
   // ✅ FIXED V2: Changed from GET to POST with JSON body
   async read_availability(args){
-    if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    if (!RECEPTORX_BASE_URL) {
+      log("[ERROR] RECEPTORX_BASE_URL not configured!");
+      return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    }
+    
     try {
       const { startISO, endISO } = args || {};
       if (!startISO || !endISO) return { ok:false, error:"MISSING_TIME_WINDOW" };
@@ -425,17 +429,25 @@ const Tools = {
         userId: RECEPTORX_USER_ID
       };
 
+      const url = `${RECEPTORX_BASE_URL}/api/appointments/availability`;
+      log("[TOOL][read_availability] Calling:", url);
+      log("[TOOL][read_availability] Payload:", JSON.stringify(payload));
+
       // ✅ CHANGED: POST instead of GET
-      const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments/availability`, payload, { timeout:12000 });
+      const { data } = await httpPost(url, payload, { timeout:12000 });
       
-      log("[TOOL][read_availability] ok", JSON.stringify({ startISO, endISO, available: data.available }));
+      log("[TOOL][read_availability] ✅ Success:", JSON.stringify({ available: data.available, conflicts: data.conflicts?.length || 0 }));
       return { 
         ok: true, 
         available: data.available, 
         conflicts: data.conflicts || []
       };
     } catch(e){
-      log("[TOOL][read_availability] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
+      log("[TOOL][read_availability] ❌ FAILED");
+      log("  URL:", `${RECEPTORX_BASE_URL}/api/appointments/availability`);
+      log("  Status:", e?.response?.status || "NO_RESPONSE");
+      log("  Error:", e?.message);
+      log("  Response data:", e?.response?.data);
       return { ok:false, status:e.response?.status||0, error:"READ_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
