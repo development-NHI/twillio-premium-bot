@@ -6,6 +6,10 @@
    ✅ FIXED FOR RECEPTORX INTEGRATION
    - Only tool implementations changed to match ReceptorX API format
    - All TTS, Deepgram, WebSocket, and prompt logic UNTOUCHED
+   
+   ✅ V2 FIXES:
+   - read_availability: Changed from GET to POST with JSON body
+   - Scratchpad preservation after tool failures
 */
 
 import express from "express";
@@ -401,37 +405,38 @@ function transformToReceptorX(voiceData) {
     timezone: BIZ_TZ,
     propertyInterest: voiceData.service,
     notes: notes,
-    source: "voice"
+    source: "voice",
+    userId: RECEPTORX_USER_ID
   };
 }
 
 /* ===== ✅ FIXED TOOLS FOR RECEPTORX ===== */
 const Tools = {
-  // ✅ FIXED: Read availability from ReceptorX
+  // ✅ FIXED V2: Changed from GET to POST with JSON body
   async read_availability(args){
     if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
     try {
       const { startISO, endISO } = args || {};
       if (!startISO || !endISO) return { ok:false, error:"MISSING_TIME_WINDOW" };
 
-      const params = {
+      const payload = {
         startTime: startISO,
         endTime: endISO,
         userId: RECEPTORX_USER_ID
       };
 
-      const { data } = await httpGet(`${RECEPTORX_BASE_URL}/api/appointments/availability`, { params, timeout:12000 });
+      // ✅ CHANGED: POST instead of GET
+      const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments/availability`, payload, { timeout:12000 });
       
-      log("[TOOL][read_availability] ok", JSON.stringify({ startISO, endISO }));
+      log("[TOOL][read_availability] ok", JSON.stringify({ startISO, endISO, available: data.available }));
       return { 
         ok: true, 
         available: data.available, 
-        conflicts: data.conflicts || [],
-        data 
+        conflicts: data.conflicts || []
       };
     } catch(e){
       log("[TOOL][read_availability] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"READ_FAILED", body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"READ_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
 
@@ -444,27 +449,27 @@ const Tools = {
       const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments`, payload, { timeout:12000 });
       
       if (data.success) {
-        log("[TOOL][book_appointment] ok", JSON.stringify({ startISO:args.startISO, endISO:args.endISO }));
+        log("[TOOL][book_appointment] ok", JSON.stringify({ id: data.appointment?.id }));
         return { 
           ok: true, 
-          appointment: data.appointment,
-          event_id: data.appointment?.eventId || data.appointment?.id,
-          data 
+          appointmentId: data.appointment?.id,
+          title: data.appointment?.title,
+          startTime: data.appointment?.startTime,
+          endTime: data.appointment?.endTime
         };
       } else {
         log("[TOOL][book_appointment] conflict:", data.reason);
         return { 
           ok: false, 
           reason: data.reason, 
-          alternatives: data.alternatives || [],
-          data 
+          alternatives: data.alternatives || []
         };
       }
     } catch(e){
       const status = e?.response?.status;
       const msg = e?.response?.data?.message || e?.message;
       log("[TOOL][book_appointment] fail:", status, msg?.slice?.(0,160));
-      return { ok:false, status: status||0, error:"CREATE_FAILED", body:e.response?.data };
+      return { ok:false, status: status||0, error:"CREATE_FAILED", message: msg };
     }
   },
 
@@ -475,15 +480,23 @@ const Tools = {
       const appointmentId = args.event_id;
       if (!appointmentId) return { ok:false, error:"MISSING_EVENT_ID" };
 
-      const payload = { appointmentId };
+      const payload = { 
+        appointmentId,
+        userId: RECEPTORX_USER_ID
+      };
       const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments/cancel`, payload, { timeout:12000 });
       
       const ok = data?.ok || data?.cancelled;
       log("[TOOL][cancel_appointment]", ok ? "ok" : "not-ok");
-      return { ok: !!ok, data };
+      return { 
+        ok: !!ok, 
+        cancelled: !!ok,
+        appointmentId: appointmentId,
+        title: data?.title || ""
+      };
     } catch(e){
       log("[TOOL][cancel_appointment] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
 
@@ -518,19 +531,18 @@ const Tools = {
 
       // Transform to voice agent format with event_id
       const events = customerAppointments.map(apt => ({
-        event_id: apt.eventId || apt.id,
+        event_id: apt.id,
         title: apt.title,
-        startISO: apt.startTime,
-        endISO: apt.endTime,
-        status: apt.status,
-        notes: apt.notes
+        start: apt.startTime,
+        end: apt.endTime,
+        location: apt.location || ""
       }));
 
       log("[TOOL][find_customer_events] ok, found:", events.length);
-      return { ok:true, events, data: customerAppointments };
+      return { ok:true, events };
     } catch(e){
       log("[TOOL][find_customer_events] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], message: e?.response?.data?.message || e?.message };
     }
   },
 
@@ -543,15 +555,21 @@ const Tools = {
         phone: args.phone,
         source: "voice",
         status: "new",
-        notes: args.notes || args.intent || ""
+        notes: args.notes || args.intent || "",
+        userId: RECEPTORX_USER_ID
       };
 
       const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/leads`, payload, { timeout:8000 });
       log("[TOOL][lead_upsert] ok");
-      return { ok:true, data };
+      return { 
+        ok:true, 
+        leadId: data?.id,
+        name: args.name,
+        phone: args.phone
+      };
     } catch(e){
       log("[TOOL][lead_upsert] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
 
@@ -586,7 +604,7 @@ const Tools = {
       return { ok:true };
     } catch(e){
       log("[TOOL][transfer] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"TRANSFER_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
 
@@ -606,7 +624,7 @@ const Tools = {
       return { ok:true };
     } catch(e){
       log("[TOOL][end_call] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
-      return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", body:e.response?.data };
+      return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", message: e?.response?.data?.message || e?.message };
     }
   }
 };
@@ -775,4 +793,3 @@ wss.on("connection", (ws)=>{
 });
 
 log(`[READY] Voice agent with ReceptorX integration on port ${PORT}`);
-
