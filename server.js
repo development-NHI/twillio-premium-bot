@@ -37,15 +37,18 @@ const BIZ_TZ   = process.env.BIZ_TZ   || "America/New_York";
 const DASH_BIZ = process.env.DASH_BIZ || "The Victory Team";
 const DASH_SRC = process.env.DASH_SOURCE || "voice";
 
-// ✅ FIXED: ReceptorX integration uses single base URL
-const RECEPTORX_BASE_URL = process.env.RECEPTORX_BASE_URL || "";
-const RECEPTORX_USER_ID  = process.env.RECEPTORX_USER_ID || "developer-user";
-
-// Legacy URL support (for backward compatibility)
+// Use your existing dashboard URLs
 const URLS = {
+  CAL_CREATE:   process.env.DASH_CAL_CREATE_URL   || "",
+  CAL_READ:     process.env.DASH_CAL_READ_URL     || "",
+  CAL_CANCEL:   process.env.DASH_CAL_CANCEL_URL   || "",
+  LEAD_UPSERT:  process.env.DASH_LEAD_UPSERT_URL  || "",
   FAQ_LOG:      process.env.DASH_CALL_LOG_URL     || "",
+  CALL_SUMMARY: process.env.DASH_CALL_SUMMARY_URL || "",
   PROMPT_FETCH: process.env.PROMPT_FETCH_URL      || ""
 };
+
+const RECEPTORX_USER_ID = process.env.RECEPTORX_USER_ID || "developer-user";
 
 const PRE_CONNECT_GREETING = process.env.PRE_CONNECT_GREETING || "";
 const RENDER_PROMPT        = process.env.RENDER_PROMPT || "";
@@ -412,11 +415,11 @@ function transformToReceptorX(voiceData) {
 
 /* ===== ✅ FIXED TOOLS FOR RECEPTORX ===== */
 const Tools = {
-  // ✅ FIXED V2: Changed from GET to POST with JSON body
+  // Check calendar availability using your existing DASH_CAL_READ_URL
   async read_availability(args){
-    if (!RECEPTORX_BASE_URL) {
-      log("[ERROR] RECEPTORX_BASE_URL not configured!");
-      return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    if (!URLS.CAL_READ) {
+      log("[ERROR] DASH_CAL_READ_URL not configured!");
+      return { ok:false, error:"CAL_READ_URL_MISSING" };
     }
     
     try {
@@ -429,12 +432,11 @@ const Tools = {
         userId: RECEPTORX_USER_ID
       };
 
-      const url = `${RECEPTORX_BASE_URL}/api/appointments/availability`;
-      log("[TOOL][read_availability] Calling:", url);
+      log("[TOOL][read_availability] Calling:", URLS.CAL_READ);
       log("[TOOL][read_availability] Payload:", JSON.stringify(payload));
 
-      // ✅ CHANGED: POST instead of GET
-      const { data } = await httpPost(url, payload, { timeout:12000 });
+      // POST to your existing read endpoint
+      const { data } = await httpPost(URLS.CAL_READ, payload, { timeout:12000 });
       
       log("[TOOL][read_availability] ✅ Success:", JSON.stringify({ available: data.available, conflicts: data.conflicts?.length || 0 }));
       return { 
@@ -444,7 +446,7 @@ const Tools = {
       };
     } catch(e){
       log("[TOOL][read_availability] ❌ FAILED");
-      log("  URL:", `${RECEPTORX_BASE_URL}/api/appointments/availability`);
+      log("  URL:", URLS.CAL_READ);
       log("  Status:", e?.response?.status || "NO_RESPONSE");
       log("  Error:", e?.message);
       log("  Response data:", e?.response?.data);
@@ -452,16 +454,17 @@ const Tools = {
     }
   },
 
-  // ✅ FIXED: Book appointment in ReceptorX
+  // Book appointment using your existing DASH_CAL_CREATE_URL
   async book_appointment(args){
-    if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    if (!URLS.CAL_CREATE) return { ok:false, error:"CAL_CREATE_URL_MISSING" };
     try {
       const payload = transformToReceptorX(args);
       
-      const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments`, payload, { timeout:12000 });
+      log("[TOOL][book_appointment] Calling:", URLS.CAL_CREATE);
+      const { data } = await httpPost(URLS.CAL_CREATE, payload, { timeout:12000 });
       
       if (data.success) {
-        log("[TOOL][book_appointment] ok", JSON.stringify({ id: data.appointment?.id }));
+        log("[TOOL][book_appointment] ✅ Success:", JSON.stringify({ id: data.appointment?.id }));
         return { 
           ok: true, 
           appointmentId: data.appointment?.id,
@@ -470,7 +473,7 @@ const Tools = {
           endTime: data.appointment?.endTime
         };
       } else {
-        log("[TOOL][book_appointment] conflict:", data.reason);
+        log("[TOOL][book_appointment] ⚠️ Conflict:", data.reason);
         return { 
           ok: false, 
           reason: data.reason, 
@@ -480,14 +483,14 @@ const Tools = {
     } catch(e){
       const status = e?.response?.status;
       const msg = e?.response?.data?.message || e?.message;
-      log("[TOOL][book_appointment] fail:", status, msg?.slice?.(0,160));
+      log("[TOOL][book_appointment] ❌ Failed:", status, msg?.slice?.(0,160));
       return { ok:false, status: status||0, error:"CREATE_FAILED", message: msg };
     }
   },
 
-  // ✅ FIXED: Cancel appointment in ReceptorX
+  // Cancel appointment using your existing DASH_CAL_CANCEL_URL
   async cancel_appointment(args){
-    if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    if (!URLS.CAL_CANCEL) return { ok:false, error:"CAL_CANCEL_URL_MISSING" };
     try {
       const appointmentId = args.event_id;
       if (!appointmentId) return { ok:false, error:"MISSING_EVENT_ID" };
@@ -496,10 +499,12 @@ const Tools = {
         appointmentId,
         userId: RECEPTORX_USER_ID
       };
-      const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/appointments/cancel`, payload, { timeout:12000 });
+      
+      log("[TOOL][cancel_appointment] Calling:", URLS.CAL_CANCEL);
+      const { data } = await httpPost(URLS.CAL_CANCEL, payload, { timeout:12000 });
       
       const ok = data?.ok || data?.cancelled;
-      log("[TOOL][cancel_appointment]", ok ? "ok" : "not-ok");
+      log("[TOOL][cancel_appointment]", ok ? "✅ Success" : "❌ Failed");
       return { 
         ok: !!ok, 
         cancelled: !!ok,
@@ -507,14 +512,19 @@ const Tools = {
         title: data?.title || ""
       };
     } catch(e){
-      log("[TOOL][cancel_appointment] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
+      log("[TOOL][cancel_appointment] ❌ Failed:", e?.response?.status, e?.response?.data?.message || e?.message);
       return { ok:false, status:e.response?.status||0, error:"DELETE_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
 
-  // ✅ FIXED: Find customer events in ReceptorX
+  // Find customer events (extracts base URL from your existing URLs)
   async find_customer_events(args){
-    if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING", events:[] };
+    // Extract base URL from any of your existing URLs
+    const baseUrl = URLS.CAL_READ.replace(/\/api\/calendar\/read$/, '') || 
+                    URLS.CAL_CREATE.replace(/\/api\/calendar\/create$/, '');
+    
+    if (!baseUrl) return { ok:false, error:"NO_BASE_URL_FOUND", events:[] };
+    
     try {
       const { name, phone, days = 30 } = args;
       
@@ -529,7 +539,10 @@ const Tools = {
         endTime: futureDate.toISOString()
       };
 
-      const { data } = await httpGet(`${RECEPTORX_BASE_URL}/api/appointments`, { params, timeout:12000 });
+      const url = `${baseUrl}/api/appointments`;
+      log("[TOOL][find_customer_events] Calling:", url);
+      
+      const { data } = await httpGet(url, { params, timeout:12000 });
       
       // Filter by customer name/phone
       let customerAppointments = Array.isArray(data) ? data : [];
@@ -550,17 +563,17 @@ const Tools = {
         location: apt.location || ""
       }));
 
-      log("[TOOL][find_customer_events] ok, found:", events.length);
+      log("[TOOL][find_customer_events] ✅ Success, found:", events.length);
       return { ok:true, events };
     } catch(e){
-      log("[TOOL][find_customer_events] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
+      log("[TOOL][find_customer_events] ❌ Failed:", e?.response?.status, e?.response?.data?.message || e?.message);
       return { ok:false, status:e.response?.status||0, error:"FIND_FAILED", events:[], message: e?.response?.data?.message || e?.message };
     }
   },
 
-  // ✅ FIXED: Upsert lead in ReceptorX
+  // Upsert lead using your existing DASH_LEAD_UPSERT_URL
   async lead_upsert(args){
-    if (!RECEPTORX_BASE_URL) return { ok:false, error:"RECEPTORX_BASE_URL_MISSING" };
+    if (!URLS.LEAD_UPSERT) return { ok:false, error:"LEAD_UPSERT_URL_MISSING" };
     try {
       const payload = {
         name: args.name,
@@ -571,8 +584,9 @@ const Tools = {
         userId: RECEPTORX_USER_ID
       };
 
-      const { data } = await httpPost(`${RECEPTORX_BASE_URL}/api/leads`, payload, { timeout:8000 });
-      log("[TOOL][lead_upsert] ok");
+      log("[TOOL][lead_upsert] Calling:", URLS.LEAD_UPSERT);
+      const { data } = await httpPost(URLS.LEAD_UPSERT, payload, { timeout:8000 });
+      log("[TOOL][lead_upsert] ✅ Success");
       return { 
         ok:true, 
         leadId: data?.id,
@@ -580,7 +594,7 @@ const Tools = {
         phone: args.phone
       };
     } catch(e){
-      log("[TOOL][lead_upsert] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
+      log("[TOOL][lead_upsert] ❌ Failed:", e?.response?.status, e?.response?.data?.message || e?.message);
       return { ok:false, status:e.response?.status||0, error:"LEAD_FAILED", message: e?.response?.data?.message || e?.message };
     }
   },
