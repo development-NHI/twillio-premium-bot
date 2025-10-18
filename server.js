@@ -226,11 +226,17 @@ const toolSchema = [
     }, required:[] } } }
 ];
 
-async function openaiChat(messages, opts={}){
+async function openaiChat(messages, opts={}, wsContext=null){
   const body = { model:"gpt-4o-mini", temperature:0.3, messages, tools:toolSchema, tool_choice:"auto", ...opts };
   const { data } = await httpPost("https://api.openai.com/v1/chat/completions", body, {
     headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }, timeout:30000
   });
+  
+  // Track token usage for cost calculation
+  if (wsContext && data?.usage) {
+    wsContext._totalTokens += (data.usage.total_tokens || 0);
+  }
+  
   return data?.choices?.[0] || {};
 }
 
@@ -656,14 +662,22 @@ Call: read_availability({ startISO: "2025-10-18T14:00:00", endISO: "2025-10-18T1
 STEP 5: Handle Result & Book (CRITICAL - MUST FOLLOW EXACTLY)
 IF available=true:
   You: "That time is open!"
-  Call: book_appointment({ ...all required fields... }) ← MUST HAPPEN IN SAME TURN
+  Call: book_appointment({ 
+    name, phone, service, 
+    startISO, endISO, 
+    meeting_type, location,
+    title: "Buyer Consultation — Cameron Metzger",  // ← Auto-generate based on service
+    notes: "Service: buyer. Type: virtual. Contact: Cameron (...617)."
+  }) ← MUST HAPPEN IN SAME TURN, NO QUESTIONS ASKED
   THEN say: "You're all set! [Name], [Day] [Date] at [Time], [Type]."
   
   ⚠️ CRITICAL RULES:
   - DO NOT ask questions between availability check and booking
-  - DO NOT say "Booking it now" without actually calling book_appointment
+  - DO NOT ask for appointment title - you generate it automatically
+  - DO NOT say "Booking it now" without actually calling book_appointment tool
   - DO NOT ask for notes before booking - book first, then ask "Anything else?"
   - You MUST call book_appointment immediately after saying "That time is open!"
+  - Title format: "Buyer Consultation — [Name]" / "Seller Consultation — [Name]"
 
 IF available=false:
   You: "That's taken, but I have Friday at 3pm or Monday at 2pm. Which works?"
@@ -673,11 +687,12 @@ STEP 6: Final Confirmation (CRITICAL - READ THIS CAREFULLY)
 You: "Anything else I can help with?"
 
 IF caller says "no", "nope", "that's it", "that's all", "nothing else", "I'm good":
-  → Say EXACTLY: "Thanks for calling The Victory Team. Have a great day!"
-  → In the SAME TURN call end_call({ callSid, reason: "completed" })
+  → In the SAME TURN, do BOTH of these things:
+  → 1. Say EXACTLY: "Thanks for calling The Victory Team. Have a great day!"
+  → 2. Call end_call({ callSid, reason: "completed" })
+  → ORDER MATTERS: Say goodbye FIRST, then call end_call in the SAME turn
   → DO NOT try to book again
   → DO NOT ask more questions
-  → DO NOT repeat yourself
 
 IF caller asks for something else:
   → Help them with the new request
@@ -1100,6 +1115,19 @@ const Tools = {
     if (URLS.CALL_SUMMARY && args._wsContext) {
       try {
         const ws = args._wsContext;
+        
+        // Calculate call duration (in seconds)
+        const durationSeconds = ws._startTime ? Math.floor((Date.now() - ws._startTime.getTime()) / 1000) : 0;
+        
+        // Calculate costs
+        // Twilio Voice: $0.0140 per minute for US outbound
+        // OpenAI gpt-4o-mini: ~$0.00015 per 1K input tokens, ~$0.00060 per 1K output tokens
+        // Using average of $0.000375 per 1K tokens for simplicity
+        const twilioMinutes = durationSeconds / 60;
+        const twilioCost = twilioMinutes * 0.0140;
+        const openaiCost = (ws._totalTokens / 1000) * 0.000375;
+        const totalCost = twilioCost + openaiCost;
+        
         const summary = {
           callSid: callSid,
           from: ws._from,
@@ -1108,10 +1136,18 @@ const Tools = {
             `${m.role === 'user' ? 'Caller' : 'Agent'}: ${m.content}`
           ).join('\n'),
           outcome: ws._lastBooked ? 'appointment_booked' : 'inquiry',
-          endReason: reason
+          endReason: reason,
+          duration: durationSeconds,
+          cost: totalCost.toFixed(4),
+          costBreakdown: {
+            twilio: twilioCost.toFixed(4),
+            openai: openaiCost.toFixed(4),
+            tokens: ws._totalTokens
+          }
         };
         
         log("[TOOL][end_call] Sending summary to:", URLS.CALL_SUMMARY);
+        log("[TOOL][end_call] Duration:", durationSeconds, "s | Cost: $" + totalCost.toFixed(4), "(Twilio: $" + twilioCost.toFixed(4) + ", OpenAI: $" + openaiCost.toFixed(4) + ")");
         await httpPost(URLS.CALL_SUMMARY, summary, { timeout:5000 });
         log("[TOOL][end_call] ✅ Summary sent");
       } catch(e){
@@ -1169,7 +1205,7 @@ async function runTurn(ws, baseMessages){
 
     for (let hops=0; hops<6; hops++){
       log("[LLM] hop", hops, "msgs:", messages.length);
-      const choice = await openaiChat(messages);
+      const choice = await openaiChat(messages, {}, ws); // Pass ws context for token tracking
       const assistantMsg = choice?.message || {};
       const text = (assistantMsg.content || "").trim();
       const calls = assistantMsg.tool_calls || [];
@@ -1199,18 +1235,20 @@ async function runTurn(ws, baseMessages){
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws._callSid || "";
         if (name === "end_call") args._wsContext = ws; // Pass context for call summary
 
-        let windowKey = "";
-        if (args?.startISO && args?.endISO) windowKey = `${args.startISO}|${args.endISO}`;
+        // Dedup tracking: prevent calling the SAME tool twice with the same window
+        // But ALLOW read_availability followed by book_appointment for same time
+        let dedupKey = "";
+        if (args?.startISO && args?.endISO) dedupKey = `${name}:${args.startISO}|${args.endISO}`;
 
-        if ((name === "read_availability" || name === "book_appointment") && windowKey){
-          if (ws._windowFlights.has(windowKey)) {
-            log("[DEDUP] skip", name, windowKey);
-            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true, message:"Already processed this exact time slot" }) });
+        if ((name === "read_availability" || name === "book_appointment") && dedupKey){
+          if (ws._windowFlights.has(dedupKey)) {
+            log("[DEDUP] skip", name, dedupKey);
+            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true, message:"Already processed" }) });
             messages.push({ role:"system",
-              content:"Tool deduped - you already checked/booked this exact time. In THIS SAME TURN, acknowledge the existing booking and ask if they need anything else. Do not repeat the booking." });
+              content:"Tool deduped - you already called this tool for this time. Move forward without repeating." });
             continue;
           }
-          ws._windowFlights.add(windowKey);
+          ws._windowFlights.add(dedupKey);
         }
 
         if (name === "book_appointment") {
@@ -1254,6 +1292,8 @@ wss.on("connection", (ws)=>{
   ws._windowFlights = new Set();
   ws._llmBusy = false;
   ws._turnQueue = null;
+  ws._startTime = null; // Track call start time for duration
+  ws._totalTokens = 0; // Track OpenAI token usage
   ws._lastBooked = null;
 
   ws.on("message", async raw=>{
@@ -1265,6 +1305,7 @@ wss.on("connection", (ws)=>{
         ws._streamSid = msg.start?.streamSid || "";
         ws._callSid   = msg.start?.customParameters?.CallSid || msg.start?.customParameters?.callSid || "";
         ws._from      = msg.start?.customParameters?.from || "";
+        ws._startTime = new Date(); // Record call start time
         log("[WS] start", ws._callSid, "from", ws._from);
         if (ws._from) ws._slots.phone = normalizePhone(ws._from);
 
