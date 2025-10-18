@@ -427,6 +427,7 @@ const Tools = {
       if (!startISO || !endISO) return { ok:false, error:"MISSING_TIME_WINDOW" };
 
       const payload = {
+        intent: "READ",  // ✅ Required by your legacy endpoint
         startTime: startISO,
         endTime: endISO,
         userId: RECEPTORX_USER_ID
