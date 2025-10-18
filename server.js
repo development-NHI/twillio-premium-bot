@@ -428,8 +428,11 @@ const Tools = {
 
       const payload = {
         intent: "READ",  // ✅ Required by your legacy endpoint
-        startTime: startISO,
-        endTime: endISO,
+        timezone: BIZ_TZ,  // ✅ Required: "America/New_York"
+        window: {
+          start: startISO,
+          end: endISO
+        },
         userId: RECEPTORX_USER_ID
       };
 
