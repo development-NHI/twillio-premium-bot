@@ -1026,13 +1026,42 @@ const Tools = {
     }
   },
 
-  // Find customer events - Not needed, ReceptorX handles finding internally
+  // Find customer events using ReceptorX search endpoint
   async find_customer_events(args){
-    // NOTE: ReceptorX doesn't have a public find endpoint
-    // The cancel_appointment endpoint handles finding by name/phone internally
-    // So we just return empty here - the AI will call cancel directly with name/phone
-    log("[TOOL][find_customer_events] Skipped - ReceptorX handles finding internally");
-    return { ok:true, events:[] };
+    const SEARCH_URL = process.env.DASH_APPOINTMENTS_SEARCH_URL || 
+                      (URLS.CAL_CREATE ? URLS.CAL_CREATE.replace('/calendar/create', '/appointments/search') : '');
+    
+    if (!SEARCH_URL) return { ok:false, error:"SEARCH_URL_MISSING" };
+    
+    try {
+      const { name, phone, days } = args;
+      
+      const payload = {
+        userId: RECEPTORX_USER_ID,
+        name: name,
+        phone: phone,
+        days: days || 30
+      };
+      
+      log("[TOOL][find_customer_events] Calling:", SEARCH_URL);
+      log("[TOOL][find_customer_events] Payload:", JSON.stringify(payload));
+      
+      const { data } = await httpPost(SEARCH_URL, payload, { timeout:12000 });
+      
+      if (data.ok && data.events) {
+        log("[TOOL][find_customer_events] ✅ Found:", data.events.length, "appointments");
+        return { 
+          ok: true, 
+          events: data.events 
+        };
+      } else {
+        log("[TOOL][find_customer_events] ⚠️ No appointments found");
+        return { ok: true, events: [] };
+      }
+    } catch(e){
+      log("[TOOL][find_customer_events] ❌ Failed:", e?.response?.status, e?.response?.data?.error || e?.message);
+      return { ok:false, status:e.response?.status||0, error:"SEARCH_FAILED", message: e?.response?.data?.error || e?.message };
+    }
   },
 
   // Upsert lead using your existing DASH_LEAD_UPSERT_URL
@@ -1159,15 +1188,33 @@ const Tools = {
     if (URLS.FAQ_LOG && args._wsContext) {
       try {
         const ws = args._wsContext;
+        
+        // Calculate call duration and costs (same as summary above)
+        const durationSeconds = ws._startTime ? Math.floor((Date.now() - ws._startTime.getTime()) / 1000) : 0;
+        const twilioMinutes = durationSeconds / 60;
+        const twilioCost = twilioMinutes * 0.0140;
+        const openaiCost = (ws._totalTokens / 1000) * 0.000375;
+        const totalCost = twilioCost + openaiCost;
+        
+        // Send FULL call data including transcript, duration, and cost
         await httpPost(URLS.FAQ_LOG, {
-          call_sid: callSid,
-          from_number: ws._from,
-          customer_name: ws._slots.name,
-          customer_phone: ws._slots.phone,
-          service: ws._slots.service,
-          outcome: ws._lastBooked ? 'booked' : 'inquiry'
+          callSid: callSid,
+          from: ws._from,
+          slots: ws._slots,
+          transcript: ws._mem.filter(m => m.role === 'user' || m.role === 'assistant').map(m => 
+            `${m.role === 'user' ? 'Caller' : 'Agent'}: ${m.content}`
+          ).join('\n'),
+          outcome: ws._lastBooked ? 'appointment_booked' : 'inquiry',
+          endReason: args.reason || "Call completed",
+          duration: durationSeconds,
+          cost: totalCost.toFixed(4),
+          costBreakdown: {
+            twilio: twilioCost.toFixed(4),
+            openai: openaiCost.toFixed(4),
+            tokens: ws._totalTokens
+          }
         }, { timeout:5000 });
-        log("[TOOL][end_call] ✅ Call logged");
+        log("[TOOL][end_call] ✅ Call logged with transcript, duration:", durationSeconds, "s, cost: $" + totalCost.toFixed(4));
       } catch(e){
         log("[TOOL][end_call] ⚠️ Call log failed:", e?.message);
       }
