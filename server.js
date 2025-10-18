@@ -1260,8 +1260,11 @@ async function runTurn(ws, baseMessages){
       if (text) {
         log("[LLM] say:", text.slice(0, 140));
         await speakULaw(ws, text);
-        ws._mem.push({ role:"assistant", content:text });
       }
+
+      // CRITICAL FIX: Store the FULL assistant message including tool_calls
+      // If we only store text, tool_calls are lost when conversation is reconstructed
+      ws._mem.push(assistantMsg);
 
       messages = [...messages, assistantMsg];
 
@@ -1290,7 +1293,9 @@ async function runTurn(ws, baseMessages){
         if ((name === "read_availability" || name === "book_appointment") && dedupKey){
           if (ws._windowFlights.has(dedupKey)) {
             log("[DEDUP] skip", name, dedupKey);
-            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true, message:"Already processed" }) });
+            const dedupResponse = { role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true, message:"Already processed" }) };
+            messages.push(dedupResponse);
+            ws._mem.push(dedupResponse); // Save dedup response to memory
             messages.push({ role:"system",
               content:"Tool deduped - you already called this tool for this time. Move forward without repeating." });
             continue;
@@ -1313,7 +1318,11 @@ async function runTurn(ws, baseMessages){
 
         if (name === "book_appointment" && result?.ok) ws._lastBooked = { startISO: args.startISO, endISO: args.endISO };
 
-        messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) });
+        // CRITICAL FIX: Save tool response to memory so conversation history is complete
+        const toolResponse = { role:"tool", tool_call_id: tc.id, content: JSON.stringify(result) };
+        messages.push(toolResponse);
+        ws._mem.push(toolResponse);
+        
         messages.push({ role:"system",
           content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not repeat the greeting. Do not mention tools or ISO strings." });
       }
