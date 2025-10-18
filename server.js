@@ -809,18 +809,54 @@ function normalizePhone(s){
 }
 function extractSlots(ws, text){
   const t = String(text).toLowerCase();
-  if (/this (is )?my number|this number/.test(t) && ws._from) ws._slots.phone = normalizePhone(ws._from);
+  const originalText = String(text).trim();
+  
+  // Get last agent message to understand context
+  const lastAgentMsg = [...ws._mem].reverse().find(m => m.role === 'assistant');
+  const lastAgentText = lastAgentMsg ? lastAgentMsg.content.toLowerCase() : '';
+  
+  // PHONE: Multiple detection methods
+  if (/this (is )?my number|this number|this one|same number/.test(t) && ws._from) {
+    ws._slots.phone = normalizePhone(ws._from);
+  }
   const mPhone = text.match(/(?:\+?1[\s\-\.]?)?\(?\d{3}\)?[\s\-\.]?\d{3}[\s\-\.]?\d{4}/);
   if (mPhone) ws._slots.phone = normalizePhone(mPhone[0]);
-  if (/\b(in[-\s]?person|at your office|meet in person)\b/.test(t)) ws._slots.meeting_type = "in-person";
-  if (/\b(virtual|zoom|phone call|google meet|teams)\b/.test(t)) ws._slots.meeting_type = "virtual";
-  const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
-  if (mAddr && !ws._slots.location && ws._slots.meeting_type === "in-person") ws._slots.location = mAddr[0];
-  const mName = text.match(/\b(?:i[' ]?m|this is|my name is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+  
+  // NAME: Context-aware capture
+  // If agent just asked for name and user responds with words (no other pattern matched)
+  if (!ws._slots.name && /\b(your name|name|who am i speaking with)\b/.test(lastAgentText)) {
+    // Look for name patterns: "Cameron Metzger", "I'm John", "John Smith", etc.
+    const nameMatch = originalText.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b/);
+    if (nameMatch && nameMatch[1].split(' ').length <= 3) { // Max 3 words for name
+      ws._slots.name = nameMatch[1].trim();
+    }
+  }
+  // Explicit name patterns
+  const mName = text.match(/\b(?:i[' ]?m|this is|my name is|name['\s]?s)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
   if (mName) ws._slots.name = mName[1].trim();
-  if (/\b(buyer|buy a home|tour)\b/.test(t)) ws._slots.service = "buyer";
-  if (/\b(seller|list my home|listing)\b/.test(t)) ws._slots.service = "seller";
-  if (/\binvest(ing|or)?\b/.test(t)) ws._slots.service = "investor";
+  
+  // SERVICE: Liberal matching
+  if (/\b(buy|buyer|buying|purchase|look.*buy)\b/.test(t)) ws._slots.service = "buyer";
+  if (/\b(sell|seller|selling|list)\b/.test(t)) ws._slots.service = "seller";
+  if (/\binvest(ing|or|ment)?\b/.test(t)) ws._slots.service = "investor";
+  
+  // MEETING TYPE
+  if (/\b(in[-\s]?person|at your office|meet in person|in person|person)\b/.test(t)) {
+    ws._slots.meeting_type = "in-person";
+  }
+  if (/\b(virtual|zoom|phone call|google meet|teams|online|remote)\b/.test(t)) {
+    ws._slots.meeting_type = "virtual";
+  }
+  
+  // LOCATION: Only if in-person
+  const mAddr = text.match(/\b\d{2,5}\s+[A-Za-z0-9.\- ]{3,40}\b/);
+  if (mAddr && ws._slots.meeting_type === "in-person") {
+    ws._slots.location = mAddr[0];
+  }
+  // "office" location
+  if (/\b(your office|the office|at office)\b/.test(t) && ws._slots.meeting_type === "in-person") {
+    ws._slots.location = "office";
+  }
 }
 function scratchpadMessage(ws){
   const S = ws._slots;
