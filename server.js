@@ -287,9 +287,19 @@ Reschedule / Cancel
 - Reschedule: verify new hour via read_availability → cancel_appointment(event_id) → book_appointment with the verified ISOs.
 - Cancel: cancel_appointment(event_id). Outcome line. Ask if they want to rebook.
 
+Post-Booking Completion (CRITICAL - MUST FOLLOW)
+- After successfully booking an appointment, say "You're all set! [confirmation details]. Anything else I can help with?"
+- If caller says "no", "nope", "that's it", "that's all", "nothing else", "I'm good", or similar:
+  → Say EXACTLY: "Thanks for calling The Victory Team. Have a great day!" 
+  → In the SAME TURN call end_call(callSid, "completed")
+  → DO NOT try to book again, DO NOT ask more questions, DO NOT repeat
+- If caller asks for something else, help them with the new request
+- NEVER attempt to book the same appointment twice
+
 Transfer / End
 - If caller asks for a human, call transfer(reason, callSid) and stop.
-- When the caller declines more help or says goodbye, say "Thanks for calling The Victory Team. Have a great day. Goodbye." and in the SAME TURN call end_call(callSid).
+- When caller says goodbye or declines help, say "Thanks for calling The Victory Team. Have a great day!" and in the SAME TURN call end_call(callSid, "completed").
+- If you already booked an appointment successfully, DO NOT try to book it again.
 
 Latency / Failure
 - If a tool will run, first say one short status line, then call the tool in the same turn.
@@ -582,9 +592,53 @@ const Tools = {
     }
   },
 
-  // ✅ UNCHANGED: End call (Twilio logic untouched)
+  // End call and send summary to ReceptorX
   async end_call(args){
     const callSid = args.callSid || "";
+    const reason = args.reason || "Call completed";
+    
+    // Send call summary to ReceptorX FIRST (before hanging up)
+    if (URLS.CALL_SUMMARY && args._wsContext) {
+      try {
+        const ws = args._wsContext;
+        const summary = {
+          callSid: callSid,
+          from: ws._from,
+          slots: ws._slots,
+          transcript: ws._mem.filter(m => m.role === 'user' || m.role === 'assistant').map(m => 
+            `${m.role === 'user' ? 'Caller' : 'Agent'}: ${m.content}`
+          ).join('\n'),
+          outcome: ws._lastBooked ? 'appointment_booked' : 'inquiry',
+          endReason: reason
+        };
+        
+        log("[TOOL][end_call] Sending summary to:", URLS.CALL_SUMMARY);
+        await httpPost(URLS.CALL_SUMMARY, summary, { timeout:5000 });
+        log("[TOOL][end_call] ✅ Summary sent");
+      } catch(e){
+        log("[TOOL][end_call] ⚠️ Summary failed:", e?.message);
+      }
+    }
+    
+    // Also log to DASH_CALL_LOG_URL if configured
+    if (URLS.FAQ_LOG && args._wsContext) {
+      try {
+        const ws = args._wsContext;
+        await httpPost(URLS.FAQ_LOG, {
+          call_sid: callSid,
+          from_number: ws._from,
+          customer_name: ws._slots.name,
+          customer_phone: ws._slots.phone,
+          service: ws._slots.service,
+          outcome: ws._lastBooked ? 'booked' : 'inquiry'
+        }, { timeout:5000 });
+        log("[TOOL][end_call] ✅ Call logged");
+      } catch(e){
+        log("[TOOL][end_call] ⚠️ Call log failed:", e?.message);
+      }
+    }
+    
+    // Now hang up the call
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return { ok:false, error:"HANGUP_CONFIG_MISSING" };
     const url = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Calls/${encodeURIComponent(callSid)}.json`;
     const params = new URLSearchParams({ Status:"completed" });
@@ -594,10 +648,10 @@ const Tools = {
         headers:{ "Content-Type":"application/x-www-form-urlencoded" },
         timeout:8000
       });
-      log("[TOOL][end_call] ok");
+      log("[TOOL][end_call] ✅ Call ended");
       return { ok:true };
     } catch(e){
-      log("[TOOL][end_call] fail:", e?.response?.status, e?.response?.data?.message || e?.message);
+      log("[TOOL][end_call] ❌ Hangup failed:", e?.response?.status, e?.response?.data?.message || e?.message);
       return { ok:false, status:e.response?.status||0, error:"HANGUP_FAILED", message: e?.response?.data?.message || e?.message };
     }
   }
@@ -644,16 +698,17 @@ async function runTurn(ws, baseMessages){
         try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
 
         if ((name === "transfer" || name === "end_call") && !args.callSid) args.callSid = ws._callSid || "";
+        if (name === "end_call") args._wsContext = ws; // Pass context for call summary
 
         let windowKey = "";
         if (args?.startISO && args?.endISO) windowKey = `${args.startISO}|${args.endISO}`;
 
         if ((name === "read_availability" || name === "book_appointment") && windowKey){
-          if (ws._windowFlights.has(windowKey) && name === "read_availability") {
-            log("[DEDUP] skip read_availability", windowKey);
-            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true }) });
+          if (ws._windowFlights.has(windowKey)) {
+            log("[DEDUP] skip", name, windowKey);
+            messages.push({ role:"tool", tool_call_id: tc.id, content: JSON.stringify({ ok:true, deduped:true, message:"Already processed this exact time slot" }) });
             messages.push({ role:"system",
-              content:"Tool response received. Now, in THIS SAME TURN, say one short outcome line (≤12 words) and ask ONE next question. Do not mention tools or ISO strings." });
+              content:"Tool deduped - you already checked/booked this exact time. In THIS SAME TURN, acknowledge the existing booking and ask if they need anything else. Do not repeat the booking." });
             continue;
           }
           ws._windowFlights.add(windowKey);
